@@ -1,0 +1,7 @@
+build/
+*.log
+models/
+*.o
+__pycache__/
+*.safetensors
+*.so

@@ -33,6 +33,11 @@ void act_quant_fp8sim(float* x, int rows, int active_dim, int block, int row_str
 void act_quant_fp8(uint8_t* a_fp8, float* a_s, const float* x, int rows, int K, int block,
                    cudaStream_t stream = 0);
 
+// Fused FP4 QAT-sim: per `block`(=32)-group over first `active_dim` of each row_stride-strided row,
+// quant->e2m1 (pow2 scale, fp4_max=6)->dequant, in-place fp32 (kernel.py fp4_act_quant inplace=True).
+void act_quant_fp4sim(float* x, int rows, int active_dim, int block, int row_stride = -1,
+                      cudaStream_t stream = 0);
+
 // Grouped o-LoRA GEMM: out[bs,G,R] = sum_d o[bs,G,d] * wo_a[G,R,d]. fp32.
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream = 0);

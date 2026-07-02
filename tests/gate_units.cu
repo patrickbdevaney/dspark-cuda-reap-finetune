@@ -305,6 +305,18 @@ static bool gate_index_score(const std::string& dir) {
     cudaFree(dq);cudaFree(dkv);cudaFree(dw);cudaFree(sc); return ok;
 }
 
+static bool gate_act_quant_fp4(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_act_quant_fp4.safetensors");
+    const auto& dm=S.get("dims"); int n=i32(dm,0), dim=i32(dm,1), block=i32(dm,2);
+    void* dx=up(S.get("x"));
+    act_quant_fp4sim((float*)dx, n, dim, block); CU(cudaDeviceSynchronize());
+    std::vector<float> y((size_t)n*dim); CU(cudaMemcpy(y.data(),dx,y.size()*4,cudaMemcpyDeviceToHost));
+    const float* yr=f32(S.get("y_ref")); double mx=0; for(size_t i=0;i<y.size();++i) mx=fmax(mx,fabs((double)yr[i]));
+    Err e=compare(y,yr,y.size(),mx); bool ok=e.max_rel<1e-3;
+    printf("[act_quant_fp4] n=%d dim=%d block=%d  max_abs=%.5f max_rel=%.5f -> %s\n",n,dim,block,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dx); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
@@ -313,6 +325,7 @@ int main(int argc, char** argv) {
     ok &= gate_compressor_full(dir);
     ok &= gate_hadamard(dir);
     ok &= gate_index_score(dir);
+    ok &= gate_act_quant_fp4(dir);
     ok &= gate_fp8_gemm(dir);
     ok &= gate_hc(dir);
     ok &= gate_sparse_attn(dir);

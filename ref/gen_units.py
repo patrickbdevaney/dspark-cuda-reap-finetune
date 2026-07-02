@@ -139,6 +139,16 @@ def gen_act_quant(out_dir, n=32, dim=512, block=64):
     print("[act_quant] n=%d dim=%d block=%d  maxdiff=%.4f" % (n, dim, block, (x.float()-y.float()).abs().max().item()))
 
 
+def gen_act_quant_fp4(out_dir, n=32, dim=256, block=32):
+    """Fused FP4 QAT-sim (kernel.py fp4_act_quant inplace=True) — indexer q + rotate-compressor."""
+    torch.manual_seed(116)
+    x = torch.randn(n, dim)
+    y = K.fp4_act_quant(x.clone(), block, inplace=True)
+    save_file({"x": x.contiguous(), "y_ref": y.contiguous(), "dims": torch.tensor([n, dim, block], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_act_quant_fp4.safetensors"))
+    print("[act_quant_fp4] n=%d dim=%d block=%d  maxdiff=%.4f" % (n, dim, block, (x - y).abs().max().item()))
+
+
 _E2M1_MAG = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.])   # nibble&7 -> magnitude
 
 
@@ -380,4 +390,5 @@ if __name__ == "__main__":
     gen_compressor_full(a.out)
     gen_hadamard(a.out)
     gen_index_score(a.out)
+    gen_act_quant_fp4(a.out)
     print("units written to", a.out)

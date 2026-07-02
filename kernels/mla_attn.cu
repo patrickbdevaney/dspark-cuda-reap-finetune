@@ -173,3 +173,33 @@ void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream) {
     ogroup_gemm_kernel<<<bs * G * R, 32, 0, stream>>>(out, o, wo_a, bs, G, R, Kd);
 }
+
+// ---------------- act_quant_fp4sim ----------------
+// FP4 e2m1 QAT-sim (quant->dequant), pow2 scale, fp4_max=6, block=32. Matches kernel.py fp4_act_quant inplace.
+__device__ __forceinline__ float round_e2m1(float v) {   // nearest signed E2M1 grid value {0,.5,1,1.5,2,3,4,6}
+    float a = fabsf(v), m;
+    if (a < 0.25f) m = 0.f; else if (a < 0.75f) m = 0.5f; else if (a < 1.25f) m = 1.f;
+    else if (a < 1.75f) m = 1.5f; else if (a < 2.5f) m = 2.f; else if (a < 3.5f) m = 3.f;
+    else if (a < 5.f) m = 4.f; else m = 6.f;
+    return (v < 0.f) ? -m : m;
+}
+__global__ void act_quant_fp4sim_kernel(float* __restrict__ x, int rows, int active_dim, int block, int row_stride) {
+    int ng = active_dim / block; int gid = blockIdx.x; if (gid >= rows * ng) return;
+    int row = gid / ng, g = gid % ng;
+    float* xr = x + (size_t)row * row_stride + (size_t)g * block;
+    extern __shared__ float red[];
+    float v = (threadIdx.x < block) ? fabsf(xr[threadIdx.x]) : 0.f;
+    red[threadIdx.x] = v; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    float amax = fmaxf(red[0], 6.f * 7.5231631e-37f);              // 6*2^-126
+    float scale = exp2f(ceilf(log2f(amax * (1.f / 6.f))));
+    if (threadIdx.x < block) {
+        float q = fminf(fmaxf(xr[threadIdx.x] / scale, -6.f), 6.f);
+        xr[threadIdx.x] = round_e2m1(q) * scale;
+    }
+}
+void act_quant_fp4sim(float* x, int rows, int active_dim, int block, int row_stride, cudaStream_t stream) {
+    if (row_stride < 0) row_stride = active_dim;
+    int threads = block < 32 ? 32 : block;
+    act_quant_fp4sim_kernel<<<rows * (active_dim / block), threads, threads * sizeof(float), stream>>>(x, rows, active_dim, block, row_stride);
+}

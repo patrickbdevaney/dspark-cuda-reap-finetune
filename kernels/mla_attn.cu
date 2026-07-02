@@ -62,12 +62,14 @@ void sparse_attn(float* o, const float* q, const float* kv, const float* attn_si
 // ---------------- rope_interleaved ----------------
 // x[rows, rope_dim]; pairs (2j,2j+1) rotated by (cos_j, sin_j). inverse => sin -> -sin.
 __global__ void rope_kernel(float* __restrict__ x, const float* __restrict__ cosT,
-                            const float* __restrict__ sinT, int rows, int rope_dim, int inv) {
+                            const float* __restrict__ sinT, int rows, int rope_dim, int inv,
+                            int row_stride, int cos_stride_rows) {
     int row = blockIdx.x; if (row >= rows) return;
     int half = rope_dim / 2;
-    float* xr = x + (size_t)row * rope_dim;
-    const float* c = cosT + (size_t)row * half;
-    const float* s = sinT + (size_t)row * half;
+    float* xr = x + (size_t)row * row_stride;
+    int crow = row / cos_stride_rows;
+    const float* c = cosT + (size_t)crow * half;
+    const float* s = sinT + (size_t)crow * half;
     for (int j = threadIdx.x; j < half; j += blockDim.x) {
         float a = xr[2 * j], bb = xr[2 * j + 1];
         float sj = inv ? -s[j] : s[j], cj = c[j];
@@ -77,8 +79,11 @@ __global__ void rope_kernel(float* __restrict__ x, const float* __restrict__ cos
 }
 
 void rope_interleaved(float* x, const float* cosT, const float* sinT,
-                      int rows, int rope_dim, bool inverse, cudaStream_t stream) {
-    rope_kernel<<<rows, 64, 0, stream>>>(x, cosT, sinT, rows, rope_dim, inverse ? 1 : 0);
+                      int rows, int rope_dim, bool inverse, int row_stride, int cos_stride_rows,
+                      cudaStream_t stream) {
+    if (row_stride < 0) row_stride = rope_dim;
+    rope_kernel<<<rows, 64, 0, stream>>>(x, cosT, sinT, rows, rope_dim, inverse ? 1 : 0,
+                                         row_stride, cos_stride_rows);
 }
 
 // ---------------- rmsnorm ----------------
@@ -103,10 +108,10 @@ void rmsnorm(float* y, const float* x, const float* weight, int rows, int dim,
 // Per (row, block-of-`block`): amax -> pow2 scale (ue8m0) -> clamp(x/scale) to e4m3 -> dequant*scale.
 // One block per (row, group); threads cover the group. Matches kernel.py act_quant(inplace, round_scale).
 #include <cuda_fp8.h>
-__global__ void act_quant_fp8sim_kernel(float* __restrict__ x, int rows, int dim, int block) {
-    int ng = dim / block; int gid = blockIdx.x; if (gid >= rows * ng) return;
+__global__ void act_quant_fp8sim_kernel(float* __restrict__ x, int rows, int active_dim, int block, int row_stride) {
+    int ng = active_dim / block; int gid = blockIdx.x; if (gid >= rows * ng) return;
     int row = gid / ng, g = gid % ng;
-    float* xr = x + (size_t)row * dim + (size_t)g * block;
+    float* xr = x + (size_t)row * row_stride + (size_t)g * block;
     extern __shared__ float red[];
     float v = (threadIdx.x < block) ? fabsf(xr[threadIdx.x]) : 0.f;
     red[threadIdx.x] = v; __syncthreads();
@@ -120,9 +125,34 @@ __global__ void act_quant_fp8sim_kernel(float* __restrict__ x, int rows, int dim
         xr[threadIdx.x] = __half2float(*reinterpret_cast<__half*>(&hr)) * scale;
     }
 }
-void act_quant_fp8sim(float* x, int rows, int dim, int block, cudaStream_t stream) {
+void act_quant_fp8sim(float* x, int rows, int active_dim, int block, int row_stride, cudaStream_t stream) {
+    if (row_stride < 0) row_stride = active_dim;
     int threads = block < 32 ? 32 : block;
-    act_quant_fp8sim_kernel<<<rows * (dim / block), threads, threads * sizeof(float), stream>>>(x, rows, dim, block);
+    act_quant_fp8sim_kernel<<<rows * (active_dim / block), threads, threads * sizeof(float), stream>>>(x, rows, active_dim, block, row_stride);
+}
+
+// Real activation quant -> fp8 bytes + f32 pow2 scale (the activation half of an fp8 linear).
+__global__ void act_quant_fp8_kernel(uint8_t* __restrict__ a, float* __restrict__ as,
+                                     const float* __restrict__ x, int rows, int K, int block) {
+    int nb = K / block; int gid = blockIdx.x; if (gid >= rows * nb) return;
+    int row = gid / nb, b = gid % nb;
+    const float* xr = x + (size_t)row * K + (size_t)b * block;
+    uint8_t* ar = a + (size_t)row * K + (size_t)b * block;
+    extern __shared__ float red[];
+    float v = (threadIdx.x < block) ? fabsf(xr[threadIdx.x]) : 0.f;
+    red[threadIdx.x] = v; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    float amax = fmaxf(red[0], 1e-4f);
+    float scale = exp2f(ceilf(log2f(amax * (1.f / 448.f))));
+    if (threadIdx.x == 0) as[(size_t)row * nb + b] = scale;
+    if (threadIdx.x < block) {
+        float q = fminf(fmaxf(xr[threadIdx.x] / scale, -448.f), 448.f);
+        ar[threadIdx.x] = __nv_fp8_e4m3(q).__x;
+    }
+}
+void act_quant_fp8(uint8_t* a_fp8, float* a_s, const float* x, int rows, int K, int block, cudaStream_t stream) {
+    int threads = block < 32 ? 32 : block;
+    act_quant_fp8_kernel<<<rows * (K / block), threads, threads * sizeof(float), stream>>>(a_fp8, a_s, x, rows, K, block);
 }
 
 // ---------------- ogroup_gemm ----------------

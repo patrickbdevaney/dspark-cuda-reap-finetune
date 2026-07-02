@@ -36,3 +36,56 @@ void compressor_pool(float* pooled, const float* kv, const float* score, const f
                      int groups, int ratio, int d, cudaStream_t stream) {
     compressor_pool_kernel<<<(groups * d + 255) / 256, 256, 0, stream>>>(pooled, kv, score, ape, groups, ratio, d);
 }
+
+// ---------------- overlap pooling (ratio==4) ----------------
+// kv,score:[s,2d] (s=groups*ratio); ape:[ratio,2d]. Slot q in [0,2*ratio): q>=ratio -> current group token
+// (q-ratio), dims [d:2d]; q<ratio -> previous group (g-1) token q, dims [0:d] (masked for g=0).
+__global__ void compressor_pool_overlap_kernel(float* __restrict__ pooled, const float* __restrict__ kv,
+                                               const float* __restrict__ score, const float* __restrict__ ape,
+                                               int groups, int ratio, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= groups * d) return;
+    int g = i / d, e = i % d; int twod = 2 * d, nslot = 2 * ratio;
+    float mx = -1e30f;
+    for (int q = 0; q < nslot; ++q) {
+        float sc;
+        if (q >= ratio) { int tok = g * ratio + (q - ratio); sc = score[(size_t)tok * twod + d + e] + ape[(size_t)(q - ratio) * twod + d + e]; }
+        else if (g >= 1) { int tok = (g - 1) * ratio + q; sc = score[(size_t)tok * twod + e] + ape[(size_t)q * twod + e]; }
+        else sc = -1e30f;
+        mx = fmaxf(mx, sc);
+    }
+    float sum = 0.f, acc = 0.f;
+    for (int q = 0; q < nslot; ++q) {
+        float sc, kvv;
+        if (q >= ratio) { int tok = g * ratio + (q - ratio); sc = score[(size_t)tok * twod + d + e] + ape[(size_t)(q - ratio) * twod + d + e]; kvv = kv[(size_t)tok * twod + d + e]; }
+        else if (g >= 1) { int tok = (g - 1) * ratio + q; sc = score[(size_t)tok * twod + e] + ape[(size_t)q * twod + e]; kvv = kv[(size_t)tok * twod + e]; }
+        else continue;
+        float w = expf(sc - mx); sum += w; acc += w * kvv;
+    }
+    pooled[i] = acc / sum;
+}
+void compressor_pool_overlap(float* pooled, const float* kv, const float* score, const float* ape,
+                             int groups, int ratio, int d, cudaStream_t stream) {
+    compressor_pool_overlap_kernel<<<(groups * d + 255) / 256, 256, 0, stream>>>(pooled, kv, score, ape, groups, ratio, d);
+}
+
+// ---------------- full Compressor forward ----------------
+#include "mla_attn.h"     // rmsnorm, rope_interleaved, act_quant_fp8sim
+#include <cstdio>
+#define CU2(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
+void compressor_forward(float* out, const float* x, const float* wkv, const float* wgate,
+                        const float* ape, const float* norm_w, const float* cosT, const float* sinT,
+                        int s, int dim, int d, int ratio, bool overlap, int rope_dim, float eps,
+                        cudaStream_t stream) {
+    int coff = overlap ? 2 : 1, groups = s / ratio, od = coff * d;
+    float *kv, *score;
+    CU2(cudaMalloc(&kv, (size_t)s * od * 4)); CU2(cudaMalloc(&score, (size_t)s * od * 4));
+    gemm_fp32(kv, x, wkv, s, od, dim, stream);
+    gemm_fp32(score, x, wgate, s, od, dim, stream);
+    if (overlap) compressor_pool_overlap(out, kv, score, ape, groups, ratio, d, stream);
+    else         compressor_pool(out, kv, score, ape, groups, ratio, d, stream);
+    rmsnorm(out, out, norm_w, groups, d, eps, true, stream);
+    rope_interleaved(out + (d - rope_dim), cosT, sinT, groups, rope_dim, false, d, 1, stream);
+    act_quant_fp8sim(out, groups, d - rope_dim, 64, d, stream);
+    CU2(cudaStreamSynchronize(stream));
+    cudaFree(kv); cudaFree(score);
+}

@@ -249,10 +249,42 @@ static bool gate_compressor(const std::string& dir) {
     cudaFree(dx);cudaFree(dwkv);cudaFree(dwg);cudaFree(dape);cudaFree(kv);cudaFree(score);cudaFree(pooled); return ok;
 }
 
+static bool gate_compressor_overlap(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_compressor_overlap.safetensors");
+    const auto& dm=S.get("dims"); int s=i32(dm,0), d=i32(dm,1), ratio=i32(dm,2); int groups=s/ratio;
+    void *dkv=up(S.get("kv")), *dsc=up(S.get("score")), *dape=up(S.get("ape"));
+    float* pooled; CU(cudaMalloc(&pooled,(size_t)groups*d*4));
+    compressor_pool_overlap(pooled,(const float*)dkv,(const float*)dsc,(const float*)dape,groups,ratio,d);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> p((size_t)groups*d); CU(cudaMemcpy(p.data(),pooled,p.size()*4,cudaMemcpyDeviceToHost));
+    const float* pr=f32(S.get("pooled")); double mx=0; for(size_t i=0;i<p.size();++i) mx=fmax(mx,fabs((double)pr[i]));
+    Err e=compare(p,pr,p.size(),mx); bool ok=e.max_rel<1e-3;
+    printf("[compressor_overlap] s=%d d=%d ratio=%d  |p|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",s,d,ratio,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dkv);cudaFree(dsc);cudaFree(dape);cudaFree(pooled); return ok;
+}
+
+static bool gate_compressor_full(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_compressor_full.safetensors");
+    const auto& dm=S.get("dims"); int s=i32(dm,0), dim=i32(dm,1), d=i32(dm,2), ratio=i32(dm,3), rd=i32(dm,4); int groups=s/ratio;
+    void *dx=up(S.get("x")), *dwkv=up(S.get("wkv")), *dwg=up(S.get("wgate")), *dape=up(S.get("ape"));
+    void *dn=up(S.get("norm_w")), *dc=up(S.get("cos")), *dsin=up(S.get("sin"));
+    float* out; CU(cudaMalloc(&out,(size_t)groups*d*4));
+    compressor_forward(out,(const float*)dx,(const float*)dwkv,(const float*)dwg,(const float*)dape,
+                       (const float*)dn,(const float*)dc,(const float*)dsin,s,dim,d,ratio,true,rd,1e-6f);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> o((size_t)groups*d); CU(cudaMemcpy(o.data(),out,o.size()*4,cudaMemcpyDeviceToHost));
+    const float* orf=f32(S.get("out")); double mx=0; for(size_t i=0;i<o.size();++i) mx=fmax(mx,fabs((double)orf[i]));
+    Err e=compare(o,orf,o.size(),mx); bool ok=e.max_rel<5e-3;
+    printf("[compressor_full] s=%d dim=%d d=%d ratio=%d  |o|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",s,dim,d,ratio,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dwkv);cudaFree(dwg);cudaFree(dape);cudaFree(dn);cudaFree(dc);cudaFree(dsin);cudaFree(out); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
     ok &= gate_compressor(dir);
+    ok &= gate_compressor_overlap(dir);
+    ok &= gate_compressor_full(dir);
     ok &= gate_fp8_gemm(dir);
     ok &= gate_hc(dir);
     ok &= gate_sparse_attn(dir);

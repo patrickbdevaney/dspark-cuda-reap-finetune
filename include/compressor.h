@@ -11,3 +11,16 @@ void gemm_fp32(float* C, const float* A, const float* B, int M, int N, int K, cu
 // kv,score:[groups*ratio, d]; ape:[ratio,d]; pooled:[groups,d].
 void compressor_pool(float* pooled, const float* kv, const float* score, const float* ape,
                      int groups, int ratio, int d, cudaStream_t stream = 0);
+
+// Overlap pooling (ratio==4, model.py overlap_transform + softmax). kv,score:[groups*ratio, 2d];
+// ape:[ratio,2d]; pooled:[groups,d]. Each group softmaxes over 2*ratio slots: current group (dims [d:2d])
+// + previous group (dims [0:d], masked for g=0).
+void compressor_pool_overlap(float* pooled, const float* kv, const float* score, const float* ape,
+                             int groups, int ratio, int d, cudaStream_t stream = 0);
+
+// Full Compressor forward (prefill, remainder-free): gemm(wkv/wgate) -> pool -> norm -> RoPE(last 64) ->
+// fp8-sim NoPE. x:[s,dim] -> out:[s/ratio, d]. cos/sin:[s/ratio, 64/2] (compressed-position freqs).
+void compressor_forward(float* out, const float* x, const float* wkv, const float* wgate,
+                        const float* ape, const float* norm_w, const float* cosT, const float* sinT,
+                        int s, int dim, int d, int ratio, bool overlap, int rope_dim, float eps,
+                        cudaStream_t stream = 0);

@@ -210,6 +210,49 @@ def gen_compressor(out_dir, bs=8, dim=256, d=128, ratio=4):
     print("[compressor] bs=%d dim=%d d=%d ratio=%d  |pooled|max=%.4f" % (bs, dim, d, ratio, pooled.abs().max().item()))
 
 
+def _overlap_transform(t, value, groups, ratio, d):
+    # t:[groups,ratio,2d] -> [groups,2*ratio,d]  (model.py Compressor.overlap_transform)
+    new = torch.full((groups, 2 * ratio, d), value, dtype=t.dtype)
+    new[:, ratio:] = t[:, :, d:]
+    new[1:, :ratio] = t[:-1, :, :d]
+    return new
+
+
+def gen_compressor_overlap(out_dir, bs=8, d=64, ratio=4):
+    torch.manual_seed(112)
+    s = bs; groups = s // ratio; twod = 2 * d
+    kv = torch.randn(s, twod); score = torch.randn(s, twod); ape = torch.randn(ratio, twod) * 0.1
+    kv_g = kv.reshape(groups, ratio, twod); score_g = score.reshape(groups, ratio, twod) + ape
+    kv_o = _overlap_transform(kv_g, 0.0, groups, ratio, d)
+    score_o = _overlap_transform(score_g, float("-inf"), groups, ratio, d)
+    pooled = (kv_o * score_o.softmax(dim=1)).sum(dim=1)             # [groups, d]
+    save_file({"kv": kv.contiguous(), "score": score.contiguous(), "ape": ape.contiguous(),
+               "pooled": pooled.contiguous(), "dims": torch.tensor([s, d, ratio], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_compressor_overlap.safetensors"))
+    print("[compressor_overlap] s=%d d=%d ratio=%d  |pooled|max=%.4f" % (s, d, ratio, pooled.abs().max().item()))
+
+
+def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps=1e-6):
+    """Full Compressor fwd (overlap, rotate=False): gemm -> overlap-pool -> norm -> RoPE -> fp8-sim NoPE."""
+    torch.manual_seed(113); coff = 2; s = bs; groups = s // ratio; od = coff * d
+    x = torch.randn(s, dim); wkv = torch.randn(od, dim) * 0.1; wgate = torch.randn(od, dim) * 0.1
+    ape = torch.randn(ratio, od) * 0.1; norm_w = torch.randn(d) * 0.1 + 1.0
+    ang = torch.randn(groups, rope_dim // 2); cos, sin = torch.cos(ang), torch.sin(ang)
+    kv = x @ wkv.t(); score = x @ wgate.t()
+    kv_g = kv.reshape(groups, ratio, od); score_g = score.reshape(groups, ratio, od) + ape
+    kv_o = _overlap_transform(kv_g, 0.0, groups, ratio, d); score_o = _overlap_transform(score_g, float("-inf"), groups, ratio, d)
+    pooled = (kv_o * score_o.softmax(dim=1)).sum(dim=1)             # [groups, d]
+    pooled = pooled.float() * torch.rsqrt(pooled.float().square().mean(-1, keepdim=True) + eps) * norm_w
+    out = pooled.clone()
+    out[:, -rope_dim:] = _rope_ref(pooled[:, -rope_dim:], cos, sin, False)
+    out[:, :-rope_dim] = K.act_quant(out[:, :-rope_dim].clone(), 64, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+    save_file({"x": x.contiguous(), "wkv": wkv.contiguous(), "wgate": wgate.contiguous(), "ape": ape.contiguous(),
+               "norm_w": norm_w.contiguous(), "cos": cos.contiguous(), "sin": sin.contiguous(),
+               "out": out.contiguous(), "dims": torch.tensor([s, dim, d, ratio, rope_dim, coff], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_compressor_full.safetensors"))
+    print("[compressor_full] s=%d dim=%d d=%d ratio=%d  |out|max=%.4f" % (s, dim, d, ratio, out.abs().max().item()))
+
+
 def gen_hc(out_dir, bs=8, hc=4, d=64, eps=1e-6, iters=20):
     """Hyper-Connections pre + post (model.py:680-693)."""
     torch.manual_seed(101)
@@ -312,4 +355,6 @@ if __name__ == "__main__":
     gen_moe(a.out)
     gen_hc(a.out)
     gen_compressor(a.out)
+    gen_compressor_overlap(a.out)
+    gen_compressor_full(a.out)
     print("units written to", a.out)

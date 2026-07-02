@@ -35,10 +35,15 @@ large *per-expert* token counts to reach compute-bound). So batching helps, but 
    and provably on-policy. **CRITICAL: only with EXACT rejection sampling** — relaxed/typical acceptance
    (Medusa-style) is NOT distribution-preserving and would corrupt the captured distribution. Compose with (4).
 6. **Cache-once, train-many.** SpecForge offline: precompute taps once, train the head many epochs on 1 GPU
-   with the 96 GiB target NOT loaded. Disk cost is the tradeoff (~12 TB for full UltraChat+ShareGPT; scales
-   with tokens). At 3 taps × 4096 × bf16 = 24 KB/token: 20M tokens ≈ **480 GB** (fp8 taps ≈ 240 GB). **User
-   can free disk → cache-once viable; else stream from NVMe or shrink the set.** Respects Axiom 8 (target and
-   trainer never co-resident — capture first, free the model, then train from cache).
+   with the 96 GiB target NOT loaded. Cache is dominated by the 3× layer-40/41/42 taps (the head's input).
+   **Store taps fp8** (12 KB/tok, matches serve precision at no quality cost) not bf16 (24 KB/tok); fp4
+   (6 KB/tok) is a further 2× pending a precision check vs golden.
+   Disk budget (measured 2026-07-02): **182 GB free today**; +~40 GB deleting 2 spare models; docker prune
+   (260 GB images, 2/13 active; 56 GB build cache) safely reclaims ~90 GB now and up to ~350 GB by dropping
+   stale re-pullable tagged images → ~550 GB ceiling. Capacity: fp8 taps → **15 M tok @182 GB, 46 M @550 GB**.
+   A warm-start fine-tune (~12–15 M tok, ~30 K samples) **fits in 182 GB today — no deletion needed.**
+   **Size disk to the Gate-2-informed need; delete nothing until Gate 2 says how big the fine-tune must be.**
+   Respects Axiom 8 (target and trainer never co-resident — capture first, free the model, then train from cache).
 7. **Training is NOT the bottleneck.** FastMTP: 210 M head, 3 epochs, 389 K samples, global batch 64,
    **<1 day on one H20**. Full-head fine-tune (not LoRA) is the disclosed recipe; warm-start + token-CE+KD.
    Thor is slower absolute but training stays hours-scale and is amortized by cache-once.

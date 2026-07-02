@@ -242,9 +242,10 @@ def gen_compressor_overlap(out_dir, bs=8, d=64, ratio=4):
     print("[compressor_overlap] s=%d d=%d ratio=%d  |pooled|max=%.4f" % (s, d, ratio, pooled.abs().max().item()))
 
 
-def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps=1e-6):
-    """Full Compressor fwd (overlap, rotate=False): gemm -> overlap-pool -> norm -> RoPE -> fp8-sim NoPE."""
-    torch.manual_seed(113); coff = 2; s = bs; groups = s // ratio; od = coff * d
+def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps=1e-6, rotate=False):
+    """Full Compressor fwd (overlap): gemm -> overlap-pool -> norm -> RoPE -> [rotate: hadamard(full)+fp4-sim
+    | else fp8-sim NoPE]. rotate=True is the DSA indexer's compressor (computed in fp32 to match CUDA)."""
+    torch.manual_seed(113 + int(rotate)); coff = 2; s = bs; groups = s // ratio; od = coff * d
     x = torch.randn(s, dim); wkv = torch.randn(od, dim) * 0.1; wgate = torch.randn(od, dim) * 0.1
     ape = torch.randn(ratio, od) * 0.1; norm_w = torch.randn(d) * 0.1 + 1.0
     ang = torch.randn(groups, rope_dim // 2); cos, sin = torch.cos(ang), torch.sin(ang)
@@ -255,12 +256,18 @@ def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps
     pooled = pooled.float() * torch.rsqrt(pooled.float().square().mean(-1, keepdim=True) + eps) * norm_w
     out = pooled.clone()
     out[:, -rope_dim:] = _rope_ref(pooled[:, -rope_dim:], cos, sin, False)
-    out[:, :-rope_dim] = K.act_quant(out[:, :-rope_dim].clone(), 64, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+    if rotate:
+        from fast_hadamard_transform import hadamard_transform
+        out = hadamard_transform(out, scale=d ** -0.5)             # full-d Hadamard
+        out = K.fp4_act_quant(out, 32, inplace=True)               # fp4-sim full
+    else:
+        out[:, :-rope_dim] = K.act_quant(out[:, :-rope_dim].clone(), 64, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+    fn = "unit_compressor_full_rotate.safetensors" if rotate else "unit_compressor_full.safetensors"
     save_file({"x": x.contiguous(), "wkv": wkv.contiguous(), "wgate": wgate.contiguous(), "ape": ape.contiguous(),
                "norm_w": norm_w.contiguous(), "cos": cos.contiguous(), "sin": sin.contiguous(),
                "out": out.contiguous(), "dims": torch.tensor([s, dim, d, ratio, rope_dim, coff], dtype=torch.int32)},
-              os.path.join(out_dir, "unit_compressor_full.safetensors"))
-    print("[compressor_full] s=%d dim=%d d=%d ratio=%d  |out|max=%.4f" % (s, dim, d, ratio, out.abs().max().item()))
+              os.path.join(out_dir, fn))
+    print("[compressor_full rotate=%d] s=%d dim=%d d=%d  |out|max=%.4f" % (int(rotate), s, dim, d, out.abs().max().item()))
 
 
 def gen_hadamard(out_dir, rows=8, D=128):
@@ -388,6 +395,7 @@ if __name__ == "__main__":
     gen_compressor(a.out)
     gen_compressor_overlap(a.out)
     gen_compressor_full(a.out)
+    gen_compressor_full(a.out, rotate=True)
     gen_hadamard(a.out)
     gen_index_score(a.out)
     gen_act_quant_fp4(a.out)

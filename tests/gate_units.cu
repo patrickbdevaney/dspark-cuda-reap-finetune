@@ -264,19 +264,20 @@ static bool gate_compressor_overlap(const std::string& dir) {
     cudaFree(dkv);cudaFree(dsc);cudaFree(dape);cudaFree(pooled); return ok;
 }
 
-static bool gate_compressor_full(const std::string& dir) {
-    st::SafeTensors S(dir + "/unit_compressor_full.safetensors");
+static bool gate_compressor_full(const std::string& dir, bool rotate) {
+    std::string fn = rotate ? "/unit_compressor_full_rotate.safetensors" : "/unit_compressor_full.safetensors";
+    st::SafeTensors S(dir + fn);
     const auto& dm=S.get("dims"); int s=i32(dm,0), dim=i32(dm,1), d=i32(dm,2), ratio=i32(dm,3), rd=i32(dm,4); int groups=s/ratio;
     void *dx=up(S.get("x")), *dwkv=up(S.get("wkv")), *dwg=up(S.get("wgate")), *dape=up(S.get("ape"));
     void *dn=up(S.get("norm_w")), *dc=up(S.get("cos")), *dsin=up(S.get("sin"));
     float* out; CU(cudaMalloc(&out,(size_t)groups*d*4));
     compressor_forward(out,(const float*)dx,(const float*)dwkv,(const float*)dwg,(const float*)dape,
-                       (const float*)dn,(const float*)dc,(const float*)dsin,s,dim,d,ratio,true,rd,1e-6f);
+                       (const float*)dn,(const float*)dc,(const float*)dsin,s,dim,d,ratio,true,rd,1e-6f,rotate);
     CU(cudaDeviceSynchronize());
     std::vector<float> o((size_t)groups*d); CU(cudaMemcpy(o.data(),out,o.size()*4,cudaMemcpyDeviceToHost));
     const float* orf=f32(S.get("out")); double mx=0; for(size_t i=0;i<o.size();++i) mx=fmax(mx,fabs((double)orf[i]));
-    Err e=compare(o,orf,o.size(),mx); bool ok=e.max_rel<5e-3;
-    printf("[compressor_full] s=%d dim=%d d=%d ratio=%d  |o|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",s,dim,d,ratio,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    Err e=compare(o,orf,o.size(),mx); bool ok=e.max_rel< (rotate?2e-2:5e-3);
+    printf("[compressor_full rotate=%d] s=%d dim=%d d=%d  |o|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",(int)rotate,s,dim,d,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
     cudaFree(dx);cudaFree(dwkv);cudaFree(dwg);cudaFree(dape);cudaFree(dn);cudaFree(dc);cudaFree(dsin);cudaFree(out); return ok;
 }
 
@@ -322,7 +323,8 @@ int main(int argc, char** argv) {
     bool ok = true;
     ok &= gate_compressor(dir);
     ok &= gate_compressor_overlap(dir);
-    ok &= gate_compressor_full(dir);
+    ok &= gate_compressor_full(dir, false);
+    ok &= gate_compressor_full(dir, true);
     ok &= gate_hadamard(dir);
     ok &= gate_index_score(dir);
     ok &= gate_act_quant_fp4(dir);

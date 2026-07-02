@@ -69,13 +69,14 @@ void compressor_pool_overlap(float* pooled, const float* kv, const float* score,
 }
 
 // ---------------- full Compressor forward ----------------
-#include "mla_attn.h"     // rmsnorm, rope_interleaved, act_quant_fp8sim
+#include "mla_attn.h"     // rmsnorm, rope_interleaved, act_quant_fp8sim/fp4sim
+#include "indexer.h"      // hadamard
 #include <cstdio>
 #define CU2(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 void compressor_forward(float* out, const float* x, const float* wkv, const float* wgate,
                         const float* ape, const float* norm_w, const float* cosT, const float* sinT,
                         int s, int dim, int d, int ratio, bool overlap, int rope_dim, float eps,
-                        cudaStream_t stream) {
+                        bool rotate, cudaStream_t stream) {
     int coff = overlap ? 2 : 1, groups = s / ratio, od = coff * d;
     float *kv, *score;
     CU2(cudaMalloc(&kv, (size_t)s * od * 4)); CU2(cudaMalloc(&score, (size_t)s * od * 4));
@@ -85,7 +86,8 @@ void compressor_forward(float* out, const float* x, const float* wkv, const floa
     else         compressor_pool(out, kv, score, ape, groups, ratio, d, stream);
     rmsnorm(out, out, norm_w, groups, d, eps, true, stream);
     rope_interleaved(out + (d - rope_dim), cosT, sinT, groups, rope_dim, false, d, 1, stream);
-    act_quant_fp8sim(out, groups, d - rope_dim, 64, d, stream);
+    if (rotate) { hadamard(out, out, groups, d, stream); act_quant_fp4sim(out, groups, d, 32, d, stream); }  // indexer compressor
+    else        { act_quant_fp8sim(out, groups, d - rope_dim, 64, d, stream); }                             // main compressor NoPE
     CU2(cudaStreamSynchronize(stream));
     cudaFree(kv); cudaFree(score);
 }

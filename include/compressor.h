@@ -19,8 +19,9 @@ void compressor_pool_overlap(float* pooled, const float* kv, const float* score,
                              int groups, int ratio, int d, cudaStream_t stream = 0);
 
 // Full Compressor forward (prefill, remainder-free): gemm(wkv/wgate) -> pool -> norm -> RoPE(last 64) ->
-// fp8-sim NoPE. x:[s,dim] -> out:[s/ratio, d]. cos/sin:[s/ratio, 64/2] (compressed-position freqs).
+// [rotate ? hadamard(full d) + fp4-sim(full d) : fp8-sim(NoPE)]. x:[s,dim] -> out:[s/ratio, d].
+// cos/sin:[s/ratio, 64/2] (compressed-position freqs). rotate=True is the DSA indexer's compressor.
 void compressor_forward(float* out, const float* x, const float* wkv, const float* wgate,
                         const float* ape, const float* norm_w, const float* cosT, const float* sinT,
                         int s, int dim, int d, int ratio, bool overlap, int rope_dim, float eps,
-                        cudaStream_t stream = 0);
+                        bool rotate, cudaStream_t stream = 0);

@@ -3,7 +3,8 @@
 The governing charter for this project: fine-tune the DSpark speculative-decoding draft head onto
 `0xSero/DeepSeek-V4-Flash-180B` (REAP K160, NVFP4/FP8) and serve the pair at maximum decode on Jetson
 Thor — such that the **artifact** (REAP model + fine-tuned head) is correct, portable, and beats DFlash,
-while the **tooling** (our Thor CUDA) is fast, disposable, and never contaminates the artifact.
+while the **tooling** (our Thor CUDA — a preserved, first-class repo artifact) is fast and never
+contaminates the artifact.
 
 Ethos: **formal correctness is front-loaded and scarce.** Every step earns the next by producing a
 go/no-go signal against a fixed reference. We spend correctness before we spend speed, and we spend

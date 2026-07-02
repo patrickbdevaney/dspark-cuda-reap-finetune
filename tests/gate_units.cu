@@ -7,6 +7,7 @@
 #include "hc_sinkhorn.h"
 #include "mla_attn.h"
 #include "moe.h"
+#include "hc.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -206,7 +207,30 @@ static bool gate_moe(const std::string& dir) {
     return ok;
 }
 
-// up<T> helper (mirrors gate_mla): upload raw bytes, return typed device ptr.
+static bool gate_hc(const std::string& dir, int) {
+    st::SafeTensors S(dir + "/unit_hc.safetensors");
+    const auto& dm=S.get("dims"); int bs=i32(dm,0), hc=i32(dm,1), d=i32(dm,2), iters=i32(dm,3);
+    void *dx=up(S.get("x")), *dfn=up(S.get("hc_fn")), *dsc=up(S.get("hc_scale")), *dba=up(S.get("hc_base"));
+    void *dxn=up(S.get("x_new"));
+    float *y,*post,*comb; CU(cudaMalloc(&y,(size_t)bs*d*4)); CU(cudaMalloc(&post,(size_t)bs*hc*4)); CU(cudaMalloc(&comb,(size_t)bs*hc*hc*4));
+    hc_pre(y,post,comb,(const float*)dx,(const float*)dfn,(const float*)dsc,(const float*)dba,bs,hc,d,iters,1e-6f);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> vy(bs*d),vp(bs*hc),vc(bs*hc*hc);
+    CU(cudaMemcpy(vy.data(),y,vy.size()*4,cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(vp.data(),post,vp.size()*4,cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(vc.data(),comb,vc.size()*4,cudaMemcpyDeviceToHost));
+    Err ey=compare(vy,f32(S.get("y_pre")),vy.size(),1.0), ep=compare(vp,f32(S.get("post")),vp.size(),1.0), ec=compare(vc,f32(S.get("comb")),vc.size(),1.0);
+    // hc_post using CUDA-computed post/comb, residual = x
+    float* y2; CU(cudaMalloc(&y2,(size_t)bs*hc*d*4));
+    hc_post(y2,(const float*)dxn,(const float*)dx,post,comb,bs,hc,d); CU(cudaDeviceSynchronize());
+    std::vector<float> vy2((size_t)bs*hc*d); CU(cudaMemcpy(vy2.data(),y2,vy2.size()*4,cudaMemcpyDeviceToHost));
+    Err e2=compare(vy2,f32(S.get("y_post")),vy2.size(),1.0);
+    double m=fmax(fmax(ey.max_abs,ep.max_abs),fmax(ec.max_abs,e2.max_abs));
+    bool ok=m<1e-3;
+    printf("[hc] bs=%d hc=%d d=%d  pre=%.2e post=%.2e comb=%.2e postout=%.2e -> %s\n",bs,hc,d,ey.max_abs,ep.max_abs,ec.max_abs,e2.max_abs,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dfn);cudaFree(dsc);cudaFree(dba);cudaFree(dxn);cudaFree(y);cudaFree(post);cudaFree(comb);cudaFree(y2); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
@@ -220,6 +244,7 @@ int main(int argc, char** argv) {
     ok &= gate_fp4_gemm(dir);
     ok &= gate_router(dir);
     ok &= gate_moe(dir);
+    ok &= gate_hc(dir, 0);
     printf("\nGate K (units): %s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }

@@ -195,6 +195,27 @@ def gen_router(out_dir, n=16, dim=256, n_routed=8, topk=2, route_scale=1.5):
     print("[router] n=%d dim=%d n_routed=%d topk=%d" % (n, dim, n_routed, topk))
 
 
+def gen_hc(out_dir, bs=8, hc=4, d=64, eps=1e-6, iters=20):
+    """Hyper-Connections pre + post (model.py:680-693)."""
+    torch.manual_seed(101)
+    x = torch.randn(bs, hc, d); hc_fn = torch.randn((2 + hc) * hc, hc * d) * 0.1
+    scale = torch.randn(3) * 0.5; base = torch.randn((2 + hc) * hc) * 0.5
+    xf = x.reshape(bs, hc * d)
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+    mixes = (xf @ hc_fn.t()) * rsqrt
+    pre, post, comb = K.hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
+    y_pre = (pre.unsqueeze(-1) * x).sum(1)                          # [bs,d]
+    x_new = torch.randn(bs, d)
+    y_post = post.unsqueeze(-1) * x_new.unsqueeze(1) + torch.einsum("bjk,bke->bje", comb, x)   # [bs,hc,d]
+    save_file({
+        "x": x.contiguous(), "hc_fn": hc_fn.contiguous(), "hc_scale": scale.contiguous(), "hc_base": base.contiguous(),
+        "x_new": x_new.contiguous(), "y_pre": y_pre.contiguous(), "post": post.contiguous(),
+        "comb": comb.contiguous(), "y_post": y_post.contiguous(),
+        "dims": torch.tensor([bs, hc, d, iters], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_hc.safetensors"))
+    print("[hc] bs=%d hc=%d d=%d  |y_pre|max=%.4f |y_post|max=%.4f" % (bs, hc, d, y_pre.abs().max().item(), y_post.abs().max().item()))
+
+
 def _fp4x2(t): return t.view(torch.float4_e2m1fn_x2)
 
 
@@ -273,4 +294,5 @@ if __name__ == "__main__":
     gen_fp4_gemm(a.out)
     gen_router(a.out)
     gen_moe(a.out)
+    gen_hc(a.out)
     print("units written to", a.out)

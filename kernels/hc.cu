@@ -1,0 +1,83 @@
+// hc.cu — Hyper-Connections compose, correctness-first (Gate K oracle: ref/gen_units.py gen_hc).
+#include "hc.h"
+#include "hc_sinkhorn.h"
+#include <cstdio>
+#define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
+
+// rsqrt[t] = 1/sqrt(mean(flatten(x[t])^2)+eps). One block per token over hcd = hc*d.
+__global__ void k_rsqrt(float* __restrict__ rsq, const float* __restrict__ x, int bs, int hcd, float eps) {
+    int t = blockIdx.x; if (t >= bs) return;
+    const float* xr = x + (size_t)t * hcd;
+    __shared__ float red[256];
+    float s = 0.f; for (int j = threadIdx.x; j < hcd; j += blockDim.x) s += xr[j] * xr[j];
+    red[threadIdx.x] = s; __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) { if (threadIdx.x < k) red[threadIdx.x] += red[threadIdx.x + k]; __syncthreads(); }
+    if (threadIdx.x == 0) rsq[t] = rsqrtf(red[0] / hcd + eps);
+}
+// mixes[t,m] = (Σ_j x[t,j]*hc_fn[m,j]) * rsq[t]. One warp per (t,m).
+__global__ void k_mixes(float* __restrict__ mixes, const float* __restrict__ x, const float* __restrict__ hc_fn,
+                        const float* __restrict__ rsq, int bs, int mix_hc, int hcd) {
+    int gid = blockIdx.x; int m = gid % mix_hc, t = gid / mix_hc; if (t >= bs) return;
+    int lane = threadIdx.x & 31;
+    const float* xr = x + (size_t)t * hcd; const float* fr = hc_fn + (size_t)m * hcd;
+    float acc = 0.f; for (int j = lane; j < hcd; j += 32) acc += xr[j] * fr[j];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if (lane == 0) mixes[(size_t)t * mix_hc + m] = acc * rsq[t];
+}
+// y[t,e] = Σ_j pre[t,j] * x[t, j*d+e]. thread per (t,e).
+__global__ void k_combine(float* __restrict__ y, const float* __restrict__ pre, const float* __restrict__ x,
+                          int bs, int hc, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= bs * d) return;
+    int t = i / d, e = i % d; float acc = 0.f;
+    for (int j = 0; j < hc; ++j) acc += pre[(size_t)t * hc + j] * x[((size_t)t * hc + j) * d + e];
+    y[i] = acc;
+}
+// pre[t,j] = sigmoid(mixes[t,j]*scale0 + base[j]) + eps  (hc_head)
+__global__ void k_sigmoid_pre(float* __restrict__ pre, const float* __restrict__ mixes,
+                              const float* __restrict__ scale, const float* __restrict__ base,
+                              int bs, int hc, float eps) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= bs * hc) return;
+    int j = i % hc; pre[i] = 1.f / (1.f + expf(-(mixes[i] * scale[0] + base[j]))) + eps;
+}
+// y[t,j,e] = post[t,j]*x_new[t,e] + Σ_k comb[t,j,k]*residual[t,k,e]. thread per (t,j,e).
+__global__ void k_post(float* __restrict__ y, const float* __restrict__ x_new, const float* __restrict__ res,
+                       const float* __restrict__ post, const float* __restrict__ comb, int bs, int hc, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= bs * hc * d) return;
+    int e = i % d, jt = i / d, j = jt % hc, t = jt / hc;
+    float acc = post[(size_t)t * hc + j] * x_new[(size_t)t * d + e];
+    for (int k = 0; k < hc; ++k) acc += comb[((size_t)t * hc + j) * hc + k] * res[((size_t)t * hc + k) * d + e];
+    y[i] = acc;
+}
+
+void hc_pre(float* y, float* post, float* comb, const float* x, const float* hc_fn,
+            const float* hc_scale, const float* hc_base, int bs, int hc, int d,
+            int sinkhorn_iters, float eps, cudaStream_t stream) {
+    int mix_hc = (2 + hc) * hc, hcd = hc * d;
+    float *rsq, *mixes, *pre;
+    CU(cudaMalloc(&rsq, (size_t)bs * 4)); CU(cudaMalloc(&mixes, (size_t)bs * mix_hc * 4)); CU(cudaMalloc(&pre, (size_t)bs * hc * 4));
+    k_rsqrt<<<bs, 256, 0, stream>>>(rsq, x, bs, hcd, eps);
+    k_mixes<<<bs * mix_hc, 32, 0, stream>>>(mixes, x, hc_fn, rsq, bs, mix_hc, hcd);
+    hc_sinkhorn(pre, post, comb, mixes, hc_scale, hc_base, bs, hc, sinkhorn_iters, eps, stream);
+    k_combine<<<(bs * d + 255) / 256, 256, 0, stream>>>(y, pre, x, bs, hc, d);
+    CU(cudaStreamSynchronize(stream));
+    cudaFree(rsq); cudaFree(mixes); cudaFree(pre);
+}
+
+void hc_post(float* y, const float* x_new, const float* residual, const float* post,
+             const float* comb, int bs, int hc, int d, cudaStream_t stream) {
+    k_post<<<(bs * hc * d + 255) / 256, 256, 0, stream>>>(y, x_new, residual, post, comb, bs, hc, d);
+}
+
+void hc_head(float* y, const float* x, const float* hc_fn, const float* hc_scale,
+             const float* hc_base, int bs, int hc, int d, float eps, cudaStream_t stream) {
+    int hcd = hc * d;
+    float *rsq, *mixes, *pre;
+    CU(cudaMalloc(&rsq, (size_t)bs * 4)); CU(cudaMalloc(&mixes, (size_t)bs * hc * 4)); CU(cudaMalloc(&pre, (size_t)bs * hc * 4));
+    k_rsqrt<<<bs, 256, 0, stream>>>(rsq, x, bs, hcd, eps);
+    k_mixes<<<bs * hc, 32, 0, stream>>>(mixes, x, hc_fn, rsq, bs, hc, hcd);          // mix_hc = hc for head
+    k_sigmoid_pre<<<(bs * hc + 255) / 256, 256, 0, stream>>>(pre, mixes, hc_scale, hc_base, bs, hc, eps);
+    k_combine<<<(bs * d + 255) / 256, 256, 0, stream>>>(y, pre, x, bs, hc, d);
+    CU(cudaStreamSynchronize(stream));
+    cudaFree(rsq); cudaFree(mixes); cudaFree(pre);
+}

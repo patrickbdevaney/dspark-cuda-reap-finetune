@@ -318,9 +318,33 @@ static bool gate_act_quant_fp4(const std::string& dir) {
     cudaFree(dx); return ok;
 }
 
+static bool gate_indexer(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_indexer.safetensors");
+    const auto& dm=S.get("dims");
+    int s=i32(dm,0),dim=i32(dm,1),q_lora=i32(dm,2),nh=i32(dm,3),ihd=i32(dm,4),rd=i32(dm,5),ratio=i32(dm,6),itk=i32(dm,7),off=i32(dm,8);
+    int T=s/ratio;
+    void *dx=up(S.get("x")),*dqr=up(S.get("qr")),*dwqb=up(S.get("wq_b")),*dwqbs=up(S.get("wq_b_s")),*dwp=up(S.get("weights_proj"));
+    void *dcwkv=up(S.get("c_wkv")),*dcwg=up(S.get("c_wgate")),*dcape=up(S.get("c_ape")),*dcn=up(S.get("c_norm"));
+    void *dqc=up(S.get("q_cos")),*dqs=up(S.get("q_sin")),*dcc=up(S.get("c_cos")),*dcs=up(S.get("c_sin"));
+    float* isc; int* tk; CU(cudaMalloc(&isc,(size_t)s*T*4)); CU(cudaMalloc(&tk,(size_t)s*T*4));
+    indexer_forward(isc, tk, (const float*)dx,(const float*)dqr,(const unsigned char*)dwqb,(const float*)dwqbs,(const float*)dwp,
+                    (const float*)dcwkv,(const float*)dcwg,(const float*)dcape,(const float*)dcn,
+                    (const float*)dqc,(const float*)dqs,(const float*)dcc,(const float*)dcs,
+                    s,dim,q_lora,nh,ihd,rd,ratio,itk,off,1e-6f);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> v((size_t)s*T); CU(cudaMemcpy(v.data(),isc,v.size()*4,cudaMemcpyDeviceToHost));
+    const float* r=f32(S.get("index_score"));
+    double mx=0,ma=0; for(size_t i=0;i<v.size();++i) if(fabs((double)r[i])<1e29) mx=fmax(mx,fabs((double)r[i]));
+    for(size_t i=0;i<v.size();++i) if(fabs((double)r[i])<1e29) ma=fmax(ma,fabs((double)v[i]-r[i]));
+    bool ok = ma/(mx+1e-9) < 1e-2;
+    printf("[indexer] s=%d T=%d nh=%d idx_hd=%d  valid|sc|max=%.4f max_abs=%.5f rel=%.5f -> %s\n",s,T,nh,ihd,mx,ma,ma/(mx+1e-9),ok?"PASS":"FAIL");
+    return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
+    ok &= gate_indexer(dir);
     ok &= gate_compressor(dir);
     ok &= gate_compressor_overlap(dir);
     ok &= gate_compressor_full(dir, false);

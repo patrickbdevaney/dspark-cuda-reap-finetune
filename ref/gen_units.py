@@ -270,6 +270,58 @@ def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps
     print("[compressor_full rotate=%d] s=%d dim=%d d=%d  |out|max=%.4f" % (int(rotate), s, dim, d, out.abs().max().item()))
 
 
+def _compressor_ref(x, wkv, wgate, ape, norm_w, cos, sin, ratio, d, rope_dim, eps, rotate):
+    """fp32 reference matching CUDA compressor_forward (overlap)."""
+    s = x.shape[0]; groups = s // ratio; od = 2 * d
+    kv = x @ wkv.t(); score = x @ wgate.t()
+    kv_g = kv.reshape(groups, ratio, od); score_g = score.reshape(groups, ratio, od) + ape
+    kv_o = _overlap_transform(kv_g, 0.0, groups, ratio, d); score_o = _overlap_transform(score_g, float("-inf"), groups, ratio, d)
+    pooled = (kv_o * score_o.softmax(dim=1)).sum(dim=1)
+    pooled = pooled.float() * torch.rsqrt(pooled.float().square().mean(-1, keepdim=True) + eps) * norm_w
+    out = pooled.clone(); out[:, -rope_dim:] = _rope_ref(pooled[:, -rope_dim:], cos, sin, False)
+    if rotate:
+        from fast_hadamard_transform import hadamard_transform
+        out = hadamard_transform(out, scale=d ** -0.5); out = K.fp4_act_quant(out, 32, inplace=True)
+    else:
+        out[:, :-rope_dim] = K.act_quant(out[:, :-rope_dim].clone(), 64, "ue8m0", torch.float8_e8m0fnu, inplace=True)
+    return out
+
+
+def gen_indexer(out_dir, s=16, dim=256, q_lora=128, n_heads=8, idx_hd=128, rd=64, ratio=4, index_topk=512, offset=100, eps=1e-6):
+    """Full DSA Indexer forward (replicated via gated primitives). Gates CUDA indexer_forward's index_score."""
+    from fast_hadamard_transform import hadamard_transform
+    torch.manual_seed(117); T = s // ratio; QD = n_heads * idx_hd; od = 2 * idx_hd
+    x = torch.randn(s, dim); qr = torch.randn(s, q_lora)
+    Wqb = torch.randn(QD, q_lora) * 0.1; wqb_p, wqb_s = weight_quant_fp8(Wqb, 128)
+    Wproj = torch.randn(n_heads, dim) * 0.1
+    c_wkv = torch.randn(od, dim) * 0.1; c_wgate = torch.randn(od, dim) * 0.1
+    c_ape = torch.randn(ratio, od) * 0.1; c_norm = torch.randn(idx_hd) * 0.1 + 1.0
+    q_cos, q_sin = torch.cos(torch.randn(s, rd // 2)), torch.sin(torch.randn(s, rd // 2))
+    c_cos, c_sin = torch.cos(torch.randn(T, rd // 2)), torch.sin(torch.randn(T, rd // 2))
+    wscale = idx_hd ** -0.5 * n_heads ** -0.5
+    # q = wq_b(qr) -> rope -> hadamard -> fp4
+    qrq, qrs = K.act_quant(qr, 128, "ue8m0", torch.float8_e8m0fnu)
+    q = K.fp8_gemm(qrq, qrs, wqb_p, wqb_s).reshape(s, n_heads, idx_hd)
+    cos_e = q_cos.unsqueeze(1).expand(s, n_heads, rd // 2).reshape(s * n_heads, rd // 2)
+    sin_e = q_sin.unsqueeze(1).expand(s, n_heads, rd // 2).reshape(s * n_heads, rd // 2)
+    q[:, :, -rd:] = _rope_ref(q[:, :, -rd:].reshape(s * n_heads, rd), cos_e, sin_e, False).reshape(s, n_heads, rd)
+    q = hadamard_transform(q, scale=idx_hd ** -0.5); q = K.fp4_act_quant(q, 32, inplace=True)
+    ckv = _compressor_ref(x, c_wkv, c_wgate, c_ape, c_norm, c_cos, c_sin, ratio, idx_hd, rd, eps, True)   # [T, idx_hd]
+    weights = (x @ Wproj.t()) * wscale
+    isc = torch.einsum("shd,td->sht", q, ckv)
+    isc = (F.relu(isc) * weights.unsqueeze(-1)).sum(dim=1)                          # [s,T]
+    thr = (torch.arange(1, s + 1) // ratio).unsqueeze(1)
+    isc = isc.masked_fill(torch.arange(T).unsqueeze(0) >= thr, -1e30)               # match CUDA -inf sentinel
+    save_file({"x": x.contiguous(), "qr": qr.contiguous(), "wq_b": wqb_p.contiguous(), "wq_b_s": wqb_s.contiguous().float(),
+               "weights_proj": Wproj.contiguous(), "c_wkv": c_wkv.contiguous(), "c_wgate": c_wgate.contiguous(),
+               "c_ape": c_ape.contiguous(), "c_norm": c_norm.contiguous(),
+               "q_cos": q_cos.contiguous(), "q_sin": q_sin.contiguous(), "c_cos": c_cos.contiguous(), "c_sin": c_sin.contiguous(),
+               "index_score": isc.contiguous(),
+               "dims": torch.tensor([s, dim, q_lora, n_heads, idx_hd, rd, ratio, index_topk, offset], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_indexer.safetensors"))
+    print("[indexer] s=%d T=%d n_heads=%d idx_hd=%d  valid|score|max=%.4f" % (s, T, n_heads, idx_hd, isc[isc > -1e29].abs().max().item()))
+
+
 def gen_hadamard(out_dir, rows=8, D=128):
     from fast_hadamard_transform import hadamard_transform
     torch.manual_seed(114)
@@ -399,4 +451,5 @@ if __name__ == "__main__":
     gen_hadamard(a.out)
     gen_index_score(a.out)
     gen_act_quant_fp4(a.out)
+    gen_indexer(a.out)
     print("units written to", a.out)

@@ -195,6 +195,57 @@ def gen_router(out_dir, n=16, dim=256, n_routed=8, topk=2, route_scale=1.5):
     print("[router] n=%d dim=%d n_routed=%d topk=%d" % (n, dim, n_routed, topk))
 
 
+def _fp4x2(t): return t.view(torch.float4_e2m1fn_x2)
+
+
+def gen_moe(out_dir, n=8, dim=256, inter=128, nr=8, na=2, rs=1.5, lim=10.0):
+    """Synthetic score-routed MoE (fp4 experts + fp8 shared) computed via the gated primitives, matching
+    model.py Expert/MoE semantics (routing weight applied to intermediate BEFORE w2's act-quant)."""
+    torch.manual_seed(91)
+    x = torch.randn(n, dim); gate_w = torch.randn(nr, dim) * 0.1; bias = torch.randn(nr) * 0.1
+    W1 = [torch.randn(inter, dim) * 0.1 for _ in range(nr)]
+    W2 = [torch.randn(dim, inter) * 0.1 for _ in range(nr)]
+    W3 = [torch.randn(inter, dim) * 0.1 for _ in range(nr)]
+    q1 = [weight_quant_fp4(W1[e]) for e in range(nr)]; q2 = [weight_quant_fp4(W2[e]) for e in range(nr)]
+    q3 = [weight_quant_fp4(W3[e]) for e in range(nr)]
+    S1, S2, S3 = torch.randn(inter, dim)*0.1, torch.randn(dim, inter)*0.1, torch.randn(inter, dim)*0.1
+    from gen_units import weight_quant_fp8   # local helper
+    s1p, s1s = weight_quant_fp8(S1); s2p, s2s = weight_quant_fp8(S2); s3p, s3s = weight_quant_fp8(S3)
+
+    scores = F.softplus(x.float() @ gate_w.float().t()).sqrt()
+    idx = (scores + bias).topk(na, dim=-1)[1]
+    wts = scores.gather(1, idx); wts = wts / wts.sum(-1, keepdim=True) * rs
+
+    def clampswi(g, u):
+        g = torch.clamp(g, max=lim); u = torch.clamp(u, -lim, lim); return F.silu(g) * u
+    def exp_fp4(xr, e, weight):
+        xq, xs = K.act_quant(xr.unsqueeze(0), 128, "ue8m0", torch.float32)
+        g = K.fp4_gemm(xq, xs, _fp4x2(q1[e][0]), q1[e][1]); u = K.fp4_gemm(xq, xs, _fp4x2(q3[e][0]), q3[e][1])
+        h = weight * clampswi(g, u)
+        hq, hs = K.act_quant(h, 128, "ue8m0", torch.float32)
+        return K.fp4_gemm(hq, hs, _fp4x2(q2[e][0]), q2[e][1])[0]
+    def exp_shared(xr):
+        xq, xs = K.act_quant(xr.unsqueeze(0), 128, "ue8m0", torch.float32)
+        g = K.fp8_gemm(xq, xs, s1p, s1s); u = K.fp8_gemm(xq, xs, s3p, s3s)
+        h = clampswi(g, u); hq, hs = K.act_quant(h, 128, "ue8m0", torch.float32)
+        return K.fp8_gemm(hq, hs, s2p, s2s)[0]
+    y = torch.zeros(n, dim)
+    for t in range(n):
+        for s in range(na): y[t] += exp_fp4(x[t], int(idx[t, s]), float(wts[t, s]))
+        y[t] += exp_shared(x[t])
+
+    d = {"x": x.contiguous(), "gate_w": gate_w.contiguous(), "bias": bias.contiguous(),
+         "y_ref": y.contiguous().float(),
+         "w1": torch.stack([q1[e][0] for e in range(nr)]), "w1s": torch.stack([q1[e][1] for e in range(nr)]).float(),
+         "w2": torch.stack([q2[e][0] for e in range(nr)]), "w2s": torch.stack([q2[e][1] for e in range(nr)]).float(),
+         "w3": torch.stack([q3[e][0] for e in range(nr)]), "w3s": torch.stack([q3[e][1] for e in range(nr)]).float(),
+         "sw1": s1p, "sw1s": s1s.float(), "sw2": s2p, "sw2s": s2s.float(), "sw3": s3p, "sw3s": s3s.float(),
+         "dims": torch.tensor([n, dim, inter, nr, na], dtype=torch.int32),
+         "rs": torch.tensor([rs], dtype=torch.float32), "lim": torch.tensor([lim], dtype=torch.float32)}
+    save_file({k: v.contiguous() for k, v in d.items()}, os.path.join(out_dir, "unit_moe.safetensors"))
+    print("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f" % (n, dim, inter, nr, na, y.abs().max().item()))
+
+
 def gen_ogroup_gemm(out_dir, bs=8, G=2, R=16, Kd=128):
     """Grouped o-LoRA einsum: out[bs,G,R] = sum_d o[bs,G,d]*wo_a[G,R,d]  (model.py:543-546, bf16)."""
     torch.manual_seed(61)
@@ -221,4 +272,5 @@ if __name__ == "__main__":
     gen_ogroup_gemm(a.out)
     gen_fp4_gemm(a.out)
     gen_router(a.out)
+    gen_moe(a.out)
     print("units written to", a.out)

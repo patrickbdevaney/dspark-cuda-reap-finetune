@@ -85,3 +85,99 @@ void moe_router_score(float* weights, int* indices, const float* x, const float*
     router_kernel<<<n, 64, 2 * n_routed * sizeof(float), stream>>>(weights, indices, x, gate_w, bias,
                                                                    n, dim, n_routed, topk, route_scale);
 }
+
+// ================= MoE forward composition =================
+#include "fp8_block_gemm.h"
+#include "mla_attn.h"
+#include <vector>
+#include <cstdio>
+#define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
+
+__global__ void compute_scores_kernel(float* sc, const float* x, const float* gw, int bs, int dim, int nr){
+    int i = blockIdx.x*blockDim.x+threadIdx.x; if(i>=bs*nr) return;
+    int t=i/nr, e=i%nr; const float* xr=x+(size_t)t*dim; const float* gr=gw+(size_t)e*dim;
+    float d=0.f; for(int j=0;j<dim;++j) d+=xr[j]*gr[j];
+    float sp = d>20.f ? d : log1pf(expf(d));
+    sc[i]=sqrtf(sp);
+}
+__global__ void gather_hash_kernel(int* idx, const long* tid2eid, const int* ids, int bs, int na){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=bs*na) return;
+    int t=i/na, s=i%na; idx[i]=(int)tid2eid[(size_t)ids[t]*na + s];
+}
+__global__ void gather_scale_kernel(float* w, const float* sc, const int* idx, int bs, int na, int nr, float rs){
+    int t=blockIdx.x; if(t>=bs) return; if(threadIdx.x) return;
+    float sum=0.f; for(int s=0;s<na;++s){ float v=sc[(size_t)t*nr+idx[(size_t)t*na+s]]; w[(size_t)t*na+s]=v; sum+=v; }
+    for(int s=0;s<na;++s) w[(size_t)t*na+s]=w[(size_t)t*na+s]/sum*rs;
+}
+__global__ void router_topk_kernel(float* w, int* idx, const float* sc, const float* bias,
+                                   int bs, int nr, int na, float rs){
+    int t=blockIdx.x; if(t>=bs||threadIdx.x) return;
+    extern __shared__ float sel[];
+    for(int e=0;e<nr;++e) sel[e]=sc[(size_t)t*nr+e]+(bias?bias[e]:0.f);
+    float sum=0.f;
+    for(int s=0;s<na;++s){ float best=-1e30f; int bi=-1;
+        for(int e=0;e<nr;++e) if(sel[e]>best){best=sel[e];bi=e;}
+        sel[bi]=-1e30f; idx[(size_t)t*na+s]=bi; float o=sc[(size_t)t*nr+bi];
+        w[(size_t)t*na+s]=o; sum+=o; }
+    for(int s=0;s<na;++s) w[(size_t)t*na+s]=w[(size_t)t*na+s]/sum*rs;
+}
+__global__ void swiglu_kernel(float* h, const float* g, const float* u, int n, float lim, float weight){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
+    float gg=g[i], uu=u[i];
+    if(lim>0.f){ gg=fminf(gg,lim); uu=fminf(fmaxf(uu,-lim),lim); }
+    float s = gg/(1.f+expf(-gg));               // silu
+    h[i]= weight * s * uu;
+}
+__global__ void accum_kernel(float* y, const float* v, int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) y[i]+=v[i];
+}
+
+void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeights& w, int bs, cudaStream_t stream){
+    const int dim=w.dim, inter=w.inter, nr=w.n_routed, na=w.n_act;
+    float *sc,*wt,*g,*u,*h,*hs,*xs,*oe; uint8_t *xq,*hq; int *idx;
+    CU(cudaMalloc(&sc,(size_t)bs*nr*4)); CU(cudaMalloc(&wt,(size_t)bs*na*4)); CU(cudaMalloc(&idx,(size_t)bs*na*4));
+    CU(cudaMalloc(&xq,dim)); CU(cudaMalloc(&xs,(dim/128)*4));
+    CU(cudaMalloc(&g,inter*4)); CU(cudaMalloc(&u,inter*4)); CU(cudaMalloc(&h,inter*4));
+    CU(cudaMalloc(&hq,inter)); CU(cudaMalloc(&hs,(inter/128)*4)); CU(cudaMalloc(&oe,dim*4));
+    CU(cudaMemsetAsync(out,0,(size_t)bs*dim*4,stream));
+
+    compute_scores_kernel<<<(bs*nr+63)/64,64,0,stream>>>(sc,x,w.gate_w,bs,dim,nr);
+    if(w.is_hash){
+        gather_hash_kernel<<<(bs*na+63)/64,64,0,stream>>>(idx,w.tid2eid,input_ids,bs,na);
+        gather_scale_kernel<<<bs,32,0,stream>>>(wt,sc,idx,bs,na,nr,w.route_scale);
+    } else {
+        router_topk_kernel<<<bs,32,nr*sizeof(float),stream>>>(wt,idx,sc,w.gate_bias,bs,nr,na,w.route_scale);
+    }
+    std::vector<int> hidx((size_t)bs*na); std::vector<float> hw((size_t)bs*na);
+    CU(cudaStreamSynchronize(stream));
+    CU(cudaMemcpy(hidx.data(),idx,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(hw.data(),wt,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
+
+    size_t w13n=(size_t)inter*(dim/2), w13s=(size_t)inter*(dim/32);
+    size_t w2n=(size_t)dim*(inter/2),  w2s=(size_t)dim*(inter/32);
+    for(int t=0;t<bs;++t){
+        const float* xr=x+(size_t)t*dim;
+        // routed experts (fp4)
+        for(int s=0;s<na;++s){
+            int e=hidx[(size_t)t*na+s]; float wgt=hw[(size_t)t*na+s];
+            act_quant_fp8(xq,xs,xr,1,dim,128,stream);
+            fp4_gemm(g,xq,xs, w.w1+(size_t)e*w13n, w.w1s+(size_t)e*w13s, 1,inter,dim,stream);
+            fp4_gemm(u,xq,xs, w.w3+(size_t)e*w13n, w.w3s+(size_t)e*w13s, 1,inter,dim,stream);
+            swiglu_kernel<<<(inter+63)/64,64,0,stream>>>(h,g,u,inter,w.swiglu_limit,wgt);
+            act_quant_fp8(hq,hs,h,1,inter,128,stream);
+            fp4_gemm(oe,hq,hs, w.w2+(size_t)e*w2n, w.w2s+(size_t)e*w2s, 1,dim,inter,stream);
+            accum_kernel<<<(dim+63)/64,64,0,stream>>>(out+(size_t)t*dim,oe,dim);
+        }
+        // shared expert (fp8), no routing weight
+        act_quant_fp8(xq,xs,xr,1,dim,128,stream);
+        fp8_block_gemm(g,xq,xs, w.sw1, w.sw1s, 1,inter,dim,stream);
+        fp8_block_gemm(u,xq,xs, w.sw3, w.sw3s, 1,inter,dim,stream);
+        swiglu_kernel<<<(inter+63)/64,64,0,stream>>>(h,g,u,inter,w.swiglu_limit,1.f);
+        act_quant_fp8(hq,hs,h,1,inter,128,stream);
+        fp8_block_gemm(oe,hq,hs, w.sw2, w.sw2s, 1,dim,inter,stream);
+        accum_kernel<<<(dim+63)/64,64,0,stream>>>(out+(size_t)t*dim,oe,dim);
+    }
+    CU(cudaStreamSynchronize(stream));
+    cudaFree(sc);cudaFree(wt);cudaFree(idx);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);
+    cudaFree(h);cudaFree(hq);cudaFree(hs);cudaFree(oe);
+}

@@ -181,6 +181,32 @@ static bool gate_router(const std::string& dir) {
     cudaFree(dx);cudaFree(dgw);cudaFree(dbias);cudaFree(dw);cudaFree(di); return ok;
 }
 
+static bool gate_moe(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_moe.safetensors");
+    const auto& dm=S.get("dims"); int n=i32(dm,0), dim=i32(dm,1), inter=i32(dm,2), nr=i32(dm,3), na=i32(dm,4);
+    MoEWeights w{};
+    w.gate_w=(const float*)up(S.get("gate_w")); w.gate_bias=(const float*)up(S.get("bias")); w.tid2eid=nullptr; w.is_hash=false;
+    w.w1=(const uint8_t*)up(S.get("w1")); w.w1s=(const float*)up(S.get("w1s"));
+    w.w2=(const uint8_t*)up(S.get("w2")); w.w2s=(const float*)up(S.get("w2s"));
+    w.w3=(const uint8_t*)up(S.get("w3")); w.w3s=(const float*)up(S.get("w3s"));
+    w.sw1=(const uint8_t*)up(S.get("sw1")); w.sw1s=(const float*)up(S.get("sw1s"));
+    w.sw2=(const uint8_t*)up(S.get("sw2")); w.sw2s=(const float*)up(S.get("sw2s"));
+    w.sw3=(const uint8_t*)up(S.get("sw3")); w.sw3s=(const float*)up(S.get("sw3s"));
+    w.n_routed=nr; w.n_act=na; w.dim=dim; w.inter=inter; w.vocab=0;
+    w.route_scale=f32(S.get("rs"))[0]; w.swiglu_limit=f32(S.get("lim"))[0];
+    const float* x=(const float*)up(S.get("x"));
+    float* out; CU(cudaMalloc(&out,(size_t)n*dim*4));
+    moe_forward(out, x, nullptr, w, n);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> y((size_t)n*dim); CU(cudaMemcpy(y.data(),out,y.size()*4,cudaMemcpyDeviceToHost));
+    const float* yref=f32(S.get("y_ref")); double mx=0; for(size_t i=0;i<y.size();++i) mx=fmax(mx,fabs((double)yref[i]));
+    Err e=compare(y,yref,y.size(),mx); bool ok=e.max_rel<2e-2;
+    printf("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
+           n,dim,inter,nr,na,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    return ok;
+}
+
+// up<T> helper (mirrors gate_mla): upload raw bytes, return typed device ptr.
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
@@ -193,6 +219,7 @@ int main(int argc, char** argv) {
     ok &= gate_ogroup(dir);
     ok &= gate_fp4_gemm(dir);
     ok &= gate_router(dir);
+    ok &= gate_moe(dir);
     printf("\nGate K (units): %s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }

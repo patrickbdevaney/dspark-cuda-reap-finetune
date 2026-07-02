@@ -9,6 +9,7 @@
 #include "moe.h"
 #include "hc.h"
 #include "compressor.h"
+#include "indexer.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -279,12 +280,39 @@ static bool gate_compressor_full(const std::string& dir) {
     cudaFree(dx);cudaFree(dwkv);cudaFree(dwg);cudaFree(dape);cudaFree(dn);cudaFree(dc);cudaFree(dsin);cudaFree(out); return ok;
 }
 
+static bool gate_hadamard(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_hadamard.safetensors");
+    const auto& dm=S.get("dims"); int rows=i32(dm,0), D=i32(dm,1);
+    void* dx=up(S.get("x")); float* dy; CU(cudaMalloc(&dy,(size_t)rows*D*4));
+    hadamard(dy,(const float*)dx,rows,D); CU(cudaDeviceSynchronize());
+    std::vector<float> y((size_t)rows*D); CU(cudaMemcpy(y.data(),dy,y.size()*4,cudaMemcpyDeviceToHost));
+    const float* yr=f32(S.get("y")); double mx=0; for(size_t i=0;i<y.size();++i) mx=fmax(mx,fabs((double)yr[i]));
+    Err e=compare(y,yr,y.size(),mx); bool ok=e.max_rel<1e-3;
+    printf("[hadamard] rows=%d D=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",rows,D,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dy); return ok;
+}
+
+static bool gate_index_score(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_index_score.safetensors");
+    const auto& dm=S.get("dims"); int Sn=i32(dm,0), H=i32(dm,1), d=i32(dm,2), T=i32(dm,3);
+    void *dq=up(S.get("q")), *dkv=up(S.get("kv")), *dw=up(S.get("weights"));
+    float* sc; CU(cudaMalloc(&sc,(size_t)Sn*T*4));
+    index_score(sc,(const float*)dq,(const float*)dkv,(const float*)dw,Sn,T,H,d); CU(cudaDeviceSynchronize());
+    std::vector<float> v((size_t)Sn*T); CU(cudaMemcpy(v.data(),sc,v.size()*4,cudaMemcpyDeviceToHost));
+    const float* r=f32(S.get("score")); double mx=0; for(size_t i=0;i<v.size();++i) mx=fmax(mx,fabs((double)r[i]));
+    Err e=compare(v,r,v.size(),mx); bool ok=e.max_rel<1e-3;
+    printf("[index_score] S=%d H=%d d=%d T=%d  |sc|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",Sn,H,d,T,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dq);cudaFree(dkv);cudaFree(dw);cudaFree(sc); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
     ok &= gate_compressor(dir);
     ok &= gate_compressor_overlap(dir);
     ok &= gate_compressor_full(dir);
+    ok &= gate_hadamard(dir);
+    ok &= gate_index_score(dir);
     ok &= gate_fp8_gemm(dir);
     ok &= gate_hc(dir);
     ok &= gate_sparse_attn(dir);

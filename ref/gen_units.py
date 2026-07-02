@@ -253,6 +253,27 @@ def gen_compressor_full(out_dir, bs=8, dim=256, d=128, ratio=4, rope_dim=64, eps
     print("[compressor_full] s=%d dim=%d d=%d ratio=%d  |out|max=%.4f" % (s, dim, d, ratio, out.abs().max().item()))
 
 
+def gen_hadamard(out_dir, rows=8, D=128):
+    from fast_hadamard_transform import hadamard_transform
+    torch.manual_seed(114)
+    x = torch.randn(rows, D)
+    y = hadamard_transform(x, scale=D ** -0.5)
+    save_file({"x": x.contiguous(), "y": y.contiguous(), "dims": torch.tensor([rows, D], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_hadamard.safetensors"))
+    print("[hadamard] rows=%d D=%d  |y|max=%.4f" % (rows, D, y.abs().max().item()))
+
+
+def gen_index_score(out_dir, S=8, H=8, d=128, T=6):
+    torch.manual_seed(115)
+    q = torch.randn(S, H, d); kv = torch.randn(T, d); weights = torch.randn(S, H) * 0.1
+    score = torch.einsum("shd,td->sht", q, kv)
+    score = (F.relu(score) * weights.unsqueeze(-1)).sum(dim=1)      # [S,T]
+    save_file({"q": q.contiguous(), "kv": kv.contiguous(), "weights": weights.contiguous(),
+               "score": score.contiguous(), "dims": torch.tensor([S, H, d, T], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_index_score.safetensors"))
+    print("[index_score] S=%d H=%d d=%d T=%d  |score|max=%.4f" % (S, H, d, T, score.abs().max().item()))
+
+
 def gen_hc(out_dir, bs=8, hc=4, d=64, eps=1e-6, iters=20):
     """Hyper-Connections pre + post (model.py:680-693)."""
     torch.manual_seed(101)
@@ -357,4 +378,6 @@ if __name__ == "__main__":
     gen_compressor(a.out)
     gen_compressor_overlap(a.out)
     gen_compressor_full(a.out)
+    gen_hadamard(a.out)
+    gen_index_score(a.out)
     print("units written to", a.out)

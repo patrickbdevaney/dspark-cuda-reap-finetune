@@ -62,6 +62,10 @@ with correct outputs at production context length and KV capacity, **reproducibl
 7. **Scarcity of trust.** Every published number is a hypothesis to reproduce, not a fact to lean on
    (96.66 GiB → measured 96.02; 18.946/24.378 tok/s; τ figures; 537K KV). We proceed on *our* measured
    number.
+8. **The weights are single-tenant.** The ~96 GiB target fills most of Thor's 122.8 GiB unified pool;
+   **only one process may hold the full model at a time** (torch reference *xor* CUDA serving *xor*
+   data capture — never two). Full-model steps are sequenced, never overlapped. Per-op / per-block
+   goldens (a few GB) are exempt. Loading two full copies is an instant OOM, not a slow-down.
 
 ---
 

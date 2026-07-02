@@ -5,6 +5,7 @@
 #include "safetensors.h"
 #include "fp8_block_gemm.h"
 #include "hc_sinkhorn.h"
+#include "mla_attn.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -67,10 +68,65 @@ static bool gate_hc(const std::string& dir) {
     return ok;
 }
 
+static bool gate_sparse_attn(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_sparse_attn.safetensors");
+    const auto& dm = S.get("dims");
+    int b=i32(dm,0), m=i32(dm,1), h=i32(dm,2), d=i32(dm,3), n=i32(dm,4), topk=i32(dm,5);
+    float scale = f32(S.get("scale"))[0];
+    void *dq=up(S.get("q")), *dkv=up(S.get("kv")), *dsink=up(S.get("attn_sink")), *didx=up(S.get("topk_idxs"));
+    float* d_o; CU(cudaMalloc(&d_o,(size_t)b*m*h*d*4));
+    sparse_attn(d_o,(const float*)dq,(const float*)dkv,(const float*)dsink,(const int*)didx,b,m,h,d,n,topk,scale);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> o((size_t)b*m*h*d); CU(cudaMemcpy(o.data(),d_o,o.size()*4,cudaMemcpyDeviceToHost));
+    const float* oref=f32(S.get("o_ref"));
+    double mx=0; for(size_t i=0;i<o.size();++i) mx=fmax(mx,fabs((double)oref[i]));
+    Err e=compare(o,oref,o.size(),mx);
+    bool ok=e.max_rel<1e-2;
+    printf("[sparse_attn] b=%d m=%d h=%d d=%d n=%d topk=%d  |o|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
+           b,m,h,d,n,topk,mx,e.max_abs,e.max_rel, ok?"PASS":"FAIL");
+    cudaFree(dq);cudaFree(dkv);cudaFree(dsink);cudaFree(didx);cudaFree(d_o); return ok;
+}
+
+static bool gate_rope(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_rope.safetensors");
+    const auto& dm=S.get("dims"); int rows=i32(dm,0), rd=i32(dm,1);
+    void *dc=up(S.get("cos")), *ds=up(S.get("sin"));
+    auto run=[&](const char* refname, bool inv)->Err{
+        void* dx=up(S.get("x"));
+        rope_interleaved((float*)dx,(const float*)dc,(const float*)ds,rows,rd,inv);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> y((size_t)rows*rd); CU(cudaMemcpy(y.data(),dx,y.size()*4,cudaMemcpyDeviceToHost));
+        Err e=compare(y,f32(S.get(refname)),y.size(),1.0); cudaFree(dx); return e;
+    };
+    Err ef=run("y_fwd",false), ei=run("y_inv",true);
+    bool ok=fmax(ef.max_abs,ei.max_abs)<1e-4;
+    printf("[rope] rows=%d rope_dim=%d  fwd_abs=%.2e inv_abs=%.2e -> %s\n",rows,rd,ef.max_abs,ei.max_abs,ok?"PASS":"FAIL");
+    cudaFree(dc);cudaFree(ds); return ok;
+}
+
+static bool gate_rmsnorm(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_rmsnorm.safetensors");
+    const auto& dm=S.get("dims"); int rows=i32(dm,0), dim=i32(dm,1); float eps=f32(S.get("eps"))[0];
+    void *dx=up(S.get("x")), *dw=up(S.get("weight"));
+    float* dy; CU(cudaMalloc(&dy,(size_t)rows*dim*4));
+    rmsnorm(dy,(const float*)dx,(const float*)dw,rows,dim,eps,true); CU(cudaDeviceSynchronize());
+    std::vector<float> yw((size_t)rows*dim); CU(cudaMemcpy(yw.data(),dy,yw.size()*4,cudaMemcpyDeviceToHost));
+    rmsnorm(dy,(const float*)dx,nullptr,rows,dim,eps,false); CU(cudaDeviceSynchronize());
+    std::vector<float> yn((size_t)rows*dim); CU(cudaMemcpy(yn.data(),dy,yn.size()*4,cudaMemcpyDeviceToHost));
+    Err ew=compare(yw,f32(S.get("y_w")),yw.size(),1.0), en=compare(yn,f32(S.get("y_now")),yn.size(),1.0);
+    bool ok=fmax(ew.max_abs,en.max_abs)<1e-4;
+    printf("[rmsnorm] rows=%d dim=%d  w_abs=%.2e now_abs=%.2e -> %s\n",rows,dim,ew.max_abs,en.max_abs,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dw);cudaFree(dy); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
-    bool a = gate_fp8_gemm(dir);
-    bool b = gate_hc(dir);
-    printf("\nGate K (units): %s\n", (a&&b)?"PASS":"FAIL");
-    return (a&&b)?0:1;
+    bool ok = true;
+    ok &= gate_fp8_gemm(dir);
+    ok &= gate_hc(dir);
+    ok &= gate_sparse_attn(dir);
+    ok &= gate_rope(dir);
+    ok &= gate_rmsnorm(dir);
+    printf("\nGate K (units): %s\n", ok?"PASS":"FAIL");
+    return ok?0:1;
 }

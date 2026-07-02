@@ -62,9 +62,75 @@ def gen_hc_sinkhorn(out_dir, n=64, hc_mult=4, iters=20, eps=1e-6):
           f"pre {tuple(pre.shape)} post {tuple(post.shape)} comb {tuple(comb.shape)}")
 
 
+def gen_sparse_attn(out_dir, b=1, m=8, h=4, d=128, n=24, topk=16):
+    """Gathered top-k attention with a learnable sink (kernel.py:276-368). Single latent KV shared
+    across heads (MLA: 1 kv, h q-heads). Some topk_idxs = -1 (masked)."""
+    torch.manual_seed(21)
+    q = torch.randn(b, m, h, d, dtype=torch.bfloat16)
+    kv = torch.randn(b, n, d, dtype=torch.bfloat16)
+    attn_sink = torch.randn(h, dtype=torch.float32)
+    # per (b,m): topk indices into [0,n), with a few -1 masks
+    idx = torch.randint(0, n, (b, m, topk), dtype=torch.int32)
+    mask = torch.rand(b, m, topk) < 0.25
+    idx = torch.where(mask, torch.full_like(idx, -1), idx)
+    scale = d ** -0.5
+    o = K.sparse_attn(q, kv, attn_sink, idx, scale)          # ref -> [b,m,h,d] bf16
+    save_file({
+        "q": q.contiguous().float(), "kv": kv.contiguous().float(),
+        "attn_sink": attn_sink.contiguous(), "topk_idxs": idx.contiguous(),
+        "o_ref": o.contiguous().float(),
+        "dims": torch.tensor([b, m, h, d, n, topk], dtype=torch.int32),
+        "scale": torch.tensor([scale], dtype=torch.float32),
+    }, os.path.join(out_dir, "unit_sparse_attn.safetensors"))
+    print(f"[sparse_attn] b={b} m={m} h={h} d={d} n={n} topk={topk}  o {tuple(o.shape)} |o|max={o.abs().max():.4f}")
+
+
+def _rope_ref(x, cos, sin, inverse=False):
+    # x:[n,D] (D even), cos/sin:[n,D/2]; matches apply_rotary_emb (interleaved pairs, view_as_complex)
+    xc = x.float().reshape(x.shape[0], -1, 2)
+    xr, xi = xc[..., 0], xc[..., 1]
+    s = -sin if inverse else sin
+    yr = xr * cos - xi * s
+    yi = xr * s + xi * cos
+    return torch.stack([yr, yi], dim=-1).reshape(x.shape)
+
+
+def gen_rope(out_dir, n=32, rope_dim=64):
+    torch.manual_seed(31)
+    x = torch.randn(n, rope_dim)
+    ang = torch.randn(n, rope_dim // 2)          # arbitrary per-pos angles
+    cos, sin = torch.cos(ang), torch.sin(ang)
+    y_fwd = _rope_ref(x, cos, sin, False)
+    y_inv = _rope_ref(x, cos, sin, True)
+    save_file({
+        "x": x.contiguous(), "cos": cos.contiguous(), "sin": sin.contiguous(),
+        "y_fwd": y_fwd.contiguous(), "y_inv": y_inv.contiguous(),
+        "dims": torch.tensor([n, rope_dim], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_rope.safetensors"))
+    print(f"[rope] n={n} rope_dim={rope_dim}  fwd|max={y_fwd.abs().max():.4f}")
+
+
+def gen_rmsnorm(out_dir, n=32, dim=512, eps=1e-6):
+    torch.manual_seed(41)
+    x = torch.randn(n, dim)
+    w = torch.randn(dim) * 0.1 + 1.0
+    yw = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps) * w)
+    yn = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps))   # no-weight (per-head q norm)
+    save_file({
+        "x": x.contiguous(), "weight": w.contiguous(),
+        "y_w": yw.contiguous(), "y_now": yn.contiguous(),
+        "dims": torch.tensor([n, dim], dtype=torch.int32),
+        "eps": torch.tensor([eps], dtype=torch.float32),
+    }, os.path.join(out_dir, "unit_rmsnorm.safetensors"))
+    print(f"[rmsnorm] n={n} dim={dim}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="goldens")
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
     gen_fp8_gemm(a.out)
     gen_hc_sinkhorn(a.out)
+    gen_sparse_attn(a.out)
+    gen_rope(a.out)
+    gen_rmsnorm(a.out)
     print("units written to", a.out)

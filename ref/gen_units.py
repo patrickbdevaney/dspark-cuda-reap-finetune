@@ -8,6 +8,7 @@ Covers the two hardest net-new primitives first: FP8 128-block GEMM and HC/Sinkh
 """
 import os, sys, argparse
 import torch
+import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kernel as K
 from safetensors.torch import save_file
@@ -138,6 +139,62 @@ def gen_act_quant(out_dir, n=32, dim=512, block=64):
     print("[act_quant] n=%d dim=%d block=%d  maxdiff=%.4f" % (n, dim, block, (x.float()-y.float()).abs().max().item()))
 
 
+_E2M1_MAG = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.])   # nibble&7 -> magnitude
+
+
+def weight_quant_fp4(W, block=32):
+    """[N,K] bf16 -> packed fp4 [N,K/2] uint8 (2 nibbles/byte) + per-32 pow2 scale [N,K/32] f32.
+    Nibble = sign(bit3) | nearest-E2M1-magnitude-index. Packing: element k even -> low nibble."""
+    N, K = W.shape
+    Wb = W.float().view(N, K // block, block)
+    amax = Wb.abs().amax(-1, keepdim=True).clamp_min(6 * 2 ** -126)
+    s = _round_pow2(amax / 6.0)
+    scaled = torch.clamp((Wb / s).view(N, K), -6.0, 6.0)
+    mags = _E2M1_MAG.to(scaled.device)
+    idx = (scaled.abs().unsqueeze(-1) - mags).abs().argmin(-1).to(torch.uint8)     # [N,K]
+    nib = idx | ((scaled < 0).to(torch.uint8) << 3)
+    packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).contiguous()                      # [N,K/2]
+    return packed, s.squeeze(-1).contiguous()
+
+
+def gen_fp4_gemm(out_dir, M=32, N=128, K_=256):
+    """FP8-act x FP4-weight GEMM (kernel.py fp4_gemm) — the MoE expert GEMM."""
+    torch.manual_seed(71)
+    A = torch.randn(M, K_)
+    A_fp8, a_s = K.act_quant(A, 128, None, torch.float32)
+    W = torch.randn(N, K_) * 0.1
+    b_packed, b_s = weight_quant_fp4(W, 32)
+    C = K.fp4_gemm(A_fp8, a_s, b_packed.view(torch.float4_e2m1fn_x2), b_s)
+    save_file({
+        "A_fp8": A_fp8.contiguous(), "a_s": a_s.contiguous().float(),
+        "B_fp4": b_packed, "b_s": b_s.contiguous().float(), "C_ref": C.contiguous().float(),
+        "dims": torch.tensor([M, N, K_], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_fp4_gemm.safetensors"))
+    print("[fp4_gemm] M=%d N=%d K=%d  |C|max=%.4f" % (M, N, K_, C.abs().max().item()))
+
+
+def gen_router(out_dir, n=16, dim=256, n_routed=8, topk=2, route_scale=1.5):
+    """noaux_tc score router (sqrtsoftplus, bias for selection only, renorm, *route_scale)."""
+    torch.manual_seed(81)
+    x = torch.randn(n, dim)
+    gate_w = torch.randn(n_routed, dim) * 0.1
+    bias = torch.randn(n_routed) * 0.1
+    scores = (x.float() @ gate_w.float().t())
+    scores = F.softplus(scores).sqrt()
+    orig = scores
+    sel = scores + bias
+    idx = sel.topk(topk, dim=-1)[1]
+    wts = orig.gather(1, idx)
+    wts = wts / wts.sum(-1, keepdim=True) * route_scale
+    save_file({
+        "x": x.contiguous(), "gate_w": gate_w.contiguous(), "bias": bias.contiguous(),
+        "weights_ref": wts.contiguous().float(), "indices_ref": idx.contiguous().int(),
+        "dims": torch.tensor([n, dim, n_routed, topk], dtype=torch.int32),
+        "route_scale": torch.tensor([route_scale], dtype=torch.float32),
+    }, os.path.join(out_dir, "unit_router.safetensors"))
+    print("[router] n=%d dim=%d n_routed=%d topk=%d" % (n, dim, n_routed, topk))
+
+
 def gen_ogroup_gemm(out_dir, bs=8, G=2, R=16, Kd=128):
     """Grouped o-LoRA einsum: out[bs,G,R] = sum_d o[bs,G,d]*wo_a[G,R,d]  (model.py:543-546, bf16)."""
     torch.manual_seed(61)
@@ -162,4 +219,6 @@ if __name__ == "__main__":
     gen_rmsnorm(a.out)
     gen_act_quant(a.out)
     gen_ogroup_gemm(a.out)
+    gen_fp4_gemm(a.out)
+    gen_router(a.out)
     print("units written to", a.out)

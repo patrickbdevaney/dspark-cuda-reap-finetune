@@ -6,6 +6,7 @@
 #include "fp8_block_gemm.h"
 #include "hc_sinkhorn.h"
 #include "mla_attn.h"
+#include "moe.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -148,6 +149,38 @@ static bool gate_ogroup(const std::string& dir) {
     cudaFree(doo);cudaFree(dw);cudaFree(dout); return ok;
 }
 
+static bool gate_fp4_gemm(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_fp4_gemm.safetensors");
+    const auto& dm=S.get("dims"); int M=i32(dm,0), N=i32(dm,1), K=i32(dm,2);
+    void *dA=up(S.get("A_fp8")), *das=up(S.get("a_s")), *dB=up(S.get("B_fp4")), *dbs=up(S.get("b_s"));
+    float* dC; CU(cudaMalloc(&dC,(size_t)M*N*4));
+    fp4_gemm(dC,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> C(M*N); CU(cudaMemcpy(C.data(),dC,(size_t)M*N*4,cudaMemcpyDeviceToHost));
+    const float* Cref=f32(S.get("C_ref")); double mx=0; for(int i=0;i<M*N;++i) mx=fmax(mx,fabs((double)Cref[i]));
+    Err e=compare(C,Cref,M*N,mx); bool ok=e.max_rel<2e-2;
+    printf("[fp4_gemm] M=%d N=%d K=%d  |C|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",M,N,K,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dA);cudaFree(das);cudaFree(dB);cudaFree(dbs);cudaFree(dC); return ok;
+}
+
+static bool gate_router(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_router.safetensors");
+    const auto& dm=S.get("dims"); int n=i32(dm,0), dim=i32(dm,1), nr=i32(dm,2), topk=i32(dm,3);
+    float rs=f32(S.get("route_scale"))[0];
+    void *dx=up(S.get("x")), *dgw=up(S.get("gate_w")), *dbias=up(S.get("bias"));
+    float* dw; int* di; CU(cudaMalloc(&dw,(size_t)n*topk*4)); CU(cudaMalloc(&di,(size_t)n*topk*4));
+    moe_router_score(dw,di,(const float*)dx,(const float*)dgw,(const float*)dbias,n,dim,nr,topk,rs);
+    CU(cudaDeviceSynchronize());
+    std::vector<float> wv(n*topk); std::vector<int> iv(n*topk);
+    CU(cudaMemcpy(wv.data(),dw,(size_t)n*topk*4,cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(iv.data(),di,(size_t)n*topk*4,cudaMemcpyDeviceToHost));
+    const float* wref=f32(S.get("weights_ref")); const int* iref=(const int*)S.get("indices_ref").data;
+    Err e=compare(wv,wref,n*topk,1.0); int idx_mism=0; for(int i=0;i<n*topk;++i) if(iv[i]!=iref[i]) idx_mism++;
+    bool ok = e.max_abs<1e-3 && idx_mism==0;
+    printf("[router] n=%d dim=%d n_routed=%d topk=%d  w_abs=%.2e idx_mismatch=%d -> %s\n",n,dim,nr,topk,e.max_abs,idx_mism,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dgw);cudaFree(dbias);cudaFree(dw);cudaFree(di); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
@@ -158,6 +191,8 @@ int main(int argc, char** argv) {
     ok &= gate_rmsnorm(dir);
     ok &= gate_act_quant(dir);
     ok &= gate_ogroup(dir);
+    ok &= gate_fp4_gemm(dir);
+    ok &= gate_router(dir);
     printf("\nGate K (units): %s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }

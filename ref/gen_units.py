@@ -206,7 +206,8 @@ def gen_hc(out_dir, bs=8, hc=4, d=64, eps=1e-6, iters=20):
     pre, post, comb = K.hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     y_pre = (pre.unsqueeze(-1) * x).sum(1)                          # [bs,d]
     x_new = torch.randn(bs, d)
-    y_post = post.unsqueeze(-1) * x_new.unsqueeze(1) + torch.einsum("bjk,bke->bje", comb, x)   # [bs,hc,d]
+    # model.py hc_post sums comb's FIRST index: y[j,e] = post_j*x_new_e + Σ_i comb[i,j]*x[i,e]
+    y_post = post.unsqueeze(-1) * x_new.unsqueeze(1) + torch.einsum("bij,bie->bje", comb, x)   # [bs,hc,d]
     save_file({
         "x": x.contiguous(), "hc_fn": hc_fn.contiguous(), "hc_scale": scale.contiguous(), "hc_base": base.contiguous(),
         "x_new": x_new.contiguous(), "y_pre": y_pre.contiguous(), "post": post.contiguous(),

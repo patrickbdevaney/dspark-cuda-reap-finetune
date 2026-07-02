@@ -67,58 +67,101 @@ def smoke():
     print("[smoke] PASS — architecture + swapped kernels run end-to-end.")
 
 
+_HF2MA = {"hidden_size": "dim", "moe_intermediate_size": "moe_inter_dim", "num_hidden_layers": "n_layers",
+          "num_hash_layers": "n_hash_layers", "num_nextn_predict_layers": "n_mtp_layers",
+          "num_attention_heads": "n_heads", "num_experts_per_tok": "n_activated_experts",
+          "scoring_func": "score_func", "routed_scaling_factor": "route_scale",
+          "qk_rope_head_dim": "rope_head_dim", "rms_norm_eps": "norm_eps", "sliding_window": "window_size"}
+
+
+def build_args(cfg):
+    """Build ModelArgs from an HF config.json, mapping HF key names -> ModelArgs fields (they differ!)."""
+    fields = M.ModelArgs.__dataclass_fields__; kw = {}
+    for k, v in cfg.items():
+        key = _HF2MA.get(k, k)
+        if key in fields and not isinstance(v, dict):
+            kw[key] = v
+    rs = cfg.get("rope_scaling") or {}
+    for hk, mk in [("factor", "rope_factor"), ("original_max_position_embeddings", "original_seq_len"),
+                   ("beta_fast", "beta_fast"), ("beta_slow", "beta_slow")]:
+        if hk in rs: kw[mk] = rs[hk]
+    return M.ModelArgs(**kw)
+
+
 def block(ckpt, config, layer, seq, out_dir):
+    """Full-Block real-weights golden (pure-sliding, hash-routed layer 1), fp32. Dumps block_in +
+    input_ids + ALL weights (attn + 160 fp4 experts + fp8 shared + gate + hc + norms) + block_out."""
     from safetensors.torch import save_file
     import raw_loader
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device(dev)
-    cfg = json.load(open(config))
-    args = M.ModelArgs(**{k: v for k, v in cfg.items() if k in M.ModelArgs.__dataclass_fields__})
+    torch.set_default_dtype(torch.float32); torch.set_default_device(dev)
+    args = build_args(json.load(open(config)))
     args.max_batch_size = 1; args.max_seq_len = max(256, seq * 2)
-    print(f"[block] device={dev} layer={layer} compress_ratio={args.compress_ratios[layer]}")
-
-    # build only embed + the single block (cheap); reuse Transformer's globals via a bare build
+    assert args.compress_ratios[layer] == 0, f"block gate needs pure-sliding layer (got ratio {args.compress_ratios[layer]})"
     M.world_size = 1; M.rank = 0
     M.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
     M.scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
     M.scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
-    embed = M.ParallelEmbedding(args.vocab_size, args.dim)
-    blk = M.Block(layer, args)
+    print(f"[block] layer={layer} dim={args.dim} inter={args.moe_inter_dim} nr={args.n_routed_experts} "
+          f"na={args.n_activated_experts} hash_layers={args.n_hash_layers} route_scale={args.route_scale}")
 
-    prefix_e = ["embed."]
-    prefix_b = [f"layers.{layer}."]
-    # map our bare modules' names to checkpoint names
+    blk = M.Block(layer, args)
     class Wrap(torch.nn.Module):
-        def __init__(s): super().__init__(); s.embed = embed; s.layers = torch.nn.ModuleList()
+        def __init__(s): super().__init__(); s.layers = torch.nn.ModuleList()
     w = Wrap()
-    # place block at index `layer` so named_parameters -> layers.<layer>.*
     for _ in range(layer): w.layers.append(torch.nn.Module())
     w.layers.append(blk)
-    raw_loader.load_state_into(w, ckpt, only_prefixes=prefix_e + prefix_b)
+    raw_loader.load_state_into(w, ckpt, only_prefixes=[f"layers.{layer}."])
+    blk.attn.wo_a.weight.data = blk.attn.wo_a.weight.data.float()
 
     torch.manual_seed(1234)
-    ids = torch.randint(0, args.vocab_size, (1, seq), device=dev)
-    g = {}
-    h = embed(ids)
-    h = h.unsqueeze(2).repeat(1, 1, args.hc_mult, 1)             # HC expand
-    g["block_in"] = h.reshape(1, seq, -1).clone()
+    x = torch.randn(1, seq, args.hc_mult, args.dim)
+    ids = torch.randint(0, args.vocab_size, (1, seq))
     taps = {}
     def hook(name):
-        def f(mod, inp, out): taps[name] = (out if isinstance(out, torch.Tensor) else out[0]).detach().clone()
-        return f
-    blk.attn_norm.register_forward_hook(hook("attn_norm_out"))
-    blk.attn.register_forward_hook(hook("attn_out"))
-    blk.ffn_norm.register_forward_hook(hook("ffn_norm_out"))
-    blk.ffn.register_forward_hook(hook("ffn_out"))
-    hout = blk(h, 0, ids)
-    g["block_out"] = hout.reshape(1, seq, -1).clone()
-    for k, v in taps.items():
-        g[k] = v.reshape(1, seq, -1) if v.dim() >= 2 else v
+        def fn(m, i, o): taps[name] = (o if isinstance(o, torch.Tensor) else o[0]).detach().clone()
+        return fn
+    blk.attn.register_forward_hook(hook("attn_out"))          # mla output
+    blk.ffn.register_forward_hook(hook("moe_out"))            # moe output
+    out = blk(x, 0, ids)                                       # [1,seq,hc,dim]
+    # recompute the two HC-block boundaries via the reference's own methods (for stage isolation)
+    x1a, post_a, comb_a = blk.hc_pre(x, blk.hc_attn_fn, blk.hc_attn_scale, blk.hc_attn_base)   # [1,s,d]
+    res2 = blk.hc_post(taps["attn_out"], x, post_a, comb_a)   # attn-block output [1,s,hc,d]
+    x1f, _, _ = blk.hc_pre(res2, blk.hc_ffn_fn, blk.hc_ffn_scale, blk.hc_ffn_base)
+
+    a, f = blk.attn, blk.ffn; nr = args.n_routed_experts
+    def u8(p): return p.detach().view(torch.uint8).contiguous().cpu()
+    def ff(p): return p.detach().float().contiguous().cpu()
+    fc = a.freqs_cis[:seq]
+    g = {
+        "block_in": ff(x[0]), "block_out": ff(out[0]), "input_ids": ids[0].int().contiguous().cpu(),
+        "wq_a": u8(a.wq_a.weight), "wq_a_s": ff(a.wq_a.scale), "wq_b": u8(a.wq_b.weight), "wq_b_s": ff(a.wq_b.scale),
+        "wkv": u8(a.wkv.weight), "wkv_s": ff(a.wkv.scale), "wo_b": u8(a.wo_b.weight), "wo_b_s": ff(a.wo_b.scale),
+        "q_norm": ff(a.q_norm.weight), "kv_norm": ff(a.kv_norm.weight),
+        "wo_a": ff(a.wo_a.weight.view(args.o_groups, args.o_lora_rank, -1)), "attn_sink": ff(a.attn_sink),
+        "cos": torch.view_as_real(fc)[..., 0].contiguous().cpu(), "sin": torch.view_as_real(fc)[..., 1].contiguous().cpu(),
+        "attn_norm": ff(blk.attn_norm.weight), "ffn_norm": ff(blk.ffn_norm.weight),
+        "hc_attn_fn": ff(blk.hc_attn_fn), "hc_attn_scale": ff(blk.hc_attn_scale), "hc_attn_base": ff(blk.hc_attn_base),
+        "hc_ffn_fn": ff(blk.hc_ffn_fn), "hc_ffn_scale": ff(blk.hc_ffn_scale), "hc_ffn_base": ff(blk.hc_ffn_base),
+        "gate_w": ff(f.gate.weight), "tid2eid": f.gate.tid2eid.detach().long().contiguous().cpu(),
+        "w1": torch.stack([u8(f.experts[e].w1.weight) for e in range(nr)]), "w1s": torch.stack([ff(f.experts[e].w1.scale) for e in range(nr)]),
+        "w2": torch.stack([u8(f.experts[e].w2.weight) for e in range(nr)]), "w2s": torch.stack([ff(f.experts[e].w2.scale) for e in range(nr)]),
+        "w3": torch.stack([u8(f.experts[e].w3.weight) for e in range(nr)]), "w3s": torch.stack([ff(f.experts[e].w3.scale) for e in range(nr)]),
+        "sw1": u8(f.shared_experts.w1.weight), "sw1s": ff(f.shared_experts.w1.scale),
+        "sw2": u8(f.shared_experts.w2.weight), "sw2s": ff(f.shared_experts.w2.scale),
+        "sw3": u8(f.shared_experts.w3.weight), "sw3s": ff(f.shared_experts.w3.scale),
+        "dims": torch.tensor([seq, args.hc_mult, args.dim, args.moe_inter_dim, nr, args.n_activated_experts, args.vocab_size], dtype=torch.int32),
+        "route_scale": torch.tensor([args.route_scale], dtype=torch.float32),
+        "swiglu_limit": torch.tensor([args.swiglu_limit], dtype=torch.float32),
+        # stage-isolation taps
+        "tap_hc_attn_out": ff(x1a[0]), "tap_attn_out": ff(taps["attn_out"][0]), "tap_res2": ff(res2[0]),
+        "tap_hc_ffn_out": ff(x1f[0]), "tap_moe_out": ff(taps["moe_out"][0]),
+        "tap_post_a": ff(post_a[0]), "tap_comb_a": ff(comb_a[0]),
+    }
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"golden_layer{layer}_seq{seq}.safetensors")
-    save_file({k: v.contiguous().cpu().to(torch.float32) for k, v in g.items()}, path)
-    print(f"[block] wrote {path}: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in g.items()))
+    path = os.path.join(out_dir, f"block_layer{layer}_seq{seq}.safetensors")
+    save_file({k: v.contiguous() for k, v in g.items()}, path)
+    print(f"[block] wrote {path} ({os.path.getsize(path)/1e9:.2f} GB)  |out|max={out.abs().max():.4f}")
 
 
 def mla(ckpt, config, layer, seq, out_dir):
@@ -130,8 +173,7 @@ def mla(ckpt, config, layer, seq, out_dir):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_default_dtype(torch.float32)          # fp32 activations to match the CUDA path
     torch.set_default_device(dev)
-    cfg = json.load(open(config))
-    args = M.ModelArgs(**{k: v for k, v in cfg.items() if k in M.ModelArgs.__dataclass_fields__})
+    args = build_args(json.load(open(config)))
     args.max_batch_size = 1; args.max_seq_len = max(256, seq * 2)
     assert args.compress_ratios[layer] == 0, f"layer {layer} is not pure-sliding (ratio={args.compress_ratios[layer]})"
     M.world_size = 1; M.rank = 0

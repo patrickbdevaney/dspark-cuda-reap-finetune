@@ -46,7 +46,8 @@ __global__ void k_post(float* __restrict__ y, const float* __restrict__ x_new, c
     int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= bs * hc * d) return;
     int e = i % d, jt = i / d, j = jt % hc, t = jt / hc;
     float acc = post[(size_t)t * hc + j] * x_new[(size_t)t * d + e];
-    for (int k = 0; k < hc; ++k) acc += comb[((size_t)t * hc + j) * hc + k] * res[((size_t)t * hc + k) * d + e];
+    // model.py:692 sums comb's FIRST index: y[j,e] = post_j*x_new_e + Σ_i comb[i,j]*residual[i,e]
+    for (int i2 = 0; i2 < hc; ++i2) acc += comb[((size_t)t * hc + i2) * hc + j] * res[((size_t)t * hc + i2) * d + e];
     y[i] = acc;
 }
 

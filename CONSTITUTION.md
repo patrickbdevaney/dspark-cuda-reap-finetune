@@ -24,10 +24,18 @@ There are exactly two things we produce, and they must never be confused:
    enough to be accepted.* This property is identical on Thor, a DGX Spark, or a B200, under vLLM,
    SGLang, or our binary. The product outlives every line of our CUDA.
 
-2. **The MEANS — hardware-locked tooling.** Our Thor `sm_110a` CUDA training kernels and inference
-   server. Speciated to this die's roofline, smem, NVFP4/FP8 intrinsics. **Disposable.** They exist to
-   (a) capture training data from the real target fast, (b) train the head, (c) serve it at peak decode
-   locally. They may be rewritten wholesale for the next chip without touching the product.
+2. **The MEANS — hardware-specialized tooling (a first-class, preserved artifact).** Our Thor `sm_110a`
+   CUDA: the model-architecture primitives, the draft-head **fine-tuning** kernels, and the **inference
+   server**. Speciated to this die's roofline, smem, NVFP4/FP8 intrinsics. They exist to (a) capture
+   training data from the real target fast, (b) train the head, (c) serve it at peak decode locally.
+   **"Speciated" does NOT mean "disposable."** Every line of this CUDA is a deliverable in its own right —
+   the hand-rolled low-level exposition of this model's architecture, its draft head, the fine-tuning
+   process, and the serving engine — and **all of it lives in this repo, version-controlled, never
+   throwaway scratch.** It is *portable-in-principle* (re-tunable for the next chip via intrinsic
+   substitution + retuning, per the CUDA_ENGINEERING_CONSTITUTION), but it is *retained-in-practice*: the
+   repo is the canonical home of both products — the portable weights **and** the Thor CUDA that runs them.
+   The distinction from item 1 is only about *portability of the artifact* (weights run anywhere; these
+   kernels are Thor-tuned), never about whether the CUDA is worth keeping. It is. Keep it, in the repo.
 
 **The bridge between them is the only reason this works:** a hardware-locked tool that emits a
 hardware-independent artifact is valid **only if the tool's numerics equal the reference's numerics.**

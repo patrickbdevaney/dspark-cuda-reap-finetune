@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <memory>
 #include <stdexcept>
 #include <fcntl.h>
 #include <unistd.h>
@@ -105,6 +106,69 @@ private:
     int fd_ = -1; size_t filesize_ = 0; const uint8_t* base_ = nullptr;
     const uint8_t* data_start_ = nullptr; size_t data_bytes_ = 0;
     std::unordered_map<std::string, Tensor> tensors_;
+};
+
+// --- read whole file into a std::string (for index.json) ---
+inline std::string read_file(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("open failed: " + path);
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::string s(n, '\0');
+    if (fread(&s[0], 1, n, f) != (size_t)n) { fclose(f); throw std::runtime_error("read failed: " + path); }
+    fclose(f); return s;
+}
+
+// Multi-shard reader driven by model.safetensors.index.json (weight_map: name -> shard file).
+// Lazily mmaps each shard on first touch; get(name) resolves across shards. Header-only parse is cheap
+// (does not fault tensor bytes) so enumeration/validation runs at tiny RSS even for a 100GB checkpoint.
+class ShardedSafeTensors {
+public:
+    // key_map: optional normalization applied to each checkpoint name -> internal name.
+    explicit ShardedSafeTensors(const std::string& dir,
+                                std::string (*key_map)(const std::string&) = nullptr)
+        : dir_(dir) {
+        std::string idx = read_file(dir + "/model.safetensors.index.json");
+        JsonP j(idx.data(), idx.size());
+        if (!j.eat('{')) throw std::runtime_error("index: expected object");
+        do {
+            std::string k = j.str(); j.eat(':');
+            if (k == "weight_map") {
+                j.eat('{'); j.ws();
+                if (!j.eat('}')) {
+                    do { std::string name = j.str(); j.eat(':'); std::string file = j.str();
+                         weight_map_.emplace(std::move(name), std::move(file)); } while (j.eat(','));
+                    j.eat('}');
+                }
+            } else j.skip_value();
+        } while (j.eat(','));
+        // Open every distinct shard once (mmap is lazy; only headers get faulted here).
+        for (auto& kv : weight_map_) {
+            const std::string& file = kv.second;
+            if (!shards_.count(file)) shards_[file].reset(new SafeTensors(dir_ + "/" + file));
+        }
+        // Build the resolved name -> Tensor map (applying key_map).
+        for (auto& kv : weight_map_) {
+            const Tensor& t = shards_[kv.second]->get(kv.first);
+            std::string internal = key_map ? key_map(kv.first) : kv.first;
+            tensors_.emplace(std::move(internal), t);
+        }
+    }
+
+    bool has(const std::string& name) const { return tensors_.count(name) > 0; }
+    const Tensor& get(const std::string& name) const {
+        auto it = tensors_.find(name);
+        if (it == tensors_.end()) throw std::runtime_error("tensor not found: " + name);
+        return it->second;
+    }
+    const std::unordered_map<std::string, Tensor>& all() const { return tensors_; }
+    size_t count() const { return tensors_.size(); }
+    size_t shardCount() const { return shards_.size(); }
+
+private:
+    std::string dir_;
+    std::unordered_map<std::string, std::string> weight_map_;            // name -> shard file
+    std::unordered_map<std::string, std::unique_ptr<SafeTensors>> shards_;
+    std::unordered_map<std::string, Tensor> tensors_;                    // internal name -> Tensor
 };
 
 } // namespace st

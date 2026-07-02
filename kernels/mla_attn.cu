@@ -98,3 +98,48 @@ void rmsnorm(float* y, const float* x, const float* weight, int rows, int dim,
              float eps, bool has_weight, cudaStream_t stream) {
     rmsnorm_kernel<<<rows, 256, 0, stream>>>(y, x, weight, rows, dim, eps, has_weight ? 1 : 0);
 }
+
+// ---------------- act_quant_fp8sim ----------------
+// Per (row, block-of-`block`): amax -> pow2 scale (ue8m0) -> clamp(x/scale) to e4m3 -> dequant*scale.
+// One block per (row, group); threads cover the group. Matches kernel.py act_quant(inplace, round_scale).
+#include <cuda_fp8.h>
+__global__ void act_quant_fp8sim_kernel(float* __restrict__ x, int rows, int dim, int block) {
+    int ng = dim / block; int gid = blockIdx.x; if (gid >= rows * ng) return;
+    int row = gid / ng, g = gid % ng;
+    float* xr = x + (size_t)row * dim + (size_t)g * block;
+    extern __shared__ float red[];
+    float v = (threadIdx.x < block) ? fabsf(xr[threadIdx.x]) : 0.f;
+    red[threadIdx.x] = v; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]); __syncthreads(); }
+    float amax = fmaxf(red[0], 1e-4f);
+    float scale = exp2f(ceilf(log2f(amax * (1.f / 448.f))));      // pow2 (ue8m0)
+    if (threadIdx.x < block) {
+        float q = fminf(fmaxf(xr[threadIdx.x] / scale, -448.f), 448.f);
+        __nv_fp8_e4m3 e = __nv_fp8_e4m3(q);
+        __half_raw hr = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)e.__x, __NV_E4M3);
+        xr[threadIdx.x] = __half2float(*reinterpret_cast<__half*>(&hr)) * scale;
+    }
+}
+void act_quant_fp8sim(float* x, int rows, int dim, int block, cudaStream_t stream) {
+    int threads = block < 32 ? 32 : block;
+    act_quant_fp8sim_kernel<<<rows * (dim / block), threads, threads * sizeof(float), stream>>>(x, rows, dim, block);
+}
+
+// ---------------- ogroup_gemm ----------------
+// out[bs,G,R] = sum_d o[bs,G,d] * wo_a[G,R,d]. One warp per (bs,G,R) reducing over d.
+__global__ void ogroup_gemm_kernel(float* __restrict__ out, const float* __restrict__ o,
+                                   const float* __restrict__ wo_a, int bs, int G, int R, int Kd) {
+    int gid = blockIdx.x; int r = gid % R; int bg = gid / R; int gg = bg % G; int bb = bg / G;
+    int lane = threadIdx.x & 31;
+    const float* op = o + (((size_t)bb * G + gg) * Kd);
+    const float* wp = wo_a + (((size_t)gg * R + r) * Kd);
+    float acc = 0.f;
+    for (int d = lane; d < Kd; d += 32) acc += op[d] * wp[d];
+    #pragma unroll
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
+    if (lane == 0) out[((size_t)bb * G + gg) * R + r] = acc;
+}
+void ogroup_gemm(float* out, const float* o, const float* wo_a,
+                 int bs, int G, int R, int Kd, cudaStream_t stream) {
+    ogroup_gemm_kernel<<<bs * G * R, 32, 0, stream>>>(out, o, wo_a, bs, G, R, Kd);
+}

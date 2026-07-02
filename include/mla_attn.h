@@ -18,3 +18,10 @@ void rope_interleaved(float* x, const float* cosT, const float* sinT,
 // y[rows,dim] = x * rsqrt(mean(x^2)+eps) * (weight if has_weight). fp32.
 void rmsnorm(float* y, const float* x, const float* weight, int rows, int dim,
              float eps, bool has_weight, cudaStream_t stream = 0);
+
+// Fused FP8 QAT-sim: per `block`-group along dim, quant->e4m3 (pow2/ue8m0 scale)->dequant, in-place. fp32.
+void act_quant_fp8sim(float* x, int rows, int dim, int block, cudaStream_t stream = 0);
+
+// Grouped o-LoRA GEMM: out[bs,G,R] = sum_d o[bs,G,d] * wo_a[G,R,d]. fp32.
+void ogroup_gemm(float* out, const float* o, const float* wo_a,
+                 int bs, int G, int R, int Kd, cudaStream_t stream = 0);

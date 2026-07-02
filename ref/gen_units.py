@@ -125,6 +125,33 @@ def gen_rmsnorm(out_dir, n=32, dim=512, eps=1e-6):
     print(f"[rmsnorm] n={n} dim={dim}")
 
 
+def gen_act_quant(out_dir, n=32, dim=512, block=64):
+    """Fused FP8 QAT-sim (quant->dequant back to input dtype), ue8m0 pow2 scale (kernel.py act_quant
+    inplace=True; used on KV NoPE dims model.py:512)."""
+    torch.manual_seed(51)
+    x = torch.randn(n, dim, dtype=torch.bfloat16)
+    y = K.act_quant(x.clone(), block, "ue8m0", torch.float8_e8m0fnu, inplace=True)   # in-place -> bf16
+    save_file({
+        "x": x.contiguous().float(), "y_ref": y.contiguous().float(),
+        "dims": torch.tensor([n, dim, block], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_act_quant.safetensors"))
+    print("[act_quant] n=%d dim=%d block=%d  maxdiff=%.4f" % (n, dim, block, (x.float()-y.float()).abs().max().item()))
+
+
+def gen_ogroup_gemm(out_dir, bs=8, G=2, R=16, Kd=128):
+    """Grouped o-LoRA einsum: out[bs,G,R] = sum_d o[bs,G,d]*wo_a[G,R,d]  (model.py:543-546, bf16)."""
+    torch.manual_seed(61)
+    o = torch.randn(bs, G, Kd, dtype=torch.bfloat16)
+    wo_a = (torch.randn(G, R, Kd, dtype=torch.bfloat16) * 0.05)
+    out = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float())
+    save_file({
+        "o": o.contiguous().float(), "wo_a": wo_a.contiguous().float(),
+        "out_ref": out.contiguous().float(),
+        "dims": torch.tensor([bs, G, R, Kd], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_ogroup_gemm.safetensors"))
+    print(f"[ogroup_gemm] bs={bs} G={G} R={R} Kd={Kd}  |out|max={out.abs().max():.4f}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--out", default="goldens")
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
@@ -133,4 +160,6 @@ if __name__ == "__main__":
     gen_sparse_attn(a.out)
     gen_rope(a.out)
     gen_rmsnorm(a.out)
+    gen_act_quant(a.out)
+    gen_ogroup_gemm(a.out)
     print("units written to", a.out)

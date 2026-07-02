@@ -119,6 +119,35 @@ static bool gate_rmsnorm(const std::string& dir) {
     cudaFree(dx);cudaFree(dw);cudaFree(dy); return ok;
 }
 
+static bool gate_act_quant(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_act_quant.safetensors");
+    const auto& dm=S.get("dims"); int rows=i32(dm,0), dim=i32(dm,1), block=i32(dm,2);
+    void* dx=up(S.get("x"));
+    act_quant_fp8sim((float*)dx, rows, dim, block); CU(cudaDeviceSynchronize());
+    std::vector<float> y((size_t)rows*dim); CU(cudaMemcpy(y.data(),dx,y.size()*4,cudaMemcpyDeviceToHost));
+    const float* yr=f32(S.get("y_ref"));
+    double mx=0; for(size_t i=0;i<y.size();++i) mx=fmax(mx,fabs((double)yr[i]));
+    Err e=compare(y,yr,y.size(),mx);
+    bool ok=e.max_rel<1e-3;
+    printf("[act_quant] rows=%d dim=%d block=%d  max_abs=%.5f max_rel=%.5f -> %s\n",rows,dim,block,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dx); return ok;
+}
+
+static bool gate_ogroup(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_ogroup_gemm.safetensors");
+    const auto& dm=S.get("dims"); int bs=i32(dm,0), G=i32(dm,1), R=i32(dm,2), Kd=i32(dm,3);
+    void *doo=up(S.get("o")), *dw=up(S.get("wo_a"));
+    float* dout; CU(cudaMalloc(&dout,(size_t)bs*G*R*4));
+    ogroup_gemm(dout,(const float*)doo,(const float*)dw,bs,G,R,Kd); CU(cudaDeviceSynchronize());
+    std::vector<float> out((size_t)bs*G*R); CU(cudaMemcpy(out.data(),dout,out.size()*4,cudaMemcpyDeviceToHost));
+    const float* oref=f32(S.get("out_ref"));
+    double mx=0; for(size_t i=0;i<out.size();++i) mx=fmax(mx,fabs((double)oref[i]));
+    Err e=compare(out,oref,out.size(),mx);
+    bool ok=e.max_rel<1e-2;
+    printf("[ogroup_gemm] bs=%d G=%d R=%d Kd=%d  |out|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",bs,G,R,Kd,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(doo);cudaFree(dw);cudaFree(dout); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
@@ -127,6 +156,8 @@ int main(int argc, char** argv) {
     ok &= gate_sparse_attn(dir);
     ok &= gate_rope(dir);
     ok &= gate_rmsnorm(dir);
+    ok &= gate_act_quant(dir);
+    ok &= gate_ogroup(dir);
     printf("\nGate K (units): %s\n", ok?"PASS":"FAIL");
     return ok?0:1;
 }

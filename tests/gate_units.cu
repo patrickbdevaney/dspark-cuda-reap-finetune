@@ -8,6 +8,7 @@
 #include "mla_attn.h"
 #include "moe.h"
 #include "hc.h"
+#include "compressor.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -231,9 +232,27 @@ static bool gate_hc(const std::string& dir, int) {
     cudaFree(dx);cudaFree(dfn);cudaFree(dsc);cudaFree(dba);cudaFree(dxn);cudaFree(y);cudaFree(post);cudaFree(comb);cudaFree(y2); return ok;
 }
 
+static bool gate_compressor(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_compressor.safetensors");
+    const auto& dm=S.get("dims"); int bs=i32(dm,0), dim=i32(dm,1), d=i32(dm,2), ratio=i32(dm,3);
+    int groups=bs/ratio;
+    void *dx=up(S.get("x")), *dwkv=up(S.get("wkv")), *dwg=up(S.get("wgate")), *dape=up(S.get("ape"));
+    float *kv,*score,*pooled;
+    CU(cudaMalloc(&kv,(size_t)bs*d*4)); CU(cudaMalloc(&score,(size_t)bs*d*4)); CU(cudaMalloc(&pooled,(size_t)groups*d*4));
+    gemm_fp32(kv,(const float*)dx,(const float*)dwkv,bs,d,dim);
+    gemm_fp32(score,(const float*)dx,(const float*)dwg,bs,d,dim);
+    compressor_pool(pooled,kv,score,(const float*)dape,groups,ratio,d); CU(cudaDeviceSynchronize());
+    std::vector<float> p((size_t)groups*d); CU(cudaMemcpy(p.data(),pooled,p.size()*4,cudaMemcpyDeviceToHost));
+    const float* pr=f32(S.get("pooled")); double mx=0; for(size_t i=0;i<p.size();++i) mx=fmax(mx,fabs((double)pr[i]));
+    Err e=compare(p,pr,p.size(),mx); bool ok=e.max_rel<1e-3;
+    printf("[compressor] bs=%d d=%d ratio=%d  |pooled|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",bs,d,ratio,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
+    cudaFree(dx);cudaFree(dwkv);cudaFree(dwg);cudaFree(dape);cudaFree(kv);cudaFree(score);cudaFree(pooled); return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
+    ok &= gate_compressor(dir);
     ok &= gate_fp8_gemm(dir);
     ok &= gate_hc(dir);
     ok &= gate_sparse_attn(dir);

@@ -195,6 +195,21 @@ def gen_router(out_dir, n=16, dim=256, n_routed=8, topk=2, route_scale=1.5):
     print("[router] n=%d dim=%d n_routed=%d topk=%d" % (n, dim, n_routed, topk))
 
 
+def gen_compressor(out_dir, bs=8, dim=256, d=128, ratio=4):
+    """KV Compressor gated-pooling core (non-overlap prefill; model.py:329-348)."""
+    torch.manual_seed(111)
+    x = torch.randn(bs, dim); wkv = torch.randn(d, dim) * 0.1; wgate = torch.randn(d, dim) * 0.1
+    ape = torch.randn(ratio, d) * 0.1
+    kv = x @ wkv.t(); score = x @ wgate.t()
+    kv_g = kv.reshape(bs // ratio, ratio, d); score_g = score.reshape(bs // ratio, ratio, d) + ape
+    pooled = (kv_g * score_g.softmax(dim=1)).sum(1)                 # [groups, d]
+    save_file({
+        "x": x.contiguous(), "wkv": wkv.contiguous(), "wgate": wgate.contiguous(), "ape": ape.contiguous(),
+        "pooled": pooled.contiguous(), "dims": torch.tensor([bs, dim, d, ratio], dtype=torch.int32),
+    }, os.path.join(out_dir, "unit_compressor.safetensors"))
+    print("[compressor] bs=%d dim=%d d=%d ratio=%d  |pooled|max=%.4f" % (bs, dim, d, ratio, pooled.abs().max().item()))
+
+
 def gen_hc(out_dir, bs=8, hc=4, d=64, eps=1e-6, iters=20):
     """Hyper-Connections pre + post (model.py:680-693)."""
     torch.manual_seed(101)
@@ -296,4 +311,5 @@ if __name__ == "__main__":
     gen_router(a.out)
     gen_moe(a.out)
     gen_hc(a.out)
+    gen_compressor(a.out)
     print("units written to", a.out)

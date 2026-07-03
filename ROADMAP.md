@@ -165,7 +165,38 @@ compressed_block_forward L2-42) + hc_head/norm/lm_head → **Gate 1** (first ful
    **decode tok/s** (baseline single-stream ~18.9). First time the whole 180B runs on Thor.
    - Optional full-model golden: dump ref logits for a short prompt, compare (or spot-check top-k).
 
-### Phase B — DSpark MTP draft head → GATE 2  (pivotal go/no-go)  [HEAD BUILT — compiles]
+### REORDERED PLAN (user directive, turn ~42) + strategy corrections
+**Order:** (a) build the REAL DSpark block-diffusion head + true block-τ  →  (b) **optimize decode kernels
+until no more levers** (Marlin-class mma.sync GEMMs + gemma-cuda-hybrid techniques + our opts, in concert
+with the draft head; target **38–50 tok/s**) — PREREQUISITE that makes capture feasible (current correctness-
+first kernels ~1 tok/s → capture would take years)  →  (c) SOTA **representative** capture set + max block-
+acceptance training.
+**STRATEGY CORRECTION (user):** the head predicts *what the base model would say* — CANNOT domain-specialize
+beyond faithful mimicry. Acceptance varies by domain only because the target's own output ENTROPY varies (code
+low-entropy → long accepted blocks; open reasoning high-entropy → short). Capture = **representative on-policy
+coverage** of the served workload, NOT per-domain skill tuning. Lever = faithful mimicry (token-CE + top-k
+logit-KD) + coverage + block/Markov structure. Optimize **E[accepted block length]**, measured per-domain.
+**Wall-time (optimized):** capture ~½–1 day dedicated (≪ if harvested during serving — SpecForge taps-during-
+inference drops prefill 6.16hr→0); training hours (head-only ~2.5GB, 3 epochs). Total ~1–2 days, capture-
+dominated. Warm-start → ~5–20M tokens (τ already ~0.8-class).
+
+### THE REAL DSpark head (`~/models/DeepSeek-V4-Flash-DSpark-head`, 48 shards) — SPEC for build (a)
+NOT the REAP built-in `mtp.0` MTPBlock (plain next-token; my `dspark.cu` = that stepping stone, proxy τ@0=0.815).
+REAL head (modeling-notes §10; READ the DSpark-head repo's own `inference/model.py` — differs from REAP one):
+block-diffusion MTP, shares main embed+head, `compress_ratio=0` (pure sliding).
+- **Tap:** main model appends `h.mean(dim=2)` (HC 4→mean) at layers **40,41,42** → `main_hidden=[b,s,3d]`.
+- **forward_embed:** `main_x=main_norm(main_proj(main_hidden))` (fp8 3d→d); draft input `[ids, noise×4]`
+  (block_size=5, rest=`noise_token_id 128799`) → embed → 4 HC copies.
+- **DSparkAttention:** start_pos==0 builds sliding-128 KV from main_x; decode: q/kv over block, sparse_attn
+  over `[sliding main-KV ⊕ block]`.
+- **forward_head:** hc_head→norm→head → per-block **AR** sample of 5; each step adds **Markov bias**
+  `markov_head(prev_id)` (bigram embed rank-256→head); a **confidence head** scores each draft token from
+  `[hidden ⊕ markov_embed]`. Returns (output_ids[6], logits, confidence).
+- **Weights:** `mtp.0.{main_proj(+scale),main_norm}`+full block; `markov_head.markov_w1/w2` (on mtp.2 — CONFIRM
+  3-block wiring). **Verify/accept loop NOT in reference** — build in harness (draft output_ids vs target,
+  accept longest matching prefix, confidence early-exit). Loader: WeightStore reads raw shards; mp=1.
+
+### Phase B(proxy, DONE) — REAP built-in MTPBlock → measured τ@0=0.815
 **Architecture (model.py MTPBlock:756-783), fully mapped:** the head is a `Block` subclass, layer_id=43 →
 `compress_ratio(43)=0` → **PURE-SLIDING block → reuses `block_forward`** (+ `mtp.0.*` weights), wrapped:
 ```

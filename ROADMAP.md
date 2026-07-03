@@ -160,7 +160,31 @@ compressed_block_forward L2-42) + hc_head/norm/lm_head → **Gate 1** (first ful
    **decode tok/s** (baseline single-stream ~18.9). First time the whole 180B runs on Thor.
    - Optional full-model golden: dump ref logits for a short prompt, compare (or spot-check top-k).
 
-### Phase B — DSpark MTP draft head → GATE 2  (pivotal go/no-go)
+### Phase B — DSpark MTP draft head → GATE 2  (pivotal go/no-go)  [HEAD BUILT — compiles]
+**Architecture (model.py MTPBlock:756-783), fully mapped:** the head is a `Block` subclass, layer_id=43 →
+`compress_ratio(43)=0` → **PURE-SLIDING block → reuses `block_forward`** (+ `mtp.0.*` weights), wrapped:
+```
+e  = enorm( embed(input_ids) )                 # enorm: RMSNorm bf16;  embed shared (bf16 lookup)
+xh = hnorm( x )                                # x = main model's final [s,hc,d] HC state; hnorm bf16
+x' = e_proj(e).unsqueeze(hc) + h_proj(xh)      # e_proj,h_proj: FP8 [4096,4096]+scale (act_quant+fp8_block_gemm)
+x' = block_forward(x', mtp_block_weights, s)   # full pure-sliding Block (attn+MoE+HC), mtp.0.* weights
+logits = hc_head(x', mtp.hc_head_{fn,scale,base}) -> mtp.norm(bf16) -> lm_head(head.weight, shared)
+```
+**mtp.0.* weights (999 tensors):** full block set (`attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}`,
+`attn.{q_norm,kv_norm}`, `attn_sink`, `{attn_norm,ffn_norm}`, `hc_{attn,ffn}_{fn,scale,base}`,
+`ffn.gate.{weight,bias}` [NOT hash — layer 43], `ffn.experts.{0..159}.{w1,w2,w3}.{weight,scale}`,
+`ffn.shared_experts.*`) PLUS head-specific: `e_proj.{weight,scale}` `h_proj.{weight,scale}` (FP8 4096×4096)
+`enorm.weight` `hnorm.weight` `norm.weight` (bf16) `hc_head_{fn,scale,base}` (f32). +~2.5 GiB resident.
+**BUILD:** `include/dspark.h` (DSparkWeights = BlockWeights + e_proj/h_proj+scales + enorm/hnorm/norm +
+hc_head_*) + `kernels/dspark.cu` `dspark_head_forward(logits, x[s,hc,d], input_ids, W, head_w, s)`. In
+forward.cu, after the 43 layers, tap the `[s,hc,d]` state (before the main hc_head) → run dspark head.
+**GATE 2 (τ):** run main model → hidden states h_t + greedy tokens x_{t+1}; feed (h_t, x_{t+1}) to the head →
+predict x_{t+2}; **single-token acceptance = fraction matching the target's greedy next token** (first proxy;
+full block-diffusion DSPARK_BLOCK=5 acceptance later). τ decides light-finetune sufficiency. Validate the
+head forward numerically first (a real-weights golden like block/cmla, or the Paris-style sanity: does the
+head's greedy prediction track the target's?).
+
+### (original Phase B note)
 - Implement the DSpark block-diffusion MTP head forward (it's an MLA + 256-expert top-6 MoE MTP layer;
   REAP built-in mtp has 160). Reference: model.py MTP module + `src/draft.cu` (inherited DFlash draft, adapt).
 - **GATE 2:** measure **unfine-tuned acceptance τ** of the existing head on the REAP target. This decides

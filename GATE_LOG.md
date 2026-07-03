@@ -288,3 +288,13 @@ launch overhead is a tiny fraction there). The WIN is capturing the full 43-laye
 launches). REMAINING: device-pos versions of the compressed flavors (same pattern: rope_dp + append_at +
 device-pos comb from d_pos/d_T + occasional host-orchestrated compressor emit updating device T), then capture
 the whole per-token step in decode.cu. Mechanism + correctness are proven; the rest is applying the pattern.
+
+**CUDA graphs — ALL 3 attention flavors device-pos + captured BIT-EXACT.** Added `compressed_decode_step_strided_dp`
+and `compressed_decode_step_indexer_dp`: fully device-`d_pos`/`d_T`-driven over a combined cache (window+compressed
+regions, no per-step copy), with a DEVICE-CONDITIONAL compressor emit (gather last-ntok xin window via
+`k_gather_win_dp` -> pool/norm/rope@`d_g`/quant -> commit to comp region + advance device `d_T` iff group completes)
+and (indexer) device-pos scoring + masked top-k over the compressed rows. Gates (synthetic, capture->replay==
+sequential): `gate_compressed_graph` (strided, ratio=8, emit fires) = cosine 1.0, maxabs 0; `gate_indexer_graph`
+(ratio=4, overlap emit + indexer) = cosine 1.0, maxabs 0. Together with the sliding `mla_decode_step_dp`
+(gate_mla_graph, bit-exact), the ENTIRE per-token decode step is now capturable + bit-exact. NEXT: block_decode_
+step_dp/cblock wrappers + capture the full 43-layer step in decode.cu + measure on the real 180B.

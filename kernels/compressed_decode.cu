@@ -365,8 +365,7 @@ static void emit_group_dp(float* comp_region, const float* xin, const int* d_pos
     rope_interleaved_dp(cand+(d-ROPE_DIM),cc_cos,cc_sin,1,ROPE_DIM,false,d,1,d_g,stream);   // rope at compressed pos g
     if(rotate){ hadamard(cand,cand,1,d,stream); act_quant_fp4sim(cand,1,d,32,d,stream); }
     else       act_quant_fp8sim(cand,1,d-ROPE_DIM,64,d,stream);
-    k_commit_comp<<<(d+255)/256,256,0,stream>>>(comp_region,cand,d_T,d_pos,ratio,d);
-    k_advance_T<<<1,1,0,stream>>>(d_T,d_pos,ratio);
+    k_commit_comp<<<(d+255)/256,256,0,stream>>>(comp_region,cand,d_T,d_pos,ratio,d);   // commit at *d_T; caller advances
     dfree(scr);dfree(kv);dfree(score);dfree(pooled);dfree(cand);
 }
 
@@ -390,6 +389,7 @@ void compressed_decode_step_strided_dp(float* out, const float* x, const float* 
     k_append_at2<<<(HEAD_DIM+255)/256,256,0,stream>>>(kvc,kvs,d_pos,HEAD_DIM);
     // compressor emit (device-conditional) into the compressed region [winmax..]
     emit_group_dp(kvc+(size_t)winmax*HEAD_DIM, xin, d_pos, d_T, d_g, ratio, w.mc_wkv,w.mc_wgate,w.mc_ape,w.mc_norm,w.cc_cos,w.cc_sin,DIM,HEAD_DIM,false,0,eps,stream);
+    k_advance_T<<<1,1,0,stream>>>(d_T,d_pos,ratio);
     // attention over combined cache
     k_comb_strided_dp<<<(wtop+Tmax+63)/64,64,0,stream>>>(comb,d_pos,d_T,winmax,wtop,Tmax);
     sparse_attn(o,q,kvc,a.attn_sink,comb,1,1,N_HEADS,HEAD_DIM,winmax+Tmax,wtop+Tmax,scale,stream);
@@ -399,4 +399,54 @@ void compressed_decode_step_strided_dp(float* out, const float* x, const float* 
     act_quant_fp8(ogq,ogs,og,1,OB,128,stream); fp8_block_gemm(out,ogq,ogs,a.wo_b,a.wo_b_s,1,DIM,OB,stream);
     dsync(stream);
     dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(kvs);dfree(comb);
+}
+
+// device-pos indexer (ratio-4) compressed decode.
+__global__ void k_mask_scores(float* score, const int* d_T, int Tmax){ int t=blockIdx.x*blockDim.x+threadIdx.x; if(t<Tmax && t>=*d_T) score[t]=-1e30f; }
+__global__ void k_topk_masked(int* out, const float* score, int Tmax, int topk, int winmax){   // top-k valid rows -> winmax+t, else -1
+    if(threadIdx.x||blockIdx.x) return; extern __shared__ float sh[]; for(int t=0;t<Tmax;++t) sh[t]=score[t];
+    for(int k=0;k<topk;++k){ float best=-1e29f; int bi=-1; for(int t=0;t<Tmax;++t) if(sh[t]>best){best=sh[t];bi=t;}
+        if(bi>=0){ sh[bi]=-1e30f; out[k]=winmax+bi; } else out[k]=-1; } }
+__global__ void k_comb_join(int* comb, const int* win, const int* sel, int wtop, int topk_c){   // [window ⊕ selected]
+    int k=blockIdx.x*blockDim.x+threadIdx.x; int tot=wtop+topk_c; if(k>=tot) return; comb[k]=(k<wtop)?win[k]:sel[k-wtop]; }
+
+void compressed_decode_step_indexer_dp(float* out, const float* x, const float* xin, const CompressedAttnWeights& w,
+        float* kvc, float* idx_kvc, const int* d_pos, int* d_T, int* d_g, int winmax, int Tmax, int ratio, float eps, cudaStream_t stream){
+    const auto& a=w.attn; const int Kd=N_HEADS*HEAD_DIM, GKd=Kd/O_GROUPS, OB=O_GROUPS*O_LORA;
+    const int nH=w.index_n_heads, ihd=w.index_head_dim, QD=nH*ihd, rd=ROPE_DIM; const float scale=1.f/sqrtf((float)HEAD_DIM);
+    const float wscale=rsqrtf((float)ihd)*rsqrtf((float)nH);
+    uint8_t *xq,*qrq,*ogq,*iqrq; float *xs,*qrs,*ogs,*qr,*q,*o,*og,*kvs,*qidx,*qtmp,*iw,*isc; int *win,*sel,*comb;
+    xq=(uint8_t*)dmalloc(DIM); xs=(float*)dmalloc((DIM/128)*4); qr=(float*)dmalloc(Q_LORA*4); qrq=(uint8_t*)dmalloc(Q_LORA); qrs=(float*)dmalloc((Q_LORA/128)*4);
+    q=(float*)dmalloc(Kd*4); o=(float*)dmalloc(Kd*4); og=(float*)dmalloc(OB*4); ogq=(uint8_t*)dmalloc(OB); ogs=(float*)dmalloc((OB/128)*4); kvs=(float*)dmalloc(HEAD_DIM*4);
+    iqrq=(uint8_t*)dmalloc(Q_LORA); float* iqrs=(float*)dmalloc((Q_LORA/128)*4);
+    qidx=(float*)dmalloc((size_t)QD*4); qtmp=(float*)dmalloc((size_t)QD*4); iw=(float*)dmalloc((size_t)nH*4); isc=(float*)dmalloc((size_t)Tmax*4);
+    int wtop=WINDOW, topk_c=(w.index_topk<Tmax)?w.index_topk:Tmax;
+    win=(int*)dmalloc((size_t)wtop*4); sel=(int*)dmalloc((size_t)topk_c*4); comb=(int*)dmalloc((size_t)(wtop+topk_c)*4);
+    act_quant_fp8(xq,xs,x,1,DIM,128,stream);
+    fp8_block_gemm(qr,xq,xs,a.wq_a,a.wq_a_s,1,Q_LORA,DIM,stream); rmsnorm(qr,qr,a.q_norm,1,Q_LORA,eps,true,stream);
+    act_quant_fp8(qrq,qrs,qr,1,Q_LORA,128,stream); fp8_block_gemm(q,qrq,qrs,a.wq_b,a.wq_b_s,1,Kd,Q_LORA,stream);
+    rmsnorm(q,q,nullptr,N_HEADS,HEAD_DIM,eps,false,stream); rope_interleaved_dp(q+NOPE_DIM,a.cosT,a.sinT,N_HEADS,ROPE_DIM,false,HEAD_DIM,N_HEADS,d_pos,stream);
+    fp8_block_gemm(kvs,xq,xs,a.wkv,a.wkv_s,1,HEAD_DIM,DIM,stream); rmsnorm(kvs,kvs,a.kv_norm,1,HEAD_DIM,eps,true,stream);
+    rope_interleaved_dp(kvs+NOPE_DIM,a.cosT,a.sinT,1,ROPE_DIM,false,HEAD_DIM,1,d_pos,stream); act_quant_fp8sim(kvs,1,NOPE_DIM,64,HEAD_DIM,stream);
+    k_append_at2<<<(HEAD_DIM+255)/256,256,0,stream>>>(kvc,kvs,d_pos,HEAD_DIM);
+    // main (overlap) + indexer (overlap+rotate) emits at the SAME *d_T, then advance once
+    emit_group_dp(kvc+(size_t)winmax*HEAD_DIM, xin, d_pos, d_T, d_g, ratio, w.mc_wkv,w.mc_wgate,w.mc_ape,w.mc_norm,w.cc_cos,w.cc_sin,DIM,HEAD_DIM,true,0,eps,stream);
+    emit_group_dp(idx_kvc, xin, d_pos, d_T, d_g, ratio, w.idx_c_wkv,w.idx_c_wgate,w.idx_c_ape,w.idx_c_norm,w.cc_cos,w.cc_sin,DIM,ihd,true,1,eps,stream);
+    k_advance_T<<<1,1,0,stream>>>(d_T,d_pos,ratio);
+    // indexer scoring for the single query -> select main-compressed rows
+    act_quant_fp8(iqrq,iqrs,qr,1,Q_LORA,128,stream); fp8_block_gemm(qidx,iqrq,iqrs,w.idx_wq_b,w.idx_wq_b_s,1,QD,Q_LORA,stream);
+    rope_interleaved_dp(qidx+(ihd-rd),a.cosT,a.sinT,nH,rd,false,ihd,nH,d_pos,stream); hadamard(qtmp,qidx,nH,ihd,stream); act_quant_fp4sim(qtmp,nH,ihd,32,ihd,stream);
+    gemm_fp32(iw,x,w.idx_weights_proj,1,nH,DIM,stream); k_iw_scale<<<(nH+63)/64,64,0,stream>>>(iw,wscale,nH);
+    index_score(isc,qtmp,idx_kvc,iw,1,Tmax,nH,ihd,stream); k_mask_scores<<<(Tmax+63)/64,64,0,stream>>>(isc,d_T,Tmax);
+    k_topk_masked<<<1,32,(size_t)Tmax*4,stream>>>(sel,isc,Tmax,topk_c,winmax);
+    k_comb_strided_dp<<<(wtop+63)/64,64,0,stream>>>(win,d_pos,d_T,winmax,wtop,0);   // window part only (Tmax=0)
+    k_comb_join<<<(wtop+topk_c+63)/64,64,0,stream>>>(comb,win,sel,wtop,topk_c);
+    sparse_attn(o,q,kvc,a.attn_sink,comb,1,1,N_HEADS,HEAD_DIM,winmax+Tmax,wtop+topk_c,scale,stream);
+    rope_interleaved_dp(o+NOPE_DIM,a.cosT,a.sinT,N_HEADS,ROPE_DIM,true,HEAD_DIM,N_HEADS,d_pos,stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og,o,a.wo_a_fp8,a.wo_a_sc,1,O_GROUPS,O_LORA,GKd,stream);
+    else              ogroup_gemm    (og,o,a.wo_a,               1,O_GROUPS,O_LORA,GKd,stream);
+    act_quant_fp8(ogq,ogs,og,1,OB,128,stream); fp8_block_gemm(out,ogq,ogs,a.wo_b,a.wo_b_s,1,DIM,OB,stream);
+    dsync(stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(kvs);
+    dfree(iqrq);dfree(iqrs);dfree(qidx);dfree(qtmp);dfree(iw);dfree(isc);dfree(win);dfree(sel);dfree(comb);
 }

@@ -238,3 +238,15 @@ ratio=4, s=16, T=4): prefill vs cache+decode = **cosine 1.0, rms 0, maxabs 0**. 
 sparse_attn softmaxes over the selected SET.) **All three attention flavors now decode bit-exact** (sliding /
 strided-128 / indexer-4). Remaining for Step 4: milestone 3 — full 43-layer decode loop (per-layer caches +
 HC + moe_forward(bs=1) + head), gate decode logits == prefill logits[s-1] on the real model, measure tok/s.
+
+**Step 4 milestone 3 — FULL 43-layer M=1 KV-cache decode: GATE PASS on the real 180B.** `src/decode.cu` +
+`kernels/block_decode.cu` (block/cblock prefill-cache + decode-step wrappers, all 3 layer types + HC + MoE(bs=1)
++ head). Prefill populates per-layer KV caches over [id0..id6]; autoregressive M=1 decode of token id7 at pos7
+-> **argmax=270** (== the gated prefill's logits[7], the known-correct next token). Generates 270 6919 9829 16
+983 344. Mem 110.6/122.8 (memory-neutral). **First measured decode: 2019 ms/tok = 0.50 tok/s.** SLOW by design:
+weights load native but scales/norms/wo_a re-dequant PER LAYER PER TOKEN (release() scoping, same peak as prefill
+— keeping all 43 layers' dequant resident is +26 GB -> OOM). The per-token re-dequant (~480 MB expert scales ×43
+layers) dominates and is exactly what the native-dtype-scale optimization removes next (in-kernel e8m0->f32,
+memory-neutral). Correctness first, speed next. The decode-spine attention is all bit-exact-gated; this wires it
+end-to-end. NEXT optimizations toward the ~273 GB/s / ~50 tok/s bound: (1) native-dtype scales (kill re-dequant),
+(2) pre-alloc buffers (Step 2), (3) CUDA graphs (Step 3), (4) DSpark spec-decode (Step 5, the multiplier).

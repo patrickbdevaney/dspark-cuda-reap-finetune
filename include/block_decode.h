@@ -11,7 +11,10 @@
 // idx_ckv:[Tmax,index_head_dim] (ratio-4 only); xin:[seqmax,DIM] = per-position ATTENTION-INPUT history that
 // the compressor pools (overlap groups span the prefill/decode boundary, so prefill x1 must be retained).
 // T = compressed rows emitted so far.
-struct LayerKV { float* win_kv=nullptr; float* comp_kv=nullptr; float* idx_ckv=nullptr; float* xin=nullptr; int T=0; };
+struct LayerKV { float* win_kv=nullptr; float* comp_kv=nullptr; float* idx_ckv=nullptr; float* xin=nullptr; int T=0;
+    // device-pos / CUDA-graph fields: combined cache [seqmax(window) + Tmax(compressed)][HEAD_DIM] so attention
+    // needs no per-step copy; d_T = device compressed-row count (graph reads it, the emit advances it on device).
+    float* kvc=nullptr; float* idx_kvc=nullptr; int* d_T=nullptr; int winmax=0; };
 
 // ---- sliding (ratio==0) ----
 void block_prefill_cache(float* out, const float* x, const int* input_ids, const BlockWeights& w,

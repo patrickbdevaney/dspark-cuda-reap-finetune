@@ -327,3 +327,76 @@ void compressed_verify_step_indexer(float* out, const float* x_full, int pos, in
     dsync(stream);
     dfree(q);dfree(xq2);dfree(xs2);dfree(qr2);dfree(iqrq);dfree(iqrs);dfree(qidx);dfree(qtmp);dfree(iw);dfree(iscore);dfree(dtop);dfree(kv_all);dfree(dcomb);
 }
+
+// ================= device-pos compressed decode (CUDA-graph capturable) =================
+// combined cache kvc = [winmax(window) .. winmax+Tmax(compressed)][HEAD_DIM]; d_T = device compressed count.
+#include "mla_forward.h"
+__global__ void k_gather_win_dp(float* scr, const float* xin, const int* d_pos, int ntok, int tok_off, int dim){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)ntok*dim) return; int r=i/dim, c=i%dim;
+    int t=(*d_pos)+tok_off+r; scr[i]=xin[(size_t)t*dim+c]; }
+__global__ void k_dg(int* d_g, const int* d_pos, int ratio){ if(!threadIdx.x&&!blockIdx.x) *d_g=(*d_pos)/ratio; }
+__global__ void k_append_at2(float* dst, const float* scr, const int* d_idx, int hd){          // dst[(*d_idx)*hd + i]=scr[i]
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=hd) return; dst[(size_t)(*d_idx)*hd + i]=scr[i]; }
+__global__ void k_commit_comp(float* comp_region, const float* cand, const int* d_T, const int* d_pos, int ratio, int hd){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=hd) return;
+    if(((*d_pos)+1)%ratio==0) comp_region[(size_t)(*d_T)*hd + i]=cand[i]; }          // append only when a group completes
+__global__ void k_advance_T(int* d_T, const int* d_pos, int ratio){ if(!threadIdx.x&&!blockIdx.x && ((*d_pos)+1)%ratio==0) (*d_T)++; }
+// strided combined idxs: window [base..pos] (region [0,winmax)) then compressed [winmax + t for t<*d_T]; fixed topk.
+__global__ void k_comb_strided_dp(int* comb, const int* d_pos, const int* d_T, int winmax, int wtop, int Tmax){
+    int k=blockIdx.x*blockDim.x+threadIdx.x; int topk=wtop+Tmax; if(k>=topk) return; int pos=*d_pos;
+    if(k<wtop){ int base=pos-WINDOW+1; if(base<0)base=0; int v=base+k; comb[k]=(v<=pos)? v : -1; }
+    else { int t=k-wtop; comb[k]=(t<*d_T)? winmax+t : -1; } }
+
+// device-pos compressor emit: computes the candidate row from the last ntok tokens of xin (ending at *d_pos) and
+// commits it to the compressed region + advances *d_T iff (*d_pos+1)%ratio==0. rope at compressed pos d_g.
+static void emit_group_dp(float* comp_region, const float* xin, const int* d_pos, int* d_T, int* d_g, int ratio,
+        const float* wkv, const float* wgate, const float* ape, const float* norm_w, const float* cc_cos, const float* cc_sin,
+        int dim, int d, bool overlap, int rotate, float eps, cudaStream_t stream){
+    int coff=overlap?2:1, od=coff*d; int ntok=overlap?2*ratio:ratio, tok_off=-(ntok-1), localg=overlap?1:0;
+    float *scr,*kv,*score,*pooled,*cand;
+    scr=(float*)dmalloc((size_t)ntok*dim*4); kv=(float*)dmalloc((size_t)ntok*od*4); score=(float*)dmalloc((size_t)ntok*od*4);
+    pooled=(float*)dmalloc((size_t)(localg+1)*d*4); cand=(float*)dmalloc((size_t)d*4);
+    k_gather_win_dp<<<((size_t)ntok*dim+255)/256,256,0,stream>>>(scr,xin,d_pos,ntok,tok_off,dim);
+    gemm_fp32(kv,scr,wkv,ntok,od,dim,stream); gemm_fp32(score,scr,wgate,ntok,od,dim,stream);
+    if(overlap) compressor_pool_overlap(pooled,kv,score,ape,localg+1,ratio,d,stream);
+    else        compressor_pool(pooled,kv,score,ape,1,ratio,d,stream);
+    rmsnorm(cand,pooled+(size_t)localg*d,norm_w,1,d,eps,true,stream);
+    k_dg<<<1,1,0,stream>>>(d_g,d_pos,ratio);
+    rope_interleaved_dp(cand+(d-ROPE_DIM),cc_cos,cc_sin,1,ROPE_DIM,false,d,1,d_g,stream);   // rope at compressed pos g
+    if(rotate){ hadamard(cand,cand,1,d,stream); act_quant_fp4sim(cand,1,d,32,d,stream); }
+    else       act_quant_fp8sim(cand,1,d-ROPE_DIM,64,d,stream);
+    k_commit_comp<<<(d+255)/256,256,0,stream>>>(comp_region,cand,d_T,d_pos,ratio,d);
+    k_advance_T<<<1,1,0,stream>>>(d_T,d_pos,ratio);
+    dfree(scr);dfree(kv);dfree(score);dfree(pooled);dfree(cand);
+}
+
+// strided (ratio!=4) device-pos compressed decode step. kvc = combined cache; d_pos/d_T device.
+void compressed_decode_step_strided_dp(float* out, const float* x, const float* xin, const CompressedAttnWeights& w,
+        float* kvc, const int* d_pos, int* d_T, int* d_g, int winmax, int Tmax, int ratio, float eps, cudaStream_t stream){
+    const auto& a=w.attn; const int Kd=N_HEADS*HEAD_DIM, GKd=Kd/O_GROUPS, OB=O_GROUPS*O_LORA; const float scale=1.f/sqrtf((float)HEAD_DIM);
+    uint8_t *xq,*qrq,*ogq; float *xs,*qrs,*ogs,*qr,*q,*o,*og,*kvs; int* comb;
+    xq=(uint8_t*)dmalloc(DIM); xs=(float*)dmalloc((DIM/128)*4);
+    qr=(float*)dmalloc(Q_LORA*4); qrq=(uint8_t*)dmalloc(Q_LORA); qrs=(float*)dmalloc((Q_LORA/128)*4);
+    q=(float*)dmalloc(Kd*4); o=(float*)dmalloc(Kd*4); og=(float*)dmalloc(OB*4); ogq=(uint8_t*)dmalloc(OB); ogs=(float*)dmalloc((OB/128)*4);
+    kvs=(float*)dmalloc(HEAD_DIM*4); int wtop=WINDOW; comb=(int*)dmalloc((size_t)(wtop+Tmax)*4);
+    act_quant_fp8(xq,xs,x,1,DIM,128,stream);
+    fp8_block_gemm(qr,xq,xs,a.wq_a,a.wq_a_s,1,Q_LORA,DIM,stream); rmsnorm(qr,qr,a.q_norm,1,Q_LORA,eps,true,stream);
+    act_quant_fp8(qrq,qrs,qr,1,Q_LORA,128,stream); fp8_block_gemm(q,qrq,qrs,a.wq_b,a.wq_b_s,1,Kd,Q_LORA,stream);
+    rmsnorm(q,q,nullptr,N_HEADS,HEAD_DIM,eps,false,stream);
+    rope_interleaved_dp(q+NOPE_DIM,a.cosT,a.sinT,N_HEADS,ROPE_DIM,false,HEAD_DIM,N_HEADS,d_pos,stream);
+    // window kv -> kvc[*d_pos]
+    fp8_block_gemm(kvs,xq,xs,a.wkv,a.wkv_s,1,HEAD_DIM,DIM,stream); rmsnorm(kvs,kvs,a.kv_norm,1,HEAD_DIM,eps,true,stream);
+    rope_interleaved_dp(kvs+NOPE_DIM,a.cosT,a.sinT,1,ROPE_DIM,false,HEAD_DIM,1,d_pos,stream); act_quant_fp8sim(kvs,1,NOPE_DIM,64,HEAD_DIM,stream);
+    k_append_at2<<<(HEAD_DIM+255)/256,256,0,stream>>>(kvc,kvs,d_pos,HEAD_DIM);
+    // compressor emit (device-conditional) into the compressed region [winmax..]
+    emit_group_dp(kvc+(size_t)winmax*HEAD_DIM, xin, d_pos, d_T, d_g, ratio, w.mc_wkv,w.mc_wgate,w.mc_ape,w.mc_norm,w.cc_cos,w.cc_sin,DIM,HEAD_DIM,false,0,eps,stream);
+    // attention over combined cache
+    k_comb_strided_dp<<<(wtop+Tmax+63)/64,64,0,stream>>>(comb,d_pos,d_T,winmax,wtop,Tmax);
+    sparse_attn(o,q,kvc,a.attn_sink,comb,1,1,N_HEADS,HEAD_DIM,winmax+Tmax,wtop+Tmax,scale,stream);
+    rope_interleaved_dp(o+NOPE_DIM,a.cosT,a.sinT,N_HEADS,ROPE_DIM,true,HEAD_DIM,N_HEADS,d_pos,stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og,o,a.wo_a_fp8,a.wo_a_sc,1,O_GROUPS,O_LORA,GKd,stream);
+    else              ogroup_gemm    (og,o,a.wo_a,               1,O_GROUPS,O_LORA,GKd,stream);
+    act_quant_fp8(ogq,ogs,og,1,OB,128,stream); fp8_block_gemm(out,ogq,ogs,a.wo_b,a.wo_b_s,1,DIM,OB,stream);
+    dsync(stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(kvs);dfree(comb);
+}

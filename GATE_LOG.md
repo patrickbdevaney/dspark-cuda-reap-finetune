@@ -111,5 +111,14 @@ fp8. NEXT GRIND: dequant fp4-weight→fp8 (not fp16) + FP8 tensor core (m16n8k32
 fp8→fp16 act upconvert. ML/HW note: decode bandwidth-bound so this helps compute-bound regimes most (prefill,
 batched capture, spec-block verify); single-token decode already rides fp4-memory.
 
+**tc_fp8_gemm champion (dense/attn W8A8).** Finding: fp8_block_gemm is warp-per-output (~1 tok/s class),
+used on every MLA q/kv/o proj + shared experts. Fix: native FP8 tensor-core GEMM `mma.sync.m16n8k32.e4m3` —
+fp8 acts + fp8 weights feed the TC directly (no fp16 upconvert), per-128 act + per-128x128 wt scale applied
+per K-block (matching fp8_block_gemm's block-scale math). Gate: cosine 1.000000, max_rel 2e-5 vs oracle.
+Measured: **17.88x** (0.413->0.023 ms, M=48/N=256/K=512). Why correct: fp8 mma computes fp8xfp8->f32 = the
+same values as the oracle's dec_e4m3 fp32 dot; only accumulation-order rounding differs (2e-5). ML/HW: this is
+the FP8 tensor-core lever (Thor's 1035 TFLOPS FP8, 2x its fp16); FP4 (2070) stays blocked in CUDA 13. Both
+dominant kernel classes now TC-accelerated: MoE experts (tc_fp4_gemm 19.7x) + dense/attn (tc_fp8_gemm 17.9x).
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

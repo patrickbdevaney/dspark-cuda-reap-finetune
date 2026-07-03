@@ -47,6 +47,20 @@ static bool gate_fp8_gemm(const std::string& dir) {
     bool ok = e.max_rel < 2e-2;
     printf("[fp8_block_gemm] M=%d N=%d K=%d  |C|max=%.4f  max_abs=%.5f  max_rel=%.5f  -> %s\n",
            M,N,K,mx,e.max_abs,e.max_rel, ok?"PASS":"FAIL");
+    // native FP8 tensor-core GEMM (mma.sync.m16n8k32.e4m3) vs oracle — the 2x-fp16 compute path
+    extern void tc_fp8_gemm(float*,const uint8_t*,const float*,const uint8_t*,const float*,int,int,int,cudaStream_t);
+    float* dCt; CU(cudaMalloc(&dCt,(size_t)M*N*4));
+    tc_fp8_gemm(dCt,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K,0); CU(cudaDeviceSynchronize());
+    std::vector<float> Ct((size_t)M*N); CU(cudaMemcpy(Ct.data(),dCt,(size_t)M*N*4,cudaMemcpyDeviceToHost));
+    Err et=compare(Ct,Cref,M*N,mx); double dt=0,n1=0,n2=0; for(int i=0;i<M*N;++i){dt+=(double)Ct[i]*Cref[i];n1+=(double)Ct[i]*Ct[i];n2+=(double)Cref[i]*Cref[i];}
+    double cos8=dt/(sqrt(n1)*sqrt(n2)+1e-30); bool ok8=cos8>0.999 && et.max_rel<5e-2;
+    printf("[fp8_gemm TC m16n8k32] cosine=%.6f max_rel=%.5f -> %s\n", cos8, et.max_rel, ok8?"PASS":"FAIL"); ok=ok&&ok8;
+    { cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b); int IT=50;
+      for(int i=0;i<5;++i){ fp8_block_gemm(dC,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K); tc_fp8_gemm(dCt,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K,0);} CU(cudaDeviceSynchronize());
+      cudaEventRecord(a); for(int i=0;i<IT;++i) fp8_block_gemm(dC,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K); cudaEventRecord(b); cudaEventSynchronize(b); float t0=0; cudaEventElapsedTime(&t0,a,b);
+      cudaEventRecord(a); for(int i=0;i<IT;++i) tc_fp8_gemm(dCt,(const uint8_t*)dA,(const float*)das,(const uint8_t*)dB,(const float*)dbs,M,N,K,0); cudaEventRecord(b); cudaEventSynchronize(b); float t1=0; cudaEventElapsedTime(&t1,a,b);
+      printf("[fp8_gemm A/B] fp8_block_gemm %.4f ms | tc_fp8_gemm %.4f ms -> %.2fx\n", t0/IT, t1/IT, t0/t1); }
+    cudaFree(dCt);
     cudaFree(dA);cudaFree(dB);cudaFree(das);cudaFree(dbs);cudaFree(dC);
     return ok;
 }

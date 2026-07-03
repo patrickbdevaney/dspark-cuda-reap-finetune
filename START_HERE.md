@@ -67,6 +67,8 @@ spec-decode) IS the core of the server. Build it once; it delivers the multiplie
 Do this as ONE focused build, gated + detached, memory-neutral. Order (details + rationale in `STRUCTURAL_PLAN.md`):
 1. **Static M=1 KV-cache decode step** (Step 4 there) — the real decode regime (we've only measured 8-tok prefill).
    MLA/attention over cached latent KV (append new token's KV, attend over history). KV is tiny (MLA+SWA+DSA).
+   **Execution-ready design in `DECODE_STEP4_DESIGN.md`** (append-only KV proven tractable incl. the compressor;
+   equivalence gate = decode logits == prefill logits[s-1]). This is the NEXT build to execute.
 2. **Zero-sync grouped-GEMM MoE** (Step 1b) — **DONE + gated + WIN (−12.5%, 365.7→319.8 ms/tok, argmax=270).**
    One grouped W4A8 launch per stage over all experts; tile→expert map built on-device from `off[]` → the last
    per-layer host sync is gone → MoE is graph-capturable. `g_moe_grouped` default-on. Next levers are 3/4/5 below.

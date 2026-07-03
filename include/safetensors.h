@@ -128,8 +128,11 @@ inline std::string read_file(const std::string& path) {
 class ShardedSafeTensors {
 public:
     // key_map: optional normalization applied to each checkpoint name -> internal name.
+    // only_prefix: if set, load ONLY tensors whose raw name contains it (e.g. "mtp."); shards that don't
+    //   exist on disk (partial download) are skipped rather than throwing. For extracting a head from a repo.
     explicit ShardedSafeTensors(const std::string& dir,
-                                std::string (*key_map)(const std::string&) = nullptr)
+                                std::string (*key_map)(const std::string&) = nullptr,
+                                const char* only_prefix = nullptr)
         : dir_(dir) {
         std::string idx = read_file(dir + "/model.safetensors.index.json");
         JsonP j(idx.data(), idx.size());
@@ -145,13 +148,17 @@ public:
                 }
             } else j.skip_value();
         } while (j.eat(','));
-        // Open every distinct shard once (mmap is lazy; only headers get faulted here).
+        auto keep = [&](const std::string& n){ return !only_prefix || n.find(only_prefix) != std::string::npos; };
+        // Open shards referenced by kept tensors; skip shards that don't exist (partial download).
         for (auto& kv : weight_map_) {
+            if (!keep(kv.first)) continue;
             const std::string& file = kv.second;
-            if (!shards_.count(file)) shards_[file].reset(new SafeTensors(dir_ + "/" + file));
+            if (!shards_.count(file)) { try { shards_[file].reset(new SafeTensors(dir_ + "/" + file)); }
+                                        catch (...) { shards_.erase(file); } }
         }
         // Build the resolved name -> Tensor map (applying key_map).
         for (auto& kv : weight_map_) {
+            if (!keep(kv.first) || !shards_.count(kv.second)) continue;
             const Tensor& t = shards_[kv.second]->get(kv.first);
             std::string internal = key_map ? key_map(kv.first) : kv.first;
             tensors_.emplace(std::move(internal), t);

@@ -7,7 +7,9 @@
 #include "deepseek_v4.h"
 #include "block.h"
 #include "compressed_block.h"
-#include "dspark.h"        // DSpark MTP draft head
+#include "dspark.h"        // DSpark MTP draft head (proxy)
+#include "dspark_real.h"   // real DSpark head pieces (main_x, markov, tap_pool, forward_head)
+#include "dspark_attn.h"   // dspark_main_kv, dspark_block_forward
 #include "hc.h"            // hc_head
 #include "mla_attn.h"      // rmsnorm
 #include "compressor.h"    // gemm_fp32
@@ -90,8 +92,9 @@ int main(int argc, char** argv){
     const float *cc128c=(s>=128)?up_f(stride_rows(cqc_h,s,half,128),keep):cqc, *cc128s=(s>=128)?up_f(stride_rows(cqs_h,s,half,128),keep):cqs;
 
     int* d_ids; CU(cudaMalloc(&d_ids,s*4)); CU(cudaMemcpy(d_ids,ids.data(),s*4,cudaMemcpyHostToDevice));
-    float *h0, *h, *h2;
+    float *h0, *h, *h2, *main_hidden;
     CU(cudaMalloc(&h0,(size_t)s*d*4)); CU(cudaMalloc(&h,(size_t)s*hc*d*4)); CU(cudaMalloc(&h2,(size_t)s*hc*d*4));
+    CU(cudaMalloc(&main_hidden,(size_t)s*3*d*4));          // DSpark taps: mean-pool of L40/41/42 output -> [s,3d]
     k_embed<<<((size_t)s*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,s,d);
     k_hc_expand<<<((size_t)s*hc*d+255)/256,256>>>(h,h0,s,hc,d);
     CU(cudaDeviceSynchronize());
@@ -155,6 +158,9 @@ int main(int argc, char** argv){
             compressed_block_forward(h2,h,d_ids,b,s,HC_SINKHORN_ITERS,EPS);
         }
         std::swap(h,h2);
+        if(Lyr==40) dspark_tap_pool(main_hidden,h,s,hc,d,0,3);   // DSpark taps: mean-pool output of L40/41/42
+        else if(Lyr==41) dspark_tap_pool(main_hidden,h,s,hc,d,1,3);
+        else if(Lyr==42) dspark_tap_pool(main_hidden,h,s,hc,d,2,3);
         L.release(mk);                                        // block synced internally -> safe to free layer dequant
         if(Lyr%4==0){ size_t fb,tb; cudaMemGetInfo(&fb,&tb);
             printf("  layer %d/%d done (ratio %d)  mem %.1f/%.1f GiB\n",Lyr,N_LAYERS,ratio,(tb-fb)/1073741824.0,tb/1073741824.0); }
@@ -208,5 +214,75 @@ int main(int argc, char** argv){
     printf("   tau@+1 (draft[t]==main[t+1]) = %.3f  (%d/%d)\n", (double)m1/(s-1), m1, s-1);
     printf("[Gate 2] main  argmax:"); for(int t=0;t<s;++t) printf(" %d",main_am[t]); printf("\n");
     printf("[Gate 2] draft argmax:"); for(int t=0;t<s;++t) printf(" %d",draft_am[t]); printf("\n");
+
+    // ============ GATE 2-REAL: DSpark block-diffusion head -> block acceptance ============
+    if(getenv("DSPARK_REAL") && argc>3){
+        const char* headdir=argv[3]; const int BLK=DSPARK_BLOCK;
+        printf("\n[Gate 2-real] loading DSpark head mtp.* from %s ...\n", headdir);
+        st::WeightStore WH(headdir, key_map, "mtp."); Loader LH(WH);
+        printf("[Gate 2-real] head loaded %.2f GiB, %zu mtp tensors\n", WH.loadedGiB(), WH.count());
+        std::vector<float> bc,bs2; yarn::freqs(bc,bs2,s+BLK,ROPE_DIM,0,ROPE_THETA,YARN_FACTOR,YARN_BETA_FAST,YARN_BETA_SLOW);
+        const float* blk_cos=up_f(bc,keep); const float* blk_sin=up_f(bs2,keep); const int hf=ROPE_DIM/2;
+        float* main_x; CU(cudaMalloc(&main_x,(size_t)s*d*4));
+        dspark_main_x(main_x, main_hidden, LH.raw("mtp.0.main_proj.weight"), LH.scale("mtp.0.main_proj.scale"), LH.bf16("mtp.0.main_norm.weight"), s, d, EPS);
+        // ---- 3-stage DSpark chain (repo ships mtp.0/1/2; forward_spec chains all, head on mtp.2) ----
+        int NSTAGE=0; while(WH.has("mtp."+std::to_string(NSTAGE)+".attn_norm.weight")) NSTAGE++;
+        int NE=0; while(WH.has("mtp.0.ffn.experts."+std::to_string(NE)+".w1.weight")) NE++;
+        printf("[Gate 2-real] DSpark stages=%d, head MoE experts=%d\n", NSTAGE, NE);
+        std::vector<BlockWeights> mb(NSTAGE); std::vector<float*> mkv(NSTAGE);
+        std::vector<std::vector<const uint8_t*>> HP1(NSTAGE),HP2(NSTAGE),HP3(NSTAGE);
+        std::vector<std::vector<const float*>> HS1(NSTAGE),HS2(NSTAGE),HS3(NSTAGE);
+        for(int st=0; st<NSTAGE; ++st){
+            std::string b="mtp."+std::to_string(st)+".", p=b+"attn.";
+            MLAWeights& a=mb[st].attn;
+            a.wq_a=LH.raw(p+"wq_a.weight"); a.wq_a_s=LH.scale(p+"wq_a.scale"); a.wq_b=LH.raw(p+"wq_b.weight"); a.wq_b_s=LH.scale(p+"wq_b.scale");
+            a.wkv=LH.raw(p+"wkv.weight"); a.wkv_s=LH.scale(p+"wkv.scale"); a.wo_b=LH.raw(p+"wo_b.weight"); a.wo_b_s=LH.scale(p+"wo_b.scale");
+            a.q_norm=LH.bf16(p+"q_norm.weight"); a.kv_norm=LH.bf16(p+"kv_norm.weight");
+            a.wo_a=LH.wo_a(p+"wo_a.weight",p+"wo_a.scale"); a.attn_sink=LH.f32(p+"attn_sink"); a.cosT=blk_cos; a.sinT=blk_sin;
+            mb[st].dim=DIM; mb[st].hc=HC_MULT;
+            mb[st].attn_norm=LH.bf16(b+"attn_norm.weight"); mb[st].ffn_norm=LH.bf16(b+"ffn_norm.weight");
+            mb[st].hc_attn_fn=LH.f32(b+"hc_attn_fn"); mb[st].hc_attn_scale=LH.f32(b+"hc_attn_scale"); mb[st].hc_attn_base=LH.f32(b+"hc_attn_base");
+            mb[st].hc_ffn_fn=LH.f32(b+"hc_ffn_fn"); mb[st].hc_ffn_scale=LH.f32(b+"hc_ffn_scale"); mb[st].hc_ffn_base=LH.f32(b+"hc_ffn_base");
+            MoEWeights& m=mb[st].ffn; std::string fp=b+"ffn.";
+            m.gate_w=LH.bf16(fp+"gate.weight"); m.is_hash=false; m.gate_bias=WH.has(fp+"gate.bias")?LH.f32(fp+"gate.bias"):nullptr; m.tid2eid=nullptr;
+            for(int e=0;e<NE;++e){ std::string ep=fp+"experts."+std::to_string(e)+".";
+                HP1[st].push_back(LH.raw(ep+"w1.weight")); HP2[st].push_back(LH.raw(ep+"w2.weight")); HP3[st].push_back(LH.raw(ep+"w3.weight"));
+                HS1[st].push_back(LH.scale(ep+"w1.scale")); HS2[st].push_back(LH.scale(ep+"w2.scale")); HS3[st].push_back(LH.scale(ep+"w3.scale")); }
+            m.w1p=HP1[st].data(); m.w2p=HP2[st].data(); m.w3p=HP3[st].data(); m.w1sp=HS1[st].data(); m.w2sp=HS2[st].data(); m.w3sp=HS3[st].data();
+            std::string sp2=fp+"shared_experts.";
+            m.sw1=LH.raw(sp2+"w1.weight"); m.sw2=LH.raw(sp2+"w2.weight"); m.sw3=LH.raw(sp2+"w3.weight");
+            m.sw1s=LH.scale(sp2+"w1.scale"); m.sw2s=LH.scale(sp2+"w2.scale"); m.sw3s=LH.scale(sp2+"w3.scale");
+            m.n_routed=NE; m.n_act=N_ACT; m.dim=DIM; m.inter=MOE_INTER; m.vocab=VOCAB; m.route_scale=ROUTE_SCALE; m.swiglu_limit=SWIGLU_LIMIT;
+            CU(cudaMalloc(&mkv[st],(size_t)s*HEAD_DIM*4)); dspark_main_kv(mkv[st], main_x, a, s, EPS);   // each stage its own main-KV
+        }
+        std::string LS="mtp."+std::to_string(NSTAGE-1)+".";                                    // head params on LAST stage
+        const float* hh_fn=LH.f32(LS+"hc_head_fn"); const float* hh_sc=LH.f32(LS+"hc_head_scale"); const float* hh_ba=LH.f32(LS+"hc_head_base");
+        const float* hnorm=LH.bf16(LS+"norm.weight"); const float* lm=L.bf16("head.weight");
+        const float* mw1=LH.bf16(LS+"markov_head.markov_w1.weight"); const float* mw2=LH.bf16(LS+"markov_head.markov_w2.weight");
+        const __nv_bfloat16* emb=(const __nv_bfloat16*)W.get("embed.weight").dev;
+        int nanchor=s-BLK-1, matched=0, total=0; std::vector<int> blkacc;
+        float *xa,*xb2,*xemb; int *dblkids,*dfid,*dout1;
+        CU(cudaMalloc(&xa,(size_t)BLK*hc*d*4)); CU(cudaMalloc(&xb2,(size_t)BLK*hc*d*4)); CU(cudaMalloc(&xemb,(size_t)BLK*d*4));
+        CU(cudaMalloc(&dblkids,(size_t)BLK*4)); CU(cudaMalloc(&dfid,4)); CU(cudaMalloc(&dout1,(size_t)(BLK+1)*4));
+        for(int t=0;t<nanchor;++t){
+            std::vector<int> bid(BLK,DSPARK_NOISE_TID); bid[0]=ids[t+1];
+            CU(cudaMemcpy(dblkids,bid.data(),(size_t)BLK*4,cudaMemcpyHostToDevice));
+            k_embed<<<((size_t)BLK*d+255)/256,256>>>(xemb, emb, dblkids, BLK, d);
+            k_hc_expand<<<((size_t)BLK*hc*d+255)/256,256>>>(xa, xemb, BLK, hc, d); CU(cudaDeviceSynchronize());
+            float *cur=xa, *nxt=xb2;
+            for(int st=0; st<NSTAGE; ++st){                                                    // chain h through all stages
+                dspark_block_forward(nxt, cur, dblkids, mkv[st], t, mb[st], blk_cos+(size_t)(t+1)*hf, blk_sin+(size_t)(t+1)*hf, BLK, WINDOW, HC_SINKHORN_ITERS, EPS);
+                float* tmp=cur; cur=nxt; nxt=tmp;
+            }
+            CU(cudaMemcpy(dfid,&ids[t+1],4,cudaMemcpyHostToDevice));
+            dspark_forward_head(dout1, cur, dfid, hh_fn,hh_sc,hh_ba, hnorm, lm, mw1, mw2, 1, BLK, hc, d, VOCAB, DSPARK_MARKOV_RANK, EPS);
+            std::vector<int> oo(BLK+1); CU(cudaMemcpy(oo.data(),dout1,(size_t)(BLK+1)*4,cudaMemcpyDeviceToHost));
+            int acc=0; for(int i=0;i<BLK && t+2+i<=s-1; ++i){ if(oo[1+i]==ids[t+2+i]) acc++; else break; }
+            blkacc.push_back(acc); matched+=acc; total++;
+        }
+        printf("\n[Gate 2-real] DSpark BLOCK acceptance (unfine-tuned, vs prompt continuation):\n");
+        printf("   mean accepted prefix = %.3f / %d  over %d anchors\n", total?(double)matched/total:0.0, BLK, total);
+        printf("[Gate 2-real] per-anchor:"); for(int a:blkacc) printf(" %d",a); printf("\n");
+    }
     return 0;
 }

@@ -19,8 +19,9 @@ struct DevTensor { const void* dev = nullptr; std::string dtype; std::vector<int
 
 class WeightStore {
 public:
-    WeightStore(const std::string& dir, std::string (*key_map)(const std::string&) = nullptr) {
-        ShardedSafeTensors S(dir, key_map);
+    WeightStore(const std::string& dir, std::string (*key_map)(const std::string&) = nullptr,
+                const char* only_prefix = nullptr) {
+        ShardedSafeTensors S(dir, key_map, only_prefix);
         // 1. load each shard's data blob into a mapped pinned buffer via pread (single copy, no mmap fault)
         std::unordered_map<const SafeTensors*, void*> base;   // shard -> pinned device-accessible base
         for (auto& kv : S.shards()) {

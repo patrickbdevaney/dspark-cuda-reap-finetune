@@ -88,6 +88,7 @@ int main(int argc, char** argv){
     Loader L(W);
     const int half=ROPE_DIM/2, hc=HC_MULT, d=DIM;
     extern bool g_tc_fp8; g_tc_fp8 = true;                 // WIN: dense/attn fp8 GEMMs -> tc_fp8_gemm (no repack, no OOM) = 559.8 ms/tok (1.23x)
+    extern bool g_tc_ogroup; g_tc_ogroup = true;           // WIN: attn-output grouped GEMM -> fp16 tensor core (cosine 1.0), ~13% warp-per-output -> TC
     extern void tc_moe_clear_cache();
 
     std::vector<void*> keep;

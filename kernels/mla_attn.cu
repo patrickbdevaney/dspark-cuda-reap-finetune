@@ -1,5 +1,6 @@
 // mla_attn.cu — MLA attention primitives, correctness-first (Gate K oracle: ref/gen_units.py).
 // Optimization (mma, smem KV staging, bf16) comes AFTER these pass their gate (CONSTITUTION Art. I).
+#include <cuda_fp16.h>
 #include "mla_attn.h"
 
 // ---------------- sparse_attn ----------------
@@ -169,8 +170,43 @@ __global__ void ogroup_gemm_kernel(float* __restrict__ out, const float* __restr
     for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
     if (lane == 0) out[((size_t)bb * G + gg) * R + r] = acc;
 }
+// --- TC version: fp16 mma per group (matches the bf16-einsum reference; ~13% warp-per-output -> tensor core) ---
+// o,wo_a fp32 -> fp16 (transient, memory-neutral), m16n8k16 fp16 GEMM per group. Dispatched by g_tc_ogroup.
+__device__ __forceinline__ void ogm_mma(float* c, const unsigned* a, const unsigned* b){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+      :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1])); }
+__global__ void k_f2h(__half* o, const float* in, size_t n){ size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if(i<n) o[i]=__float2half(in[i]); }
+__global__ void tc_ogroup_kernel(float* out, const __half* o16, const __half* wo16, int bs, int G, int R, int Kd){
+    int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
+    int gg=blockIdx.y, n0=blockIdx.x*8; if(n0>=R) return;
+    const __half* xg0 = o16 + ((size_t)gid*G+gg)*Kd;          // A row bb=gid (stride G*Kd), group gg
+    const __half* xg8 = o16 + ((size_t)(gid+8)*G+gg)*Kd;
+    const __half* Bg  = wo16 + (size_t)gg*R*Kd;               // B = wo16[gg] [R,Kd]
+    bool m0=gid<bs, m8=(gid+8)<bs; float c[4]={0,0,0,0};
+    for(int k0=0;k0<Kd;k0+=16){
+        unsigned a[4],b[2];
+        a[0]=m0?*(const unsigned*)(xg0+k0+2*t4):0u; a[1]=m8?*(const unsigned*)(xg8+k0+2*t4):0u;
+        a[2]=m0?*(const unsigned*)(xg0+k0+2*t4+8):0u; a[3]=m8?*(const unsigned*)(xg8+k0+2*t4+8):0u;
+        const __half* wr=Bg+(size_t)(n0+gid)*Kd;
+        b[0]=(n0+gid<R)?*(const unsigned*)(wr+k0+2*t4):0u; b[1]=(n0+gid<R)?*(const unsigned*)(wr+k0+2*t4+8):0u;
+        ogm_mma(c,a,b);
+    }
+    int cn=2*t4;
+    if(gid<bs   && n0+cn  <R) out[((size_t)gid*G+gg)*R + n0+cn  ]=c[0];
+    if(gid<bs   && n0+cn+1<R) out[((size_t)gid*G+gg)*R + n0+cn+1]=c[1];
+    if(gid+8<bs && n0+cn  <R) out[((size_t)(gid+8)*G+gg)*R + n0+cn ]=c[2];
+    if(gid+8<bs && n0+cn+1<R) out[((size_t)(gid+8)*G+gg)*R + n0+cn+1]=c[3];
+}
+bool g_tc_ogroup = false;   // forward.cu sets true; gates use the warp-per-output oracle
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream) {
+    if (g_tc_ogroup && Kd%16==0) {
+        __half *o16,*wo16; cudaMalloc(&o16,(size_t)bs*G*Kd*2); cudaMalloc(&wo16,(size_t)G*R*Kd*2);
+        k_f2h<<<((size_t)bs*G*Kd+255)/256,256,0,stream>>>(o16,o,(size_t)bs*G*Kd);
+        k_f2h<<<((size_t)G*R*Kd+255)/256,256,0,stream>>>(wo16,wo_a,(size_t)G*R*Kd);
+        dim3 grid((R+7)/8, G); tc_ogroup_kernel<<<grid,32,0,stream>>>(out,o16,wo16,bs,G,R,Kd);
+        cudaStreamSynchronize(stream); cudaFree(o16); cudaFree(wo16); return;
+    }
     ogroup_gemm_kernel<<<bs * G * R, 32, 0, stream>>>(out, o, wo_a, bs, G, R, Kd);
 }
 

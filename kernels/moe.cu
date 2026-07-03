@@ -178,10 +178,14 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
         if(getenv("MDBG")){ int tt=0,ne=0; for(int e=0;e<nr;++e){tt+=etok[e].size(); ne+=!etok[e].empty();} fprintf(stderr,"[batched] bs=%d na=%d nr=%d grouped=%d nonempty=%d\n",bs,na,nr,tt,ne,bs*na);
             for(int e=0;e<nr;++e){ if(etok[e].empty()) continue; fprintf(stderr,"  e%d me=%zu tok=",e,etok[e].size()); for(int t:etok[e]) fprintf(stderr,"%d,",t); fprintf(stderr,"\n"); } }
+        // Scratch must hold the LARGEST per-expert group. A token can route to the same expert in multiple of
+        // its na slots (esp. hash layers), so me can exceed bs — up to bs*na total assignments. Size for bs*na.
+        // (compute-sanitizer caught k_gather_x writing past bs*dim when me>bs; moe.cu:138.)
+        const int maxm = bs*na;
         float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb; uint8_t *Xeq,*Hqb;
-        CU(cudaMalloc(&Xe,(size_t)bs*dim*4)); CU(cudaMalloc(&Xeq,(size_t)bs*dim)); CU(cudaMalloc(&Xes2,(size_t)bs*(dim/128)*4));
-        CU(cudaMalloc(&Gb,(size_t)bs*inter*4)); CU(cudaMalloc(&Ub,(size_t)bs*inter*4)); CU(cudaMalloc(&Hb,(size_t)bs*inter*4));
-        CU(cudaMalloc(&Hqb,(size_t)bs*inter)); CU(cudaMalloc(&Hsb,(size_t)bs*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)bs*dim*4));
+        CU(cudaMalloc(&Xe,(size_t)maxm*dim*4)); CU(cudaMalloc(&Xeq,(size_t)maxm*dim)); CU(cudaMalloc(&Xes2,(size_t)maxm*(dim/128)*4));
+        CU(cudaMalloc(&Gb,(size_t)maxm*inter*4)); CU(cudaMalloc(&Ub,(size_t)maxm*inter*4)); CU(cudaMalloc(&Hb,(size_t)maxm*inter*4));
+        CU(cudaMalloc(&Hqb,(size_t)maxm*inter)); CU(cudaMalloc(&Hsb,(size_t)maxm*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)maxm*dim*4));
         // upload ALL tokens/weights once as flat arrays + per-expert offsets (robust; reused per-expert copy failed)
         std::vector<int> alltok; std::vector<float> allwt; std::vector<int> off(nr+1,0);
         for(int e=0;e<nr;++e){ for(int t:etok[e]) alltok.push_back(t); for(float w:ewt[e]) allwt.push_back(w); off[e+1]=alltok.size(); }

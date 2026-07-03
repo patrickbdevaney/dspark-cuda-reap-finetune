@@ -120,7 +120,7 @@ same values as the oracle's dec_e4m3 fp32 dot; only accumulation-order rounding 
 the FP8 tensor-core lever (Thor's 1035 TFLOPS FP8, 2x its fp16); FP4 (2070) stays blocked in CUDA 13. Both
 dominant kernel classes now TC-accelerated: MoE experts (tc_fp4_gemm 19.7x) + dense/attn (tc_fp8_gemm 17.9x).
 
-**Wiring champions into forward.cu — real-model-shape OOB (IN PROGRESS, honest status).** Finding: tc_fp8_gemm
+**Wiring champions into forward.cu — real-model OOB LOCALIZED + FIXED (compute-sanitizer).** RESOLVED (was 'IN PROGRESS'): Finding: tc_fp8_gemm
 (cosine 1.0, 17.9x) + batched MoE (cosine 1.0) each PASS their unit gates, but enabling them in the full 180B
 forward crashes with an illegal memory access in the batched-MoE path (moe.cu:215 sync catches it; also seen at
 tc_moe_gemm.cu:104 with tc_fp4 on). The PLAIN forward (champions OFF) still runs correctly (Gate 1 Paris).
@@ -130,8 +130,17 @@ is identical to the working per-token path (w1p[e]). This is the class of bug ti
 miss — needs `compute-sanitizer` on the forward to localize (the recurring 'real weights catch what synthetic
 gates can't' lesson). ACTION: forward reverted to working config (champions wired but flagged OFF: g_tc_fp8=false,
 use_tc=false, batched=false); tc_fp8_gemm banked as a validated KERNEL; end-to-end measurement BLOCKED pending
-the sanitizer localization. Why logged: honesty > a green checkmark; the integration is unfinished and the doc
-must say so.
+the sanitizer localization. Why logged: honesty > a green checkmark; must say so.
+
+RESOLUTION: `compute-sanitizer --tool memcheck` (with -lineinfo) named it in one shot: **k_gather_x invalid
+write, moe.cu:138** — block(132) existed, so the launch had me*dim > 132*256 threads → me≥9, but the batched
+scratch (Xe…) was sized bs*dim=32768. ROOT CAUSE: a token can route to the SAME expert in multiple of its na
+slots (hash layer 0 especially), so per-expert me can EXCEED bs — up to bs*na total assignments; the write
+`Xe[i], i<me*dim` overran the bs-sized buffer. The read `x[tok[r]*dim]` was fine (tok<bs); only the grouped
+WRITE overflowed. FIX: size all routed scratch for **maxm=bs*na** (the max any expert can receive). Why the
+unit gate missed it: synthetic routing gave me≤bs (no duplicate-slot collisions); the real hash layer has
+them. Gates still cosine 1.0 after the fix. LESSON (again): compute-sanitizer localizes in minutes what
+inspection can't — and 'me≤bs' was an unstated assumption the real router violates.
 
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

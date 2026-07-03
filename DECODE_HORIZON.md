@@ -5,6 +5,12 @@ This is the standing horizon. Every lever is A/B'd, gated bit-exact vs oracle, a
 measured deltas, `GATE_LOG.md` rationale). We grind all the levers we know AND periodically search the literature
 for **black-swan / step-change** techniques so we don't thrash on diminishing returns.
 
+## HARD CONSTRAINT (learned the painful way)
+Thor's 122.8 GiB unified RAM is SHARED with the host/OS/Claude Code. The forward already uses ~108-113 GiB
+(~90%). A +5.5 GiB dequant-cache starved the system and forced a power-cycle. **Every future lever MUST be
+memory-neutral** (in-place / fixed-arena reuse, never on-top). This rules out naive caching; favors kernels
+that read quantized data directly (no fp32 dequant) and in-place transforms.
+
 ## Where we are
 - Unoptimized prefill baseline: **687 ms/tok (~1.46 tok/s)** at s=8 (correctness-first: per-token host loops,
   warp-per-output GEMMs). Target 38–50 tok/s = **20–26 ms/tok** → a ~26–36× gap. Big, but the baseline is
@@ -46,9 +52,10 @@ for **black-swan / step-change** techniques so we don't thrash on diminishing re
 | tc_fp8 dense (17.9×) + batched | ✅ wired | 559.8 ms/tok (1.23×) |
 | tc_fp4 pp MoE (repack-at-load, byte-load) | ✅ correct, but ~neutral | 555.9 ms/tok (byte-loads negate coalescing) |
 | **tc_fp4 pp ALIGNED load** (funnel-shift OR loader 16B-align) | **NEXT (unlocks MoE 19.7×)** | — |
-| **DEQUANT-AT-LOAD** (cache scales/wts, ~27% redundant/forward) | **NEXT (profile-identified)** | — |
-| warmup (amortize 1-time repack, ~27% in single fwd) | NEXT | — |
-| TC-ify ogroup_gemm (13%) + gemm_fp32 (10%) | TODO | — |
+| DEQUANT — memory-NEUTRAL scheme (cache REVERTED: starved RAM) | blocked-on-memory | ~30% of warm fwd; needs in-place/arena, not on-top |
+| **2x warmup (steady-state, memory-neutral)** | ✅ done | **pass1 WARM 451.2 ms/tok (2.22 tok/s), 1.52× base** |
+| **TC-ify attn-out: use fp8 wo_a via tc_fp8 (drops dequant+fp32 GEMM)** | **NEXT (memory-neutral, ~18%)** | — |
+| TC-ify gemm_fp32 (compressor/indexer/head, ~14% warm) | TODO | — |
 | CUDA graphs + device MoE routing + fusion | TODO | — |
 | DSpark spec decode (block verify) | TODO (τ≈0.815 proven) | — |
 | FP4 compute (4×) | BLOCKED (CUDA 13) | re-test probe armed |

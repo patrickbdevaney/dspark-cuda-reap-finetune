@@ -219,3 +219,18 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   overhead, so there's little launch overhead left for a graph to eliminate. The remaining 148 ms/tok is the
   active-weight bandwidth floor. The lever to beat it is SPEC-DECODE (amortize weights over K tokens), not graphs.
   Graphs are now available infra (e.g. could wrap the M=K verify) but aren't the bottleneck at M=1.
+
+## Spec-decode verify — M=K GEMV tried, REVERTED (negative result), bottleneck pinpointed
+- Built fp8_gemv_mk (one warp/output reads the weight row ONCE, dots all M act rows -> weight read amortized M×).
+  Unit-gated cosine 1.0 for M=2/5/8/16. But full-model A/B: M=5 verify 334 -> **362 ms (SLOWER)**. Root cause:
+  the verify is NOT weight-bandwidth-bound at M=5 -- the TC (tc_fp8) reads the weight ONCE *and* does the M×N
+  compute via mma, while the scalar GEMV does M scalar dots/weight-read. TC wins for M>=2; the GEMV only wins at
+  M=1 (trivial compute, TC mma-latency dominates). Kept as a gated reference (env GEMV_MK=1), default TC for M>=2.
+- **THREE consistent results now pinpoint the bottleneck:** (a) full-step CUDA graph = parity (not launch-bound),
+  (b) M=K GEMV slower (not weight-bandwidth-bound at M=5), (c) indexer host-sync removal = no change (not
+  sync-bound). Both the M=1 decode (148 ms, ~5.5× the 27 ms active-weight bandwidth floor) and the M=5 verify
+  (334 ms, ~14× the 23 ms floor, raw MACs << peak) are **GPU KERNEL-EFFICIENCY bound** -- the tc_fp8/tc_fp4/
+  attention kernels run at ~1/5 of memory bandwidth due to access patterns (repack layout, per-block scale reads,
+  KV gather), not launch/compute/bandwidth-LIMIT bound. Levers past this: (1) head fine-tune (Phase 3, raise
+  acceptance -- the clearest spec-decode win), (2) deep per-kernel bandwidth profiling + access-pattern fixes on
+  the below-bandwidth kernels. Not graphs, not M=K GEMV, not sync removal (all tested).

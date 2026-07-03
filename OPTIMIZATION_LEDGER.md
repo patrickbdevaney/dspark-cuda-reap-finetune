@@ -199,3 +199,9 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   phases: (a) fine-tune the head (Phase 3, higher accept), (b) determinize MoE scatter (stable target argmax ->
   more accepts), (c) CUDA graphs (verify -> weight-bound floor). Then ~4 accepted x ~160ms verify = ~40ms/tok ~25
   tok/s, and with a faster base -> ~50. Head mem 10 GiB -> 120.9/122.8 peak (tight).
+
+## Determinize MoE -> spec-decode acceptance +31%
+- After deterministic MoE combine: spec mean tokens/verify 1.91 -> **2.50** (+31%), 220.7 -> **161.4 ms/tok**,
+  0.67x -> **0.91x** base. Stable target argmax stops rejecting valid drafts. Still <1x: M=5 verify = 2.8x M=1
+  (415 vs 146 ms) -> the remaining gap is CUDA graphs (verify -> weight-bound floor) + head fine-tune (Phase 3).
+  Plain decode now bit-reproducible run-to-run (270 3924 16 983 344 260), 147.9 ms/tok (no regression).

@@ -41,6 +41,28 @@ __global__ void fp8_block_gemm_kernel(float* __restrict__ C,
     if (lane == 0) C[(size_t)m * N + n] = acc;
 }
 
+// M=1 GEMV: one warp per output n. Lanes read the B[n] row uint-vectorized (4 fp8/load), coalesced (32 lanes
+// = 128 contiguous bytes); per-128-block scales applied per element; single warp-reduce. Bandwidth-bound —
+// beats the m16-tile TC at M=1 (which is mma-latency bound). Gated cosine vs fp8_block_gemm (tests/gate_fp8_gemv).
+__global__ void fp8_gemv_m1_kernel(float* __restrict__ C, const uint8_t* __restrict__ A, const float* __restrict__ as,
+                                   const uint8_t* __restrict__ B, const float* __restrict__ bs, int N, int K){
+    int warp = (blockIdx.x*blockDim.x + threadIdx.x) >> 5; if (warp >= N) return; int n = warp;
+    int lane = threadIdx.x & 31; int KB = K/128;
+    const uint8_t* Brow = B + (size_t)n*K; const float* bsr = bs + (size_t)(n/128)*KB;
+    float acc = 0.f;
+    for (int kb = 0; kb < KB; ++kb){
+        int base = kb*128 + lane*4;                       // 32 lanes * 4 = 128 contiguous bytes
+        unsigned av = *(const unsigned*)(A + base);        // 4 fp8 activations
+        unsigned bv = *(const unsigned*)(Brow + base);     // 4 fp8 weights
+        float sub = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) sub += dec_e4m3((av>>(i*8))&0xff) * dec_e4m3((bv>>(i*8))&0xff);
+        acc += sub * as[kb] * bsr[kb];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if (lane == 0) C[n] = acc;
+}
 // Global toggle: route dense fp8 GEMMs through the native FP8 tensor core (tc_fp8_gemm, ~18x). Default OFF so
 // gates use this warp-per-output oracle (bit-exact). forward.cu sets it true for decode. All our fp8 GEMM
 // shapes satisfy N%8==0 && K%128==0 (checked); fall back to the oracle otherwise.
@@ -49,8 +71,9 @@ void tc_fp8_gemm(float*, const uint8_t*, const float*, const uint8_t*, const flo
 void fp8_block_gemm(float* C, const uint8_t* A_fp8, const float* a_s,
                     const uint8_t* B_fp8, const float* b_s,
                     int M, int N, int K, cudaStream_t stream) {
-    // (A/B result: the m16-tile TC BEATS the warp-per-output oracle even at M=1 — its coalesced weight layout
-    // wins. Kept TC for all M. The M=1 attn GEMM cost is closer to bandwidth than expected.)
+    // M=1 decode: vectorized GEMV (bandwidth-bound, beats the mma-latency-bound TC at M=1). K%128==0 always here.
+    if (g_tc_fp8 && M == 1 && (K % 128 == 0) && getenv("NO_GEMV")==nullptr) {
+        int threads=256; fp8_gemv_m1_kernel<<<(N*32+threads-1)/threads, threads, 0, stream>>>(C, A_fp8, a_s, B_fp8, b_s, N, K); return; }
     if (g_tc_fp8 && (N % 8 == 0) && (K % 128 == 0)) { tc_fp8_gemm(C, A_fp8, a_s, B_fp8, b_s, M, N, K, stream); return; }
     dim3 grid(N, M);
     fp8_block_gemm_kernel<<<grid, 32, 0, stream>>>(C, A_fp8, a_s, B_fp8, b_s, M, N, K);

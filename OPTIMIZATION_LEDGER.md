@@ -173,3 +173,12 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 - **Cumulative decode: 0.50 -> 4.27 tok/s = 8.5x** (opts #1-6). Remaining (nsys): tc_fp8 attn GEMMs ~91 ms,
   MoE grouped ~78 ms, tc_ogroup mma ~30 ms, router compute_scores ~19 ms (serial dot), + launch overhead.
   Path to ~50 tok/s = reduce base toward bandwidth floor (~40 ms) + DSpark spec-decode (block verify, ~3-4x).
+
+## Decode opt #8 — vectorized M=1 fp8 GEMV (attn dense GEMMs) — WIN -30%
+- **A/B (warm M=1, argmax=270):** 214 -> **148.9 ms/tok (6.71 tok/s)** = -30%. Unit gate cosine 1.0 vs oracle.
+- **Mechanism:** at M=1 the m16-tile TC (tc_fp8) is mma-LATENCY bound (15/16 rows wasted, fixed mma cost). The
+  GEMV (`fp8_gemv_m1_kernel`) is one warp per output n, reads the B[n] row uint-vectorized (4 fp8/load, 32
+  lanes = 128 contiguous bytes, fully coalesced), per-128 scales per element, single warp-reduce -> pure
+  bandwidth. Routed for M==1 in fp8_block_gemm (NO_GEMV=1 falls back to TC for A/B). **Cumulative 0.50 -> 6.71
+  tok/s = 13.4x.** (Earlier the byte-load warp-per-output oracle was SLOWER than TC — the uint vectorization
+  is what makes the GEMV win.) Next biggest: MoE grouped fp4 GEMM at M=1 (analogous fp4 GEMV).

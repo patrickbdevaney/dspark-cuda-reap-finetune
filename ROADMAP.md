@@ -5,15 +5,25 @@
 `reference/DEEPSEEK_V4_MODELING_NOTES.md` (numeric spec), and the memory file
 `~/.claude/projects/-home-patrickd/memory/dspark-v4flash-180b-thor.md`.
 
-## HIGH-LEVEL OVERVIEW (user, turn ~48) — the definitive remaining sequence
-1. **Fastest kernels for base decode** (target model) — TC mma.sync GEMMs + batched MoE + fusion/graphs → 38-50 tok/s.
-2. **Fastest kernels for DSpark** (the UNPRUNED draft head) — the block-diffusion head decode, co-optimized with (1).
-3. **Minimized-wall-time optimal capture + training** — high-τ acceptance + outcome decode for the draft head; the
-   *fastest* kernels from (1,2) make capture feasible; representative on-policy coverage; block-acceptance objective.
-4. **OpenAI-compatible inference server** — take the BASE INFERENCE kernels (separate from the capture/fine-tune
-   TRAINING kernels) and build the server with **feature parity with gemma-cuda-hybrid** (NVFP4 decode, OpenAI API,
-   reasoning/tool parsing, prefix cache, FP8 KV, web+terminal chat). This is the production deliverable.
-Note: base-inference kernels, capture/train kernels, and the server are SEPARATE artifacts (all preserved in-repo).
+## HIGH-LEVEL OVERVIEW (user, turn ~55) — AGILE RE-SEQUENCE: ship the product first, then improve the head
+**Rationale:** a fast, stable, memory-lean production server running the 180B + the EXISTING (unpruned) DSpark
+head is a real, banked, shippable win — beats vLLM/SGLang on memory + startup + decode on Thor — *before* the
+fine-tune. Improve the draft head afterward as a follow-on optimization.
+1. **Optimize base decode + DSpark decode** — fastest kernels for the REAP target model AND the unpruned DSpark
+   block-diffusion head. TC mma.sync GEMMs (champion #1 done, 19.7×) + batched MoE + fusion/graphs. Goal: decode
+   "decent" (toward 38–50 tok/s) for base + unpruned-head spec-decode.
+2. **OpenAI-compatible server — SEPARATE FOLDER in the repo** (e.g. `serve/`). Full **feature parity with
+   gemma-cuda-hybrid's server, ADAPTED for DeepSeek-V4-Flash**: OpenAI API + **streaming**, **tool-calling schema**,
+   **think-block / reasoning delineation** (DSpark chat format), **terminal + WebUI clients (UI/UX optimized)**,
+   **configurable KV**, prefix cache, model+hardware-tuned kernels. Inherit the gemma server abstractions
+   (`reference/GEMMA_ENGINE_README.md`, inherited `src/`+`include/{webui,tokenizer,httplib}.h`+`server/`) and
+   re-target to this model's tokenizer/chat-template/tool-schema/reasoning-format. **This is the PRODUCTION
+   DELIVERABLE + banked win**: as good as vLLM/SGLang but memory-lean, quick-to-start, faster decode on Thor.
+3. **THEN capture + train the draft head** — minimized-wall-time optimal capture + training for a NEW, better draft
+   head: higher τ acceptance + ultimate decode for REAP on this hardware. (Fastest kernels from (1) make capture
+   feasible; representative on-policy coverage; block-acceptance objective.) Drops into the server as an upgrade.
+Note: base-inference kernels, the server (`serve/`), and the capture/train kernels are SEPARATE artifacts, all
+preserved in-repo. Step 2 gives a satisfying, stable, efficient product; step 3 makes it even faster.
 
 ## Mission
 Fine-tune the DeepSeek "DSpark" spec-decode **draft head** onto `0xSero/DeepSeek-V4-Flash-180B-REAP`

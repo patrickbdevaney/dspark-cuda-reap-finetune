@@ -121,8 +121,12 @@ __global__ void tc_w4a8_pp_kernel(float* out, const uint8_t* wpr, const float* b
     const float* bsr = b_s + (long)(n0+gid)*Ks32;   // original per-32 scale for this lane's weight row n0+gid
     bool m0=gid<M, m8=(gid+8)<M;
     for(int g=0; g<kg8; ++g){
-        uint4 w16 = __ldcs((const uint4*)(wb + (long)g*512 + lane*16));
-        const uint8_t* wby=(const uint8_t*)&w16;
+        // alignment-safe: the in-place repacked weight sits at an arbitrary WeightStore byte offset, so a 16-byte
+        // uint4 load would fault (misaligned). Byte loads are alignment-agnostic and same granularity as fp4_gemm;
+        // the TC compute win (mma) is preserved. (An aligned fast path is a future optimization.)
+        uint8_t wby[16]; const uint8_t* wsrc = wb + (long)g*512 + lane*16;
+        #pragma unroll
+        for(int i=0;i<16;++i) wby[i]=__ldcs(wsrc+i);
         #pragma unroll
         for(int kl=0; kl<8; ++kl){ int k_tile=g*8+kl, k0=k_tile*16;
             unsigned a[4];
@@ -156,4 +160,19 @@ void tc_fp4_gemm_pp(float* C, const uint8_t* A_fp8, const float* a_s, const uint
     k_a_to_fp16<<<((long)M*K+255)/256,256,0,s>>>(x16, A_fp8, a_s, M, K);
     dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_pp_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, Bpacked, b_s, x16, M, N, K);
     CT(cudaStreamSynchronize(s)); cudaFree(x16);
+}
+// Auto variant (drop-in for tc_fp4_gemm): repack B IN PLACE the first time it's seen (zero extra mem), then run
+// the pre-packed GEMM. First forward warms up (repacks); every later forward is pure pp GEMM. Reused temp buffer.
+#include <unordered_set>
+static std::unordered_set<const void*> g_pp_done;
+static uint8_t* g_pp_tmp=nullptr; static size_t g_pp_tmpsz=0;
+void tc_fp4_gemm_pp_auto(float* C, const uint8_t* A_fp8, const float* a_s, const uint8_t* B_fp4, const float* b_s,
+                         int M, int N, int K, cudaStream_t s){
+    if(g_pp_done.find(B_fp4)==g_pp_done.end()){
+        size_t bytes=(size_t)(N/8)*(K/128)*512;                 // == N*K/2
+        if(bytes>g_pp_tmpsz){ if(g_pp_tmp) cudaFree(g_pp_tmp); CT(cudaMalloc(&g_pp_tmp,bytes)); g_pp_tmpsz=bytes; }
+        tc_repack_weight_inplace((uint8_t*)B_fp4, N, K, g_pp_tmp, s);   // overwrite the fp4 weight with its repacked layout
+        g_pp_done.insert(B_fp4);
+    }
+    tc_fp4_gemm_pp(C, A_fp8, a_s, B_fp4, b_s, M, N, K, s);
 }

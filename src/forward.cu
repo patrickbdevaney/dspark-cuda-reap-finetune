@@ -115,7 +115,7 @@ int main(int argc, char** argv){
         m.sw1=L.raw(sp+"w1.weight"); m.sw2=L.raw(sp+"w2.weight"); m.sw3=L.raw(sp+"w3.weight");
         m.sw1s=L.scale(sp+"w1.scale"); m.sw2s=L.scale(sp+"w2.scale"); m.sw3s=L.scale(sp+"w3.scale");
         m.n_routed=N_ROUTED; m.n_act=N_ACT; m.dim=DIM; m.inter=MOE_INTER; m.vocab=VOCAB; m.route_scale=ROUTE_SCALE; m.swiglu_limit=SWIGLU_LIMIT;
-        m.use_tc=false; m.batched=true; };  // batched dispatch ON; tc_fp4 MoE OFF — per-layer repack overhead (cache cleared to avoid 82GB OOM) makes it SLOWER (773 vs 559.8); needs repack-at-load
+        m.use_tc_pp=true; m.batched=true; }; // REPACK-AT-LOAD: tc_fp4 experts repacked in-place ONCE (no malloc/OOM), then pp GEMM; + tc_fp8 dense + batched
     auto fill_attn=[&](const std::string& pfx, MLAWeights& a, bool compressed){
         std::string p=pfx+"attn.";
         a.wq_a=L.raw(p+"wq_a.weight"); a.wq_a_s=L.scale(p+"wq_a.scale"); a.wq_b=L.raw(p+"wq_b.weight"); a.wq_b_s=L.scale(p+"wq_b.scale");

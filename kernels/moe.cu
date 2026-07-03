@@ -171,7 +171,8 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
 
     size_t w13n=(size_t)inter*(dim/2), w13s=(size_t)inter*(dim/32);
     size_t w2n=(size_t)dim*(inter/2),  w2s=(size_t)dim*(inter/32);
-    auto GEMM = w.use_tc ? tc_fp4_gemm : fp4_gemm;
+    void tc_fp4_gemm_pp_auto(float*, const uint8_t*, const float*, const uint8_t*, const float*, int,int,int, cudaStream_t);
+    auto GEMM = w.use_tc_pp ? tc_fp4_gemm_pp_auto : (w.use_tc ? tc_fp4_gemm : fp4_gemm);
     if(w.batched){
         // group tokens by expert -> one GEMM per expert at M=count (amortize weight loads); shared expert M=bs.
         std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);

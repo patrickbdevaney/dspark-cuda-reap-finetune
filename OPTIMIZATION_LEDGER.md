@@ -108,8 +108,11 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   run, same code). Non-determinism ⇒ **uninitialized-device-memory read or a race**, NOT atomicAdd reorder.
   UPDATE: compute-sanitizer found illegal read at moe.cu (garbage token index from a PAGEABLE async
   cudaMemcpyAsync of etok/ewt racing the gather) -> FIXED with blocking cudaMemcpy. Now DETERMINISTIC
-  (no more crash/non-determinism) but output≈0 (cosine ~0) -> a remaining correctness bug (scatter/
-  contribution not landing). Gate K still GREEN on oracle; batched still OFF. DEBUG next:
+  (no more crash/non-determinism); now DETERMINISTIC cosine 0.649. Grouping VERIFIED correct (grouped=16
+  =bs*na, all experts non-empty via MDBG). Weight application + GEMM-per-M independently identical to
+  oracle. So remaining bug is a subtle VALUE diff (magnitudes vary per token, not reorder) — likely an
+  act_quant/GEMM-at-M interaction or scatter/shared interaction not yet isolated. Gate K GREEN on oracle;
+  batched OFF. DEBUG next (fresh pass):
   (1) cudaMemcpyAsync of host std::vector (etok/ewt) is PAGEABLE→async — may race the gather reading tok_d/wrow;
       try pinned host buffers or a sync, OR stage tok/wrow once. (2) run compute-sanitizer on the batched path.
   (3) check every batched scratch buffer is fully written before read for the me<bs rows.

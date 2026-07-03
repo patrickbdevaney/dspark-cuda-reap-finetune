@@ -176,6 +176,7 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         // group tokens by expert -> one GEMM per expert at M=count (amortize weight loads); shared expert M=bs.
         std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);
         for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
+        if(getenv("MDBG")){ int tt=0,ne=0; for(int e=0;e<nr;++e){tt+=etok[e].size(); ne+=!etok[e].empty();} fprintf(stderr,"[batched] bs=%d na=%d nr=%d grouped=%d nonempty=%d (expect grouped=%d)\n",bs,na,nr,tt,ne,bs*na); }
         float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb,*wrow; uint8_t *Xeq,*Hqb; int *tok_d;
         CU(cudaMalloc(&Xe,(size_t)bs*dim*4)); CU(cudaMalloc(&Xeq,(size_t)bs*dim)); CU(cudaMalloc(&Xes2,(size_t)bs*(dim/128)*4));
         CU(cudaMalloc(&Gb,(size_t)bs*inter*4)); CU(cudaMalloc(&Ub,(size_t)bs*inter*4)); CU(cudaMalloc(&Hb,(size_t)bs*inter*4));

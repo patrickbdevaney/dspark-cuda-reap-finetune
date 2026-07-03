@@ -131,3 +131,34 @@ void cblock_verify_step(float* out, const float* x, const int* input_ids, const 
     hc_post(out,sub,res2,post,comb,K,hc,d,stream);
     dsync(stream); dfree(x1);dfree(post);dfree(comb);dfree(sub);dfree(res2);
 }
+
+// ================= device-pos block steps (CUDA-graph capturable) =================
+extern __global__ void k_append_at2(float* dst, const float* scr, const int* d_idx, int hd);   // from compressed_decode.cu
+void mla_decode_step_dp(float* out, const float* x, const MLAWeights& w, float* kvcache, const int* d_pos, int nkv, cudaStream_t stream);
+void compressed_decode_step_strided_dp(float* out, const float* x, const float* xin, const CompressedAttnWeights& w, float* kvc, const int* d_pos, int* d_T, int* d_g, int winmax, int Tmax, int ratio, float eps, cudaStream_t stream);
+void compressed_decode_step_indexer_dp(float* out, const float* x, const float* xin, const CompressedAttnWeights& w, float* kvc, float* idx_kvc, const int* d_pos, int* d_T, int* d_g, int winmax, int Tmax, int ratio, float eps, cudaStream_t stream);
+void block_decode_step_dp(float* out, const float* x, const int* d_curid, const BlockWeights& w,
+                          const int* d_pos, int nkv, int iters, float eps, LayerKV& kv, cudaStream_t stream){
+    const int d=w.dim, hc=w.hc; float *x1,*post,*comb,*sub,*res2;
+    x1=(float*)dmalloc((size_t)d*4); post=(float*)dmalloc((size_t)hc*4); comb=(float*)dmalloc((size_t)hc*hc*4); sub=(float*)dmalloc((size_t)d*4); res2=(float*)dmalloc((size_t)hc*d*4);
+    hc_pre(x1,post,comb,x,w.hc_attn_fn,w.hc_attn_scale,w.hc_attn_base,1,hc,d,iters,eps,stream); rmsnorm(x1,x1,w.attn_norm,1,d,eps,true,stream);
+    mla_decode_step_dp(sub,x1,w.attn,kv.win_kv,d_pos,nkv,stream);
+    hc_post(res2,sub,x,post,comb,1,hc,d,stream);
+    hc_pre(x1,post,comb,res2,w.hc_ffn_fn,w.hc_ffn_scale,w.hc_ffn_base,1,hc,d,iters,eps,stream); rmsnorm(x1,x1,w.ffn_norm,1,d,eps,true,stream);
+    moe_forward(sub,x1,d_curid,w.ffn,1,stream);
+    hc_post(out,sub,res2,post,comb,1,hc,d,stream);
+    dsync(stream); dfree(x1);dfree(post);dfree(comb);dfree(sub);dfree(res2);
+}
+void cblock_decode_step_dp(float* out, const float* x, const int* d_curid, const CompressedBlockWeights& w,
+                           const int* d_pos, int* d_g, int winmax, int Tmax, int iters, float eps, LayerKV& kv, cudaStream_t stream){
+    const int d=w.dim, hc=w.hc; float *x1,*post,*comb,*sub,*res2;
+    x1=(float*)dmalloc((size_t)d*4); post=(float*)dmalloc((size_t)hc*4); comb=(float*)dmalloc((size_t)hc*hc*4); sub=(float*)dmalloc((size_t)d*4); res2=(float*)dmalloc((size_t)hc*d*4);
+    hc_pre(x1,post,comb,x,w.hc_attn_fn,w.hc_attn_scale,w.hc_attn_base,1,hc,d,iters,eps,stream); rmsnorm(x1,x1,w.attn_norm,1,d,eps,true,stream);
+    k_append_at2<<<((size_t)d+255)/256,256,0,stream>>>(kv.xin,x1,d_pos,d);          // xin[*d_pos]=x1
+    if(w.ratio==4) compressed_decode_step_indexer_dp(sub,x1,kv.xin,w.attn,kv.kvc,kv.idx_kvc,d_pos,kv.d_T,d_g,winmax,Tmax,w.ratio,eps,stream);
+    else           compressed_decode_step_strided_dp(sub,x1,kv.xin,w.attn,kv.kvc,           d_pos,kv.d_T,d_g,winmax,Tmax,w.ratio,eps,stream);
+    hc_post(res2,sub,x,post,comb,1,hc,d,stream);
+    hc_pre(x1,post,comb,res2,w.hc_ffn_fn,w.hc_ffn_scale,w.hc_ffn_base,1,hc,d,iters,eps,stream); rmsnorm(x1,x1,w.ffn_norm,1,d,eps,true,stream);
+    moe_forward(sub,x1,d_curid,w.ffn,1,stream); hc_post(out,sub,res2,post,comb,1,hc,d,stream);
+    dsync(stream); dfree(x1);dfree(post);dfree(comb);dfree(sub);dfree(res2);
+}

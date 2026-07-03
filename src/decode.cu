@@ -68,7 +68,8 @@ struct Loader {
 static const float* up_f(const std::vector<float>& v, std::vector<void*>& keep){
     void* d; CU(cudaMalloc(&d,v.size()*4)); CU(cudaMemcpy(d,v.data(),v.size()*4,cudaMemcpyHostToDevice)); keep.push_back(d); return (const float*)d; }
 static std::vector<float> stride_rows(const std::vector<float>& in, int s, int half, int ratio){
-    std::vector<float> o((size_t)(s/ratio)*half); for(int g=0; g<s/ratio; ++g) for(int j=0;j<half;++j) o[(size_t)g*half+j]=in[(size_t)(g*ratio)*half+j]; return o; }
+    int ng=s/ratio; if(ng<1) ng=1;                        // >=1 row: the device-pos emit reads cc[d_g] every step (uncommitted too)
+    std::vector<float> o((size_t)ng*half); for(int g=0; g<ng; ++g) for(int j=0;j<half;++j) o[(size_t)g*half+j]=in[(size_t)(g*ratio)*half+j]; return o; }
 
 int main(int argc, char** argv){
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -233,6 +234,61 @@ int main(int argc, char** argv){
     printf("\n[decode] first decoded token argmax = %d  (expect 270)  -> %s\n", first_am, first_am==270?"GATE PASS":"GATE FAIL");
     printf("[decode] generated:"); for(int g:gen) printf(" %d",g); printf("\n");
     printf("[decode] WARM decode: %.1f ms/tok = %.2f tok/s  (M=1 steady state, %d-step avg)\n", warm_ms, 1000.0/warm_ms, NDEC-1);
+
+    // ================= FULL-STEP CUDA GRAPH (device-pos) — capture once, replay per token =================
+    if(getenv("GRAPH")){
+        const int winmax=seqmax, Tmax=seqmax/4+2;
+        int *d_pos,*d_g,*d_curid; CU(cudaMalloc(&d_pos,4)); CU(cudaMalloc(&d_g,4)); CU(cudaMalloc(&d_curid,4));
+        for(int L=0;L<N_LAYERS;++L){ int ratio=compress_ratio(L); if(!ratio) continue;
+            CU(cudaMalloc(&KV[L].kvc,(size_t)(winmax+Tmax)*HEAD_DIM*4)); CU(cudaMalloc(&KV[L].d_T,4));
+            if(ratio==4) CU(cudaMalloc(&KV[L].idx_kvc,(size_t)Tmax*INDEX_HEAD_DIM*4)); }
+        // dp prefill: reset + re-run normal prefill, then copy separate caches -> combined kvc/idx_kvc + device d_T
+        for(int L=0;L<N_LAYERS;++L) KV[L].T=0;
+        k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,PS,d);
+        k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2); }
+        for(int L=0;L<N_LAYERS;++L){ int ratio=compress_ratio(L); if(!ratio) continue;
+            CU(cudaMemcpy(KV[L].kvc,KV[L].win_kv,(size_t)PS*HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            CU(cudaMemcpy(KV[L].kvc+(size_t)winmax*HEAD_DIM,KV[L].comp_kv,(size_t)KV[L].T*HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            if(ratio==4) CU(cudaMemcpy(KV[L].idx_kvc,KV[L].idx_ckv,(size_t)KV[L].T*INDEX_HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            CU(cudaMemcpy(KV[L].d_T,&KV[L].T,4,cudaMemcpyHostToDevice)); }
+        // build + capture the 43-layer step (input hd, device-pos)
+        cudaStream_t cap; CU(cudaStreamCreate(&cap));
+        auto build_step=[&](cudaStream_t st)->float*{ float* vin=hd; float* vout=hd2;   // reuse decode ping-pong buffers
+            for(int L=0;L<N_LAYERS;++L){ arena_reset(); int ratio=compress_ratio(L);
+                if(ratio==0) block_decode_step_dp (vout,vin,d_curid,BW[L],d_pos,winmax,HC_SINKHORN_ITERS,EPS,KV[L],st);
+                else         cblock_decode_step_dp(vout,vin,d_curid,CW[L],d_pos,d_g,winmax,Tmax,HC_SINKHORN_ITERS,EPS,KV[L],st);
+                std::swap(vin,vout); } return vin; };
+        int cur=ids[s-1]; int p=PS;
+        k_embed<<<((size_t)d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids+PS,1,d); k_hc_expand<<<((size_t)hc*d+255)/256,256>>>(hd,h0,1,hc,d);
+        CU(cudaMemcpy(d_pos,&p,4,cudaMemcpyHostToDevice)); CU(cudaMemcpy(d_curid,&cur,4,cudaMemcpyHostToDevice));
+        build_step(cap); CU(cudaStreamSynchronize(cap));                 // warm (also advances caches for pos PS) — re-prefill after
+        for(int L=0;L<N_LAYERS;++L) KV[L].T=0;
+        k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,PS,d); k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2); }
+        for(int L=0;L<N_LAYERS;++L){ int ratio=compress_ratio(L); if(!ratio) continue;
+            CU(cudaMemcpy(KV[L].kvc,KV[L].win_kv,(size_t)PS*HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            CU(cudaMemcpy(KV[L].kvc+(size_t)winmax*HEAD_DIM,KV[L].comp_kv,(size_t)KV[L].T*HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            if(ratio==4) CU(cudaMemcpy(KV[L].idx_kvc,KV[L].idx_ckv,(size_t)KV[L].T*INDEX_HEAD_DIM*4,cudaMemcpyDeviceToDevice));
+            CU(cudaMemcpy(KV[L].d_T,&KV[L].T,4,cudaMemcpyHostToDevice)); }
+        arena_reset(); float* fbuf; CU(cudaStreamBeginCapture(cap,cudaStreamCaptureModeThreadLocal)); fbuf=build_step(cap);
+        cudaGraph_t g; CU(cudaStreamEndCapture(cap,&g)); cudaGraphExec_t exec; CU(cudaGraphInstantiate(&exec,g,0));
+        printf("\n[graph] captured FULL 43-layer decode step OK. replaying...\n");
+        std::vector<int> ggen; int gm0=-1; cudaEvent_t g0,g1; cudaEventCreate(&g0); cudaEventCreate(&g1); float gms=0; int gt=0;
+        cur=ids[s-1];
+        for(int step=0; step<NDEC; ++step){ p=PS+step;
+            cudaEventRecord(g0);
+            CU(cudaMemcpy(d_curid,&cur,4,cudaMemcpyHostToDevice)); CU(cudaMemcpy(d_pos,&p,4,cudaMemcpyHostToDevice));
+            k_embed<<<((size_t)d+255)/256,256,0,cap>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_curid,1,d); k_hc_expand<<<((size_t)hc*d+255)/256,256,0,cap>>>(hd,h0,1,hc,d);
+            CU(cudaGraphLaunch(exec,cap)); CU(cudaStreamSynchronize(cap));
+            int am; head_fwd(fbuf,&am);
+            cudaEventRecord(g1); cudaEventSynchronize(g1); float ms=0; cudaEventElapsedTime(&ms,g0,g1);
+            if(step>0){ gms+=ms; gt++; } if(step==0) gm0=am; ggen.push_back(am); cur=am; }
+        double gwarm=gt?gms/gt:0;
+        printf("[graph] first token argmax=%d (expect 270) -> %s\n", gm0, gm0==270?"GATE PASS":"GATE FAIL");
+        printf("[graph] generated:"); for(int x:ggen) printf(" %d",x); printf("\n");
+        printf("[graph] WARM: %.1f ms/tok = %.2f tok/s  vs non-graph %.1f ms/tok -> %.2fx\n", gwarm, 1000.0/gwarm, warm_ms, warm_ms/gwarm);
+    }
 
     // ================= SPEC-DECODE M=K VERIFY equivalence gate + timing =================
     // Verify the SAME K tokens the autoregressive decode produced, in ONE M=K forward. Its per-position argmax

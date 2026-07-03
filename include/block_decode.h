@@ -33,3 +33,10 @@ void block_verify_step(float* out, const float* x, const int* input_ids, const B
                        int pos, int K, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);
 void cblock_verify_step(float* out, const float* x, const int* input_ids, const CompressedBlockWeights& w,
                         int pos, int K, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);
+
+// device-pos block steps (CUDA-graph capturable): driven by device *d_pos, *d_g; d_curid = 1-elem device token id
+// (hash-layer routing). Compressed uses the combined cache kv.kvc / kv.idx_kvc + device kv.d_T.
+void block_decode_step_dp(float* out, const float* x, const int* d_curid, const BlockWeights& w,
+                          const int* d_pos, int nkv, int iters, float eps, LayerKV& kv, cudaStream_t stream);
+void cblock_decode_step_dp(float* out, const float* x, const int* d_curid, const CompressedBlockWeights& w,
+                           const int* d_pos, int* d_g, int winmax, int Tmax, int iters, float eps, LayerKV& kv, cudaStream_t stream);

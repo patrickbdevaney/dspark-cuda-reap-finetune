@@ -333,7 +333,7 @@ void compressed_verify_step_indexer(float* out, const float* x_full, int pos, in
 #include "mla_forward.h"
 __global__ void k_gather_win_dp(float* scr, const float* xin, const int* d_pos, int ntok, int tok_off, int dim){
     long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)ntok*dim) return; int r=i/dim, c=i%dim;
-    int t=(*d_pos)+tok_off+r; scr[i]=xin[(size_t)t*dim+c]; }
+    int t=(*d_pos)+tok_off+r; if(t<0) t=0; scr[i]=xin[(size_t)t*dim+c]; }   // clamp: candidate computed every step (commit self-masked); early neg windows must not OOB
 __global__ void k_dg(int* d_g, const int* d_pos, int ratio){ if(!threadIdx.x&&!blockIdx.x) *d_g=(*d_pos)/ratio; }
 __global__ void k_append_at2(float* dst, const float* scr, const int* d_idx, int hd){          // dst[(*d_idx)*hd + i]=scr[i]
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=hd) return; dst[(size_t)(*d_idx)*hd + i]=scr[i]; }

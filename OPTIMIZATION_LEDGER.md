@@ -154,3 +154,13 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 - **NOTE (non-determinism):** multi-token decode sequences vary run-to-run (MoE scatter_add atomics -> near-tie
   argmax flips downstream); token-0 argmax is stable (==270) so the gate is deterministic. Benign; a sorted
   scatter would make it bit-reproducible if ever needed.
+
+## Decode opt #5 — build per-layer weight structs ONCE (persistent) — WIN -27%
+- **A/B (warm M=1, argmax=270):** 453 -> **331 ms/tok (3.02 tok/s)** = -27%. mem 110.6/122.8 (structs resident,
+  no OOM: experts + wo_a native, so residual dequant ~2 GB).
+- **Mechanism:** previously run_layer rebuilt BlockWeights/CompressedBlockWeights EVERY token (fill_attn/fill_moe
+  -> Loader dequant of scales/norms/gate/compressor + cudaMalloc + host struct-build). Now build all 43 structs
+  ONCE up front (build_layer), keep dequant resident, and the decode loop does zero per-token Loader work.
+  Removed ~120 ms/token of per-token dequant+malloc. Cumulative: 0.50 -> 3.02 tok/s (6.0x) across opts #1-5.
+- Remaining (nsys, per token): tc_fp8 attn GEMMs at M=1 ~91 ms (need M=1 GEMV), MoE grouped GEMM ~78 ms,
+  tc_ogroup ~44 ms, MoE router compute_scores ~19 ms (serial per-thread dot), + launch overhead (CUDA graphs).

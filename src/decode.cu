@@ -140,18 +140,20 @@ int main(int argc, char** argv){
 
     // build one layer's weights (dequant), run either prefill_cache (bs=PS) or a decode step (pos), then it's the
     // caller's job to L.release(mk). Returns via x_out.
-    auto run_layer=[&](int Lyr, bool prefill, int pos, const float* x_in, float* x_out, const int* ids_dev){
+    // Build EVERY layer's weight struct ONCE (persistent — experts + wo_a are native so residual dequant is
+    // ~2 GB, fits). The decode loop then does zero per-token Loader work (no dequant, no cudaMalloc, no struct
+    // rebuild). Memory-neutral enough: ~112 GiB peak.
+    std::vector<BlockWeights> BW(N_LAYERS); std::vector<CompressedBlockWeights> CW(N_LAYERS);
+    auto build_layer=[&](int Lyr){
         int ratio=compress_ratio(Lyr); std::string lp="layers."+std::to_string(Lyr)+".";
         if(ratio==0){
-            BlockWeights b{}; fill_attn(lp,b.attn,false); fill_moe(lp,is_hash_layer(Lyr),b.ffn,Lyr);
+            BlockWeights& b=BW[Lyr]; fill_attn(lp,b.attn,false); fill_moe(lp,is_hash_layer(Lyr),b.ffn,Lyr);
             b.attn_norm=L.bf16(lp+"attn_norm.weight");b.ffn_norm=L.bf16(lp+"ffn_norm.weight");
             b.hc_attn_fn=L.f32(lp+"hc_attn_fn");b.hc_attn_scale=L.f32(lp+"hc_attn_scale");b.hc_attn_base=L.f32(lp+"hc_attn_base");
             b.hc_ffn_fn=L.f32(lp+"hc_ffn_fn");b.hc_ffn_scale=L.f32(lp+"hc_ffn_scale");b.hc_ffn_base=L.f32(lp+"hc_ffn_base");
             b.dim=DIM;b.hc=HC_MULT;
-            if(prefill) block_prefill_cache(x_out,x_in,ids_dev,b,PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
-            else        block_decode_step (x_out,x_in,ids_dev,b,pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
         } else {
-            CompressedBlockWeights b{}; fill_attn(lp,b.attn.attn,true);
+            CompressedBlockWeights& b=CW[Lyr]; fill_attn(lp,b.attn.attn,true);
             std::string p=lp+"attn.";
             b.attn.mc_wkv=L.bf16(p+"compressor.wkv.weight");b.attn.mc_wgate=L.bf16(p+"compressor.wgate.weight");
             b.attn.mc_ape=L.f32(p+"compressor.ape");b.attn.mc_norm=L.bf16(p+"compressor.norm.weight");
@@ -168,8 +170,16 @@ int main(int argc, char** argv){
             b.hc_attn_fn=L.f32(lp+"hc_attn_fn");b.hc_attn_scale=L.f32(lp+"hc_attn_scale");b.hc_attn_base=L.f32(lp+"hc_attn_base");
             b.hc_ffn_fn=L.f32(lp+"hc_ffn_fn");b.hc_ffn_scale=L.f32(lp+"hc_ffn_scale");b.hc_ffn_base=L.f32(lp+"hc_ffn_base");
             b.dim=DIM;b.hc=HC_MULT;b.win=WINDOW;b.ratio=ratio;
-            if(prefill) cblock_prefill_cache(x_out,x_in,ids_dev,b,PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
-            else        cblock_decode_step  (x_out,x_in,ids_dev,b,pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+        }
+    };
+    auto run_layer=[&](int Lyr, bool prefill, int pos, const float* x_in, float* x_out, const int* ids_dev){
+        int ratio=compress_ratio(Lyr);
+        if(ratio==0){
+            if(prefill) block_prefill_cache(x_out,x_in,ids_dev,BW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            else        block_decode_step (x_out,x_in,ids_dev,BW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+        } else {
+            if(prefill) cblock_prefill_cache(x_out,x_in,ids_dev,CW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            else        cblock_decode_step  (x_out,x_in,ids_dev,CW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
         }
     };
     auto head_fwd=[&](const float* hstate, int* out_am){       // hc_head->norm->lm_head->argmax (1 token)
@@ -183,11 +193,13 @@ int main(int argc, char** argv){
     CU(cudaMemcpy(d_ids,ids.data(),s*4,cudaMemcpyHostToDevice));
     k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,PS,d);
     k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+    printf("[decode] building 43 layer structs once (persistent)...\n");
+    for(int Lyr=0; Lyr<N_LAYERS; ++Lyr) build_layer(Lyr);       // all dequant done ONCE, resident (~2 GB)
+    { size_t fb,tb; cudaMemGetInfo(&fb,&tb); printf("[decode] structs built. mem %.1f/%.1f GiB\n",(tb-fb)/1073741824.0,tb/1073741824.0); }
     arena_init((size_t)512<<20);                            // 512 MB decode scratch arena (bump, reset per layer)
     printf("[decode] prefill %d positions...\n", PS);
-    for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark(); arena_reset();
-        run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2);
-        L.release(mk); tc_moe_clear_cache();
+    for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset();
+        run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2);     // structs prebuilt -> no per-token Loader work
     }
     printf("[decode] prefill done. caches populated. starting decode.\n");
 
@@ -203,9 +215,8 @@ int main(int argc, char** argv){
         k_embed<<<((size_t)d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,cur_dev,1,d);
         k_hc_expand<<<((size_t)hc*d+255)/256,256>>>(hd,h0,1,hc,d);
         float* xin=hd; float* xout=hd2;
-        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark(); arena_reset();
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset();
             run_layer(Lyr,false,pos,xin,xout,cur_dev); std::swap(xin,xout);
-            L.release(mk); tc_moe_clear_cache();
         }
         int am; head_fwd(xin,&am);
         cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);

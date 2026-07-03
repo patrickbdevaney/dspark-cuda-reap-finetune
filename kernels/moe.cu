@@ -104,6 +104,15 @@ __global__ void compute_scores_kernel(float* sc, const float* x, const float* gw
     float sp = d>20.f ? d : log1pf(expf(d));
     sc[i]=sqrtf(sp);
 }
+// warp-per-(token,expert): coalesced row read + shuffle-reduce (vs the serial per-thread dot above).
+__global__ void compute_scores_warp(float* sc, const float* x, const float* gw, int bs, int dim, int nr){
+    int gid=blockIdx.x; int t=gid/nr, e=gid%nr; if(t>=bs) return; int lane=threadIdx.x&31;
+    const float* xr=x+(size_t)t*dim; const float* gr=gw+(size_t)e*dim;
+    float d=0.f; for(int j=lane;j<dim;j+=32) d+=xr[j]*gr[j];
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) d+=__shfl_down_sync(0xffffffff,d,o);
+    if(lane==0){ float sp=d>20.f?d:log1pf(expf(d)); sc[gid]=sqrtf(sp); }
+}
 __global__ void gather_hash_kernel(int* idx, const long* tid2eid, const int* ids, int bs, int na){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=bs*na) return;
     int t=i/na, s=i%na; idx[i]=(int)tid2eid[(size_t)ids[t]*na + s];
@@ -172,7 +181,7 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
     hq=(decltype(hq))dmalloc(inter); hs=(decltype(hs))dmalloc((inter/128)*4); oe=(decltype(oe))dmalloc(dim*4);
     CU(cudaMemsetAsync(out,0,(size_t)bs*dim*4,stream));
 
-    compute_scores_kernel<<<(bs*nr+63)/64,64,0,stream>>>(sc,x,w.gate_w,bs,dim,nr);
+    compute_scores_warp<<<bs*nr,32,0,stream>>>(sc,x,w.gate_w,bs,dim,nr);
     if(w.is_hash){
         gather_hash_kernel<<<(bs*na+63)/64,64,0,stream>>>(idx,w.tid2eid,input_ids,bs,na);
         gather_scale_kernel<<<bs,32,0,stream>>>(wt,sc,idx,bs,na,nr,w.route_scale);

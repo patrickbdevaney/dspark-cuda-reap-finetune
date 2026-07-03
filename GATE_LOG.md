@@ -87,7 +87,21 @@ MoE compute per token is top-6 experts + 1 shared SwiGLU; batching groups tokens
 weight is loaded ONCE for all its tokens (amortizes the bandwidth-bound weight load), and TC does the GEMM on
 tensor cores instead of one-warp-per-output.
 
-**HARDWARE: Thor sm_110a tensor-core dtype support (probed via ptxas).** Finding: FP8 mma `m16n8k32.e4m3`
+**HARDWARE: Thor sm_110 tensor-core dtype support — CORRECTED (I was wrong; user caught it).**
+FIRST (WRONG) claim: 'Thor has no native FP4 compute.' CORRECTION (web-verified + re-probed): **Thor HAS 2070
+FP4 TFLOPS** (96 5th-gen Tensor Cores, native FP4; 2x its 1035 FP8 TFLOPS, ~4x fp16) — FP4 is its STRONGEST
+mode. My error: I tested only the legacy `mma.sync.kind::f8f6f4` and concluded 'no FP4'. NUANCE (re-probed in
+CUDA 13.0): the FP4 mma is NOT exposed to hand-written PTX for sm_110 — `mma.sync.kind::f8f6f4`, `tcgen05.*`,
+AND block-scaled `mma...kind::mxf4.block_scale` ALL fail 'not supported on .target sm_110'; NVIDIA's CUTLASS
+SM110 FP4 is reported non-functional (forum). So Thor's 2070 FP4 TFLOPS is currently reachable ONLY via NVIDIA
+LIBRARY kernels (cuBLASLt/cuDNN/TensorRT/Transformer-Engine), not our hand-PTX path (as of CUDA 13.0).
+CONSEQUENCES: (a) hand-rolled compute ceiling = **FP8 mma m16n8k32 (verified ✅, 2x our current fp16)** — the
+near-term grind; (b) FP4 (4x) needs cuBLASLt/library today (A/B it — breaks pure hand-roll but hits 2070 TFLOPS)
+OR hand-PTX once ptxas exposes fp4 for sm_110. LESSON: verify HW capability from specs+multiple probes before
+concluding from one instruction form; and log corrections openly. ML/HW note: fp4-STORAGE (weights) was always
+the right decode-bandwidth lever; fp4-COMPUTE is the compute-bound-regime lever (prefill/capture/spec-block).
+
+**(SUPERSEDED) HARDWARE: Thor sm_110a tensor-core dtype support (probed via ptxas).** Finding: FP8 mma `m16n8k32.e4m3`
 ✅ supported; FP16 mma ✅; **FP4/NVFP4 mma (`kind::f8f6f4`, e2m1) ❌ NOT supported** ('not supported on .target
 sm_110'). Why it matters: native FP4 *compute* is a datacenter-Blackwell (B200/sm_100) feature, ABSENT on the
 Jetson sm_110 die — so there is no fp4 tensor-core to leverage. We leverage fp4 for MEMORY (4-bit weight storage

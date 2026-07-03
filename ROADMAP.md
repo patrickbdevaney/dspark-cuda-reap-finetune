@@ -15,7 +15,12 @@ artifact — nothing disposable.**
 
 ---
 
-## WHERE WE ARE NOW (turn ~36) — GATE 1 PASSED ✅
+## WHERE WE ARE NOW (turn ~40) — GATES 1, 1.5, 2 PASSED ✅ (project thesis proven end-to-end)
+**Gate 2 GO: DSpark head unfine-tuned tau@0 = 0.815 (22/27) on REAP** — head transfers, light fine-tune should suffice.
+**Gate 1.5: 'The capital of France is' -> ' Paris' (correct).  Gate 1: full 180B runs, mem 107.6/122.8.**
+NEXT PHASE: **C capture** (user: review wall-clock optimality first) -> D training (pure-CUDA aspiration, Muon-vs-AdamW review) -> E server. See CAPTURE_TRAIN_PLAN.md.
+
+### (historical) GATE 1 PASSED
 **The full DeepSeek-V4-180B-REAP forward RUNS on Thor** (`src/forward.cu`, `build/forward`, `scripts/build_forward.sh`).
 s=8 prefill: all 43 layers, memory FLAT 120.5/122.8 GiB, finite sane logits (argmax=1822 logit=16.4),
 5494 ms (687 ms/tok, unoptimized). OOM fixed by per-layer dequant scoping (`Loader::mark/release`).

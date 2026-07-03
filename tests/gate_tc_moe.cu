@@ -35,6 +35,19 @@ int main(int argc, char** argv){
     bool ok = cosine>0.999 && rms<3e-2;
     printf("[tc_moe W4A8] M=%d N=%d K=%d  cosine=%.6f rms_rel=%.5f max_abs/|c|max=%.5f -> %s\n",
            M,N,K,cosine,rms,absr, ok?"PASS":"FAIL");
+    // --- REPACK-AT-LOAD (pre-packed) variant: repack B in place, run tc_fp4_gemm_pp with ORIGINAL scale, vs oracle ---
+    extern void tc_repack_weight_inplace(uint8_t*, int, int, uint8_t*, cudaStream_t);
+    extern void tc_fp4_gemm_pp(float*, const uint8_t*, const float*, const uint8_t*, const float*, int,int,int, cudaStream_t);
+    uint8_t *dBp,*tmp; CU(cudaMalloc(&dBp,B.size())); CU(cudaMalloc(&tmp,B.size()));
+    CU(cudaMemcpy(dBp,dB,B.size(),cudaMemcpyDeviceToDevice));
+    tc_repack_weight_inplace(dBp,N,K,tmp,0); CU(cudaDeviceSynchronize());   // in-place, same as load-time
+    float* Ctp; CU(cudaMalloc(&Ctp,(size_t)M*N*4));
+    tc_fp4_gemm_pp(Ctp,dA,das,dBp,dbs,M,N,K,0); CU(cudaDeviceSynchronize());
+    std::vector<float> ctp((size_t)M*N); CU(cudaMemcpy(ctp.data(),Ctp,ctp.size()*4,cudaMemcpyDeviceToHost));
+    double dp=0,np=0,nq=0; for(size_t i=0;i<cr.size();++i){ dp+=cr[i]*ctp[i]; np+=cr[i]*cr[i]; nq+=ctp[i]*ctp[i]; }
+    double cospp=dp/(sqrt(np)*sqrt(nq)+1e-30); bool okpp=cospp>0.999; ok=ok&&okpp;
+    printf("[tc_moe PP repack-at-load] cosine vs fp4_gemm oracle=%.6f -> %s\n", cospp, okpp?"PASS":"FAIL");
+    cudaFree(dBp);cudaFree(tmp);cudaFree(Ctp);
     // --- A/B timing (full calls; tc includes per-call repack — caching that is a further win) ---
     int IT=30; cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
     for(int i=0;i<3;++i){ fp4_gemm(Cr,dA,das,dB,dbs,M,N,K,0); tc_fp4_gemm(Ct,dA,das,dB,dbs,M,N,K,0);} CU(cudaDeviceSynchronize());

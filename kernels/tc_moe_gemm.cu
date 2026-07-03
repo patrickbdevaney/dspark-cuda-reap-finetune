@@ -107,3 +107,53 @@ void tc_fp4_gemm(float* C, const uint8_t* A_fp8, const float* a_s, const uint8_t
 // Free the repack cache — call per-layer in forward.cu so the full model doesn't accumulate ~82GB of repacked
 // expert weights (the cache is a decode-across-forwards optimization; per single forward it's per-layer scoped).
 void tc_moe_clear_cache(){ for(auto& kv : g_tc_cache){ cudaFree(kv.second.wpr); cudaFree(kv.second.wsr); } g_tc_cache.clear(); }
+
+// ===================== REPACK-AT-LOAD (zero extra memory) =====================
+// The repacked layout is the SAME byte-size as the fp4 weight (N*K/2), so we repack IN PLACE at load and the
+// kernel reads the ORIGINAL scale b_s[N,K/32] directly (no wsr). Result: no 82GB doubling, no per-layer repack.
+// Pre-packed kernel: weight already in wpr layout; scale read from original b_s (per-32, one 32-block=2 k-tiles).
+__global__ void tc_w4a8_pp_kernel(float* out, const uint8_t* wpr, const float* b_s, const __half* x16, int M, int N, int K){
+    int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
+    int warp=threadIdx.x>>5; int n_block=blockIdx.x*TCM_WARPS+warp; if((long)n_block*8>=N) return; int n0=n_block*8;
+    float c[4]={0,0,0,0}; int kg8=K/128, Ks32=K/32;
+    const uint8_t* wb = wpr + (long)n_block*kg8*512;
+    const __half* xg0 = x16 + (size_t)gid*K, *xg8 = x16 + (size_t)(gid+8)*K;
+    const float* bsr = b_s + (long)(n0+gid)*Ks32;   // original per-32 scale for this lane's weight row n0+gid
+    bool m0=gid<M, m8=(gid+8)<M;
+    for(int g=0; g<kg8; ++g){
+        uint4 w16 = __ldcs((const uint4*)(wb + (long)g*512 + lane*16));
+        const uint8_t* wby=(const uint8_t*)&w16;
+        #pragma unroll
+        for(int kl=0; kl<8; ++kl){ int k_tile=g*8+kl, k0=k_tile*16;
+            unsigned a[4];
+            a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
+            a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
+            a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
+            a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
+            __half2 sc2 = __half2half2(__float2half(bsr[k_tile/2]));  // 32-block = k_tile/2 (16 per k-tile)
+            __half2 b0 = __hmul2(tcm_fp4x2(wby[2*kl]),   sc2);
+            __half2 b1 = __hmul2(tcm_fp4x2(wby[2*kl+1]), sc2);
+            unsigned bb[2]; bb[0]=*(unsigned*)&b0; bb[1]=*(unsigned*)&b1;
+            mma_m16n8k16(c, a, bb);
+        }
+    }
+    int cn=2*t4;
+    if(gid<M   && n0+cn  <N) out[(size_t)gid*N   + n0+cn  ]=c[0];
+    if(gid<M   && n0+cn+1<N) out[(size_t)gid*N   + n0+cn+1]=c[1];
+    if(gid+8<M && n0+cn  <N) out[(size_t)(gid+8)*N + n0+cn ]=c[2];
+    if(gid+8<M && n0+cn+1<N) out[(size_t)(gid+8)*N + n0+cn+1]=c[3];
+}
+// Repack one fp4 weight IN PLACE (via a reused temp of size N*K/2). Call once per routed expert weight at load.
+void tc_repack_weight_inplace(uint8_t* w_fp4, int N, int K, uint8_t* temp, cudaStream_t s){
+    long tw=(long)(N/8)*(K/128)*32*8; size_t bytes=(size_t)(N/8)*(K/128)*512;   // == N*K/2
+    k_repack_w<<<(tw+255)/256,256,0,s>>>(temp, w_fp4, N, K);
+    CT(cudaMemcpyAsync(w_fp4, temp, bytes, cudaMemcpyDeviceToDevice, s));
+}
+// Drop-in for fp4_gemm, but B_fp4 is ALREADY repacked (via tc_repack_weight_inplace) and b_s is the ORIGINAL scale.
+void tc_fp4_gemm_pp(float* C, const uint8_t* A_fp8, const float* a_s, const uint8_t* Bpacked, const float* b_s,
+                    int M, int N, int K, cudaStream_t s){
+    __half* x16; CT(cudaMalloc(&x16,(size_t)M*K*2));
+    k_a_to_fp16<<<((long)M*K+255)/256,256,0,s>>>(x16, A_fp8, a_s, M, K);
+    dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_pp_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, Bpacked, b_s, x16, M, N, K);
+    CT(cudaStreamSynchronize(s)); cudaFree(x16);
+}

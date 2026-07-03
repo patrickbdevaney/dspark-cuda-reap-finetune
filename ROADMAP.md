@@ -106,9 +106,25 @@ container `vllm-dflash-thor:sglang`. Never `--runtime nvidia` (wedges containers
      loops per selected expert, so swap `w1 + e*stride` → `w1_ptrs[e]` (localized; keep the stacked version so
      gate_block/gate_units still pass). Model loader builds the 160-ptr tables per layer via WeightStore.
    - embed = `embed_tokens.weight` (bf16 lookup). `lm_head.weight` (bf16/fp8) + final `norm.weight`.
-2. **Model assembly** — build `BlockWeights` (layers 0-1) and a new `CompressedBlockWeights`
-   (=`CompressedAttnWeights`+`MoEWeights`+hc+norms) for layers 2-42 by name lookup. Need
-   `compressed_block_forward` = mirror `block_forward` but call `compressed_attn_forward` for attention.
+2. **Model assembly** — `compressed_block_forward` DONE (`kernels/compressed_block.cu`, compiles). Build
+   per-layer `BlockWeights`(L0-1)/`CompressedBlockWeights`(L2-42) by name lookup from `WeightStore`.
+   **EXACT CHECKPOINT NAMES (verified from index):**
+   - attn: `layers.{L}.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}` · `.q_norm.weight` · `.kv_norm.weight`
+     · `.attn_sink`. compressor: `.compressor.{wkv,wgate}.weight` · `.compressor.ape` · `.compressor.norm.weight`.
+     indexer: `.indexer.wq_b.{weight,scale}` · `.indexer.weights_proj.weight` · `.indexer.compressor.{wkv,wgate}.weight`
+     · `.indexer.compressor.ape` · `.indexer.compressor.norm.weight`.
+   - block: `layers.{L}.{attn_norm,ffn_norm}.weight` · `layers.{L}.hc_{attn,ffn}_{fn,scale,base}`.
+   - ffn: `layers.{L}.ffn.gate.{weight,tid2eid}` · `.experts.{e}.{w1,w2,w3}.{weight,scale}` ·
+     `.shared_experts.{w1,w2,w3}.{weight,scale}`.
+   - top level: `embed.weight` (bf16), `norm.weight` (final), `lm_head`? (**CHECK**: not in grep above — the
+     model may TIE lm_head to `embed.weight`; verify in model.py `ModelArgs`/forward).
+   - **`wo_a` IS fp8 (`.scale` present)** but `mla_forward`/`ogroup_gemm` expect **fp32** (goldens did
+     `.float()`). LOADER MUST DEQUANT `wo_a` fp8→fp32 per layer (~134 MB/layer fp32, ~5.8 GB total) OR add an
+     fp8 path to `ogroup_gemm`. Same-class check for any other tensor a kernel assumes fp32.
+   - YaRN freqs via `yarn.h`: per layer type (compressed base=compress_rope_theta orig=65536; sliding
+     base=rope_theta orig=0). query freqs = `freqs[:s]`, compressed = `freqs[:s:ratio]`.
+3. **DSpark head names for Phase B:** `mtp.0.{enorm,hnorm,attn_norm,ffn_norm,norm}.weight`,
+   `mtp.0.attn.{q_norm,kv_norm}.weight`, + mtp attn/ffn weights (grep `mtp.` fully when building the head).
 2. **Model assembly:** `embed(input_ids)` → HC-expand → 43 layers → final `rmsnorm` → `lm_head` → logits.
    - Layers 0–1: pure-sliding block (`block_forward` uses `mla_forward`).
    - Layers 2–42: compressed block — need a `compressed_block_forward` = block wrapping

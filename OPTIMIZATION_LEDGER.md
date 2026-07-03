@@ -49,7 +49,7 @@ These are the correctness-first shapes — chosen for provable correctness, alwa
 | 1 | MoE fp4 GEMM | **tc_fp4_gemm** (Marlin TC W4A8) — per-call repack | 0.462 ms | 3.06× | superseded |
 | 2 | MoE fp4 GEMM | **tc_fp4_gemm + CACHED repack** (ptr-keyed) | **M=8: 0.080 ms / M=1: 0.065 ms** | **M=8: 19.7× / M=1: 2.71×** | **CHAMPION** (cosine 1.0). Swapped into moe.cu behind MoEWeights.use_tc. TC win GROWS with M -> BATCH tokens. |
 | — | note | full-model enable: caching every expert repack DOUBLES expert mem (~82GB) -> OOM. Repack at LOAD (store repacked in place of original) or per-layer scope. | | | TODO (blocks full-model use_tc) |
-| — | next | native fp8 mma m16n8k32 (skip fp8→fp16) | | (~2× more) | TODO |
+| — | next | **native FP8 mma m16n8k32** (dequant fp4-wt→fp8, acts already fp8, FP8 tensor core = 2× fp16; FP4 mma NOT on sm_110) | | ~2× over current fp16 TC | TODO (HW-verified path) |
 | — | next | batched/grouped MoE dispatch (kill host per-token loop) | | | TODO |
 
 ## Target #1 PORT DESIGN (turnkey — adapt gemma tc_w4a16 → our W4A8 MoE-expert GEMM)

@@ -87,5 +87,15 @@ MoE compute per token is top-6 experts + 1 shared SwiGLU; batching groups tokens
 weight is loaded ONCE for all its tokens (amortizes the bandwidth-bound weight load), and TC does the GEMM on
 tensor cores instead of one-warp-per-output.
 
+**HARDWARE: Thor sm_110a tensor-core dtype support (probed via ptxas).** Finding: FP8 mma `m16n8k32.e4m3`
+✅ supported; FP16 mma ✅; **FP4/NVFP4 mma (`kind::f8f6f4`, e2m1) ❌ NOT supported** ('not supported on .target
+sm_110'). Why it matters: native FP4 *compute* is a datacenter-Blackwell (B200/sm_100) feature, ABSENT on the
+Jetson sm_110 die — so there is no fp4 tensor-core to leverage. We leverage fp4 for MEMORY (4-bit weight storage
+= min bandwidth = the decode-bound lever) which is correct and the only fp4 lever here. BUT our tc_fp4_gemm
+upconverts fp4→fp16 + FP16 mma, leaving 2× on the table: Thor's FP8 mma is 2× fp16, and our acts are already
+fp8. NEXT GRIND: dequant fp4-weight→fp8 (not fp16) + FP8 tensor core (m16n8k32) — 2× compute + drops the
+fp8→fp16 act upconvert. ML/HW note: decode bandwidth-bound so this helps compute-bound regimes most (prefill,
+batched capture, spec-block verify); single-token decode already rides fp4-memory.
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

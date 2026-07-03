@@ -220,7 +220,15 @@ static bool gate_moe(const std::string& dir) {
     std::vector<float> y3((size_t)n*dim); CU(cudaMemcpy(y3.data(),out3,y3.size()*4,cudaMemcpyDeviceToHost));
     double d3=0,a3=0,b3=0; for(size_t i=0;i<y.size();++i){d3+=y[i]*y3[i];a3+=y[i]*y[i];b3+=y3[i]*y3[i];}
     double cosc=d3/(sqrt(a3)*sqrt(b3)+1e-30); bool okc=cosc>0.999;
-    printf("[moe batched+TC] cosine vs oracle=%.7f -> %s\n", cosc, okc?"PASS":"FAIL"); ok=ok&&okc; w.use_tc=false; cudaFree(out3);
+    printf("[moe batched+TC] cosine vs oracle=%.7f -> %s\n", cosc, okc?"PASS":"FAIL"); ok=ok&&okc; cudaFree(out3);
+    // A/B timing (measured delta per Constitution VI.5): per-token vs batched vs batched+TC. Note: TINY gate
+    // shapes (dim=256,inter=128) — shows DISPATCH amortization (fewer launches), NOT the real-model TC 19.7x.
+    { cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b); int IT=20;
+      auto tm=[&](bool bat,bool tc)->float{ w.batched=bat; w.use_tc=tc; for(int i=0;i<3;++i) moe_forward(out,x,nullptr,w,n); CU(cudaDeviceSynchronize());
+        cudaEventRecord(a); for(int i=0;i<IT;++i) moe_forward(out,x,nullptr,w,n); cudaEventRecord(b); cudaEventSynchronize(b); float ms=0; cudaEventElapsedTime(&ms,a,b); return ms/IT; };
+      float t0=tm(false,false), t1=tm(true,false), t2=tm(true,true);
+      printf("[moe A/B] per-token %.3f ms | batched %.3f ms (%.2fx) | batched+TC %.3f ms (%.2fx)\n", t0,t1,t0/t1,t2,t0/t2);
+      w.batched=false; w.use_tc=false; }
     printf("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
            n,dim,inter,nr,na,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
     return ok;

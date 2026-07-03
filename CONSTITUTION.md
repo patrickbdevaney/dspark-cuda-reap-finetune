@@ -175,6 +175,25 @@ vLLM/SGLang unchanged (Axiom 5).
 
 ---
 
+## Article VI·5 — Explainability is permanent (the "why" is a first-class artifact)
+
+CUDA is complex; the transferable value is not just the fast kernel but **how and why it got fast, what
+iterative steps produced the speed, and the machine-learning fundamentals of every component.** This is a
+standing obligation, not a one-time doc:
+
+1. **Every gate/iteration logs finding → root cause → fix → why-correct** in `GATE_LOG.md`. When a gate catches
+   something or an iteration lands a measured change, add the entry. The commit message states the same.
+2. **Every optimization records the measured A/B delta + the mechanism** (why it's faster, on which roofline
+   bound) in `OPTIMIZATION_LEDGER.md`. No "it's faster" without the number and the reason.
+3. **Every component carries its ML fundamentals** — *why the architecture does this* (e.g. MLA = latent KV to
+   cut KV bandwidth; DSA = O(Lk) sparse attention via a lightning indexer; Hyper-Connections = learned residual
+   mixing; fp4 experts = W4 memory for the bulk params; block-diffusion draft = parallel multi-token proposal;
+   Markov head = bigram correction of the AR block). Captured in `reference/DEEPSEEK_V4_MODELING_NOTES.md`
+   (numeric spec) + `GATE_LOG.md` (build rationale). A reader must be able to learn *why*, not just *what*.
+4. **Research is preserved verbatim** (`RESEARCH_*.md`) so the evidence behind decisions is auditable.
+5. The trail is durable and ordered: `git log` (per-commit rationale) → the docs above. Losing the "why" is a
+   defect, same as losing the code.
+
 ## Article VII — Definition of done
 
 1. Gates 0, 1, 2, 3 green with **recorded, measured** numbers.

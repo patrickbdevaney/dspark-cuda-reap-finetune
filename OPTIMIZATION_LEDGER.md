@@ -98,6 +98,11 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 ## REVISED GRIND ORDER (bandwidth-first): batch loads (1) → fuse gate+up (2) → native-dtype no-dequant (3) →
 ## W4A8 grouped GEMM single-launch (4) → CUDA graphs (5) → MLA dequant-cut crossover (6). Each A/B'd + logged.
 
+## Grind #2 — DONE + COMPOUNDED PATH VALIDATED
+- batched (grouped dispatch) cosine 1.0 vs oracle; **batched + use_tc (TC W4A8 at M=count) cosine 1.0** — the
+  compounded fast MoE path is correct. Carries: TC 19.7x (M=8) + dispatch amortization. Enable both in the
+  multi-token forward (prefill/spec-block/capture). Per-token+fp4_gemm stays the bit-exact oracle.
+
 ## Grind round #2 (batch MoE + fuse gate+up) — IN PROGRESS, gate caught a bug
 - **gate+up input-share: DONE** — the routed w1/w3 GEMMs share the single quantized input tile `Xeq` (act_quant
   once, feed both). (Full register-fusion of g,u+swiglu into one kernel = further follow-up.)

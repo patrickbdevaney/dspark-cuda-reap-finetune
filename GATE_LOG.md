@@ -80,5 +80,12 @@ ONCE as flat device arrays + per-expert OFFSET pointers (no reused buffer, no pe
 robust dispatch; the offset-pointer scheme removes the reused-buffer failure mode entirely. **Rationale kept:
 the gate + compute-sanitizer + per-expert dumps localized a subtle host-copy bug that inspection missed.**
 
+**Compounded fast path (batched + TC).** Finding: need to confirm the two wins COMPOSE. Gate: batched=true +
+use_tc=true vs per-token oracle -> cosine 1.0000000. Why correct: batched only reorders the accumulation
+(atomicAdd, tiny fp32) and TC only rounds acts to fp16 -> both cosine-preserving; together still 1.0. ML note:
+MoE compute per token is top-6 experts + 1 shared SwiGLU; batching groups tokens by expert so each expert's
+weight is loaded ONCE for all its tokens (amortizes the bandwidth-bound weight load), and TC does the GEMM on
+tensor cores instead of one-warp-per-output.
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

@@ -214,6 +214,13 @@ static bool gate_moe(const std::string& dir) {
     // INFORMATIONAL (not gating Gate K): batched dispatch is WIP — gate caught a correctness bug (cosine<1).
     // Per-token oracle (above) stays bit-exact and is the default. Do NOT enable MoEWeights.batched until this PASSES.
     bool okb=cosb>0.9999; printf("[moe batched] cosine vs per-token oracle=%.7f -> %s\n", cosb, okb?"PASS":"FAIL"); ok=ok&&okb;
+    // compounded fast path: batched dispatch + TC GEMM (use_tc) — the real decode win. cosine (batched reorder + fp16-act).
+    w.use_tc=true; float* out3; CU(cudaMalloc(&out3,(size_t)n*dim*4));
+    moe_forward(out3, x, nullptr, w, n); CU(cudaDeviceSynchronize());
+    std::vector<float> y3((size_t)n*dim); CU(cudaMemcpy(y3.data(),out3,y3.size()*4,cudaMemcpyDeviceToHost));
+    double d3=0,a3=0,b3=0; for(size_t i=0;i<y.size();++i){d3+=y[i]*y3[i];a3+=y[i]*y[i];b3+=y3[i]*y3[i];}
+    double cosc=d3/(sqrt(a3)*sqrt(b3)+1e-30); bool okc=cosc>0.999;
+    printf("[moe batched+TC] cosine vs oracle=%.7f -> %s\n", cosc, okc?"PASS":"FAIL"); ok=ok&&okc; w.use_tc=false; cudaFree(out3);
     printf("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
            n,dim,inter,nr,na,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
     return ok;

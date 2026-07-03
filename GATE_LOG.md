@@ -199,3 +199,14 @@ tile. Weights/scales are the SAME in-place-repacked bytes the pp path uses → i
 
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*
+
+**Step 4 milestone 1 — sliding-window M=1 KV-cache decode: BIT-EXACT.** Split the pure-sliding MLA forward into
+`mla_cache_kv` (prefill writes window-KV) + `mla_decode_step` (M=1: append new token's KV, attend the sliding
+window [max(0,pos-127)..pos]). Reuses the Gate-K primitives (fp8_block_gemm, rmsnorm, rope@pos, act_quant_fp8sim,
+sparse_attn m=1, ogroup_gemm) — every op is per-row, so decode(pos) == prefill's out[pos] bit-for-bit.
+- **Equivalence gate (`tests/gate_mla_decode.cu`, synthetic weights, no golden needed):** prefill s=16 vs
+  cache(0..s-2)+decode(s-1) → **cosine 1.00000000, rms 0, max_abs 0.** Path-vs-path equivalence: the KV-cache
+  decode is mathematically identical to recompute. This validates the cache-append + M=1 attention foundation
+  the compressed flavors (milestone 2) and the full 43-layer decode loop (milestone 3) build on.
+- key RoPE detail: at decode the single token's N_HEADS query rows all share position `pos`'s cos/sin row —
+  pass `cosT + pos*half` with `cos_stride_rows=N_HEADS`; the KV row uses the same offset with stride 1.

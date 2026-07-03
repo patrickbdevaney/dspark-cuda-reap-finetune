@@ -1,3 +1,5 @@
+> **New session: read `START_HERE.md` first** — it is the authoritative entry point (situation, arc, state, constraints, next build).
+
 # ROADMAP — full build state & path (capture → fine-tune → inference server)
 
 **Durable progress record for `dspark-cuda-reap-finetune`.** If context is lost, start here. Read alongside

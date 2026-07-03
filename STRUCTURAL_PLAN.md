@@ -51,3 +51,20 @@ multiplies the token rate. Measure each on a **decode** step (M=1), not the s=8 
 ## Discipline (unchanged)
 Gate every step cosine-1.0 vs the prior path; run detached-to-file; never a persistent memory addition; log the
 measured delta (`OPTIMIZATION_LEDGER.md`) + rationale (`GATE_LOG.md`). Stop-rule + black-swan search still apply.
+
+## FINDINGS while implementing (technical reality of zero-sync + capture)
+- **Step 1 DONE + gated** (device grouping, cosine 1.0, integrated 378.8 ms/tok correct). But it keeps one
+  small `off[]` D2H copy for the per-expert launch grid sizes.
+- **Zero-sync (Step 1b) is NOT a small tweak.** Removing the `off[]` sync means the host can't size per-expert
+  grids. Fixed maxm-per-expert grids are catastrophic (nr=160 experts × maxm=bs*na rows = ~160× wasted compute).
+  The correct form is a SINGLE **grouped-GEMM** kernel: one launch over all tokens, each tile reads device
+  `off[]` to pick its expert's weight (CUTLASS-grouped-GEMM style). That's a substantial NEW kernel.
+- **Graph capture (Step 3) needs the WHOLE forward static**, not just the MoE. cudaGraph records stream ops with
+  FIXED args; the Loader dequants+`cudaMalloc/Free` PER LAYER, and pp/funnel/x16 malloc per call — all illegal
+  during capture and all data-dependent. Capturing means pre-allocating EVERY buffer + removing all per-layer
+  host work → effectively rebuilding the forward as a static step.
+- **Conclusion:** zero-sync grouped-GEMM + full pre-alloc + graph capture ARE the decode-engine build, and the
+  decode engine IS the core of the OpenAI server (Step: server). So the multiplier phase MERGES with the server
+  phase — build the static M=1 KV-cache decode step once, capture it as a graph, and that same engine backs the
+  API. Payoff is real only at M=1 (launch-bound), not s=8 prefill (compute-bound). Do this as one focused build,
+  not rushed piecemeal on the prefill forward (which stays the correct 378.8 ms/tok kernel baseline).

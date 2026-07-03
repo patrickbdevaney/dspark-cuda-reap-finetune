@@ -32,9 +32,22 @@ first path where **decode tok/s** is actually measured (everything so far is s=8
 - ⬜ **M=1 GEMV for fp8 (attn) + fp4 (MoE)** — the m16-tile mma wastes 15/16 at M=1; a bandwidth-optimal
   M=1 GEMV (vectorized uint4 weight loads, warp-reduce) should cut tc_fp8 (91→~25ms) + MoE (78→~25ms).
   (NOTE: the naive warp-per-output oracle was A/B'd SLOWER than TC at M=1 — needs a proper vectorized GEMV.)
-- ⬜ **CUDA-graph capture (Step 3)** — collapse ~2500 launches/token (~100ms host overhead) into one graph
-  launch. Blocker: move the host-side idx generation (comb vectors, k_win_idx base/width, T counter, pos math)
-  fully on-device so the per-token launch sequence is static. Arena (done) already removed mid-token malloc.
+- 🟡 **CUDA-graph capture (Step 3) — ANALYZED, device-pos rewrite scoped.** Collapse ~2500 launches/token into
+  one `cudaGraphLaunch`. **Finding (verified): the M=1 decode path has NO host syncs** (no D2H, no
+  cudaStreamSynchronize — dsync is an arena no-op) — so it is nearly capturable. Prep done: `run_layer` threads
+  a capture stream. Remaining blockers are exactly the **pos-baked / host-resident** bits; each has a bounded fix:
+  1. **Host `comb` idx buffers** (compressed_decode_step_strided/indexer build a `std::vector` then H2D) — freed
+     after the step, so they don't survive replay. FIX: build comb in a DEVICE buffer via a kernel from `d_pos`,`d_T`.
+  2. **`pos` baked into pointer math** — rope offset `cosT+pos*half`, KV append `kvcache+pos*HEAD_DIM`,
+     `k_win_idx(base,width)`. FIX: a `d_pos` device int; device-pos rope variant (kernel reads `d_pos`); write new
+     KV to a fixed scratch then a `d_pos`-indexed copy kernel appends it; `k_win_idx`/comb kernels read `d_pos`.
+  3. **Compressor emit conditionality + host `T` counter** (`if((pos+1)%ratio==0){...; ++*T}`). FIX: an
+     always-launched emit kernel that self-masks on `d_pos` and advances a DEVICE `T`; the attention reads device `T`.
+  Once all decode-step addressing is device-`d_pos`-driven, `cudaStreamBeginCapture`→instantiate→`cudaGraphLaunch`
+  per token (bump `d_pos` with a 1-thread kernel between launches). Gate: identical logits vs the un-captured path.
+  This is the "rebuild the forward as a static step" — invasive across mla_decode/compressed_decode + a rope
+  variant, but bounded (~300-500 lines) and the M=K verify path generalizes the same way. Est. saves the
+  ~100 ms/token host launch overhead AND brings the M=5 verify toward the weight-bound floor -> spec-decode >1x.
 - 🟡 **DSpark spec-decode (Step 5) — IN PROGRESS. The M=K VERIFY primitive is DONE + gated (the hard part).**
   - ✅ **M=K verify forward** (`mla_verify_step`, `compressed_verify_step_{strided,indexer}`, `block_verify_step`,
     `cblock_verify_step`): K tokens in ONE forward, GEMMs at M=K read weights ONCE. `gate_mla_verify` cosine 1.0;

@@ -176,14 +176,14 @@ int main(int argc, char** argv){
             b.dim=DIM;b.hc=HC_MULT;b.win=WINDOW;b.ratio=ratio;
         }
     };
-    auto run_layer=[&](int Lyr, bool prefill, int pos, const float* x_in, float* x_out, const int* ids_dev){
+    auto run_layer=[&](int Lyr, bool prefill, int pos, const float* x_in, float* x_out, const int* ids_dev, cudaStream_t st=0){
         int ratio=compress_ratio(Lyr);
         if(ratio==0){
-            if(prefill) block_prefill_cache(x_out,x_in,ids_dev,BW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
-            else        block_decode_step (x_out,x_in,ids_dev,BW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            if(prefill) block_prefill_cache(x_out,x_in,ids_dev,BW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr],st);
+            else        block_decode_step (x_out,x_in,ids_dev,BW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr],st);
         } else {
-            if(prefill) cblock_prefill_cache(x_out,x_in,ids_dev,CW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
-            else        cblock_decode_step  (x_out,x_in,ids_dev,CW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            if(prefill) cblock_prefill_cache(x_out,x_in,ids_dev,CW[Lyr],PS,HC_SINKHORN_ITERS,EPS,KV[Lyr],st);
+            else        cblock_decode_step  (x_out,x_in,ids_dev,CW[Lyr],pos,HC_SINKHORN_ITERS,EPS,KV[Lyr],st);
         }
     };
     auto head_fwd=[&](const float* hstate, int* out_am){       // hc_head->norm->lm_head->argmax (1 token)

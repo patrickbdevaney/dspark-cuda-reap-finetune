@@ -142,5 +142,14 @@ unit gate missed it: synthetic routing gave me≤bs (no duplicate-slot collision
 them. Gates still cosine 1.0 after the fix. LESSON (again): compute-sanitizer localizes in minutes what
 inspection can't — and 'me≤bs' was an unstated assumption the real router violates.
 
+**End-to-end wiring result (both champions measured on the full 180B).** tc_fp8 dense + batched -> **559.8
+ms/tok vs 687 baseline = 1.23x**, forward RAN, argmax stable (correct). Adding tc_fp4 MoE -> **773 ms/tok
+(SLOWER)**. Root cause: tc_fp4's cache is cleared per-layer to avoid the ~82GB repack-doubling OOM, so every
+expert re-repacks every layer; that repack cost (k_repack_w/s + malloc/free per expert per layer) EXCEEDS the
+GEMM win at s=8. Lesson: tc_fp4's 19.7x REQUIRES the repacked layout to PERSIST (repack-at-load, storing
+repacked in place + separate fp16 scale ~7GB), not per-forward. Banked config: **tc_fp8 dense + batched
+(1.23x, no repack, no OOM)**; tc_fp4 MoE deferred to repack-at-load. The MoE is the dominant cost, so
+repack-at-load is the next big lever (unlocks 19.7x on the bulk).
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

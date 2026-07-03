@@ -82,7 +82,7 @@ int main(int argc, char** argv){
     printf("[forward] loaded %.2f GiB, %zu tensors. prefill s=%d\n", W.loadedGiB(), W.count(), s);
     Loader L(W);
     const int half=ROPE_DIM/2, hc=HC_MULT, d=DIM;
-    extern bool g_tc_fp8; g_tc_fp8 = true;                 // SANITIZER REPRO: tc_fp8 on to localize the batched-MoE OOB
+    extern bool g_tc_fp8; g_tc_fp8 = true;                 // WIN: dense/attn fp8 GEMMs -> tc_fp8_gemm (no repack, no OOM) = 559.8 ms/tok (1.23x)
     extern void tc_moe_clear_cache();
 
     std::vector<void*> keep;
@@ -115,7 +115,7 @@ int main(int argc, char** argv){
         m.sw1=L.raw(sp+"w1.weight"); m.sw2=L.raw(sp+"w2.weight"); m.sw3=L.raw(sp+"w3.weight");
         m.sw1s=L.scale(sp+"w1.scale"); m.sw2s=L.scale(sp+"w2.scale"); m.sw3s=L.scale(sp+"w3.scale");
         m.n_routed=N_ROUTED; m.n_act=N_ACT; m.dim=DIM; m.inter=MOE_INTER; m.vocab=VOCAB; m.route_scale=ROUTE_SCALE; m.swiglu_limit=SWIGLU_LIMIT;
-        m.use_tc=false; m.batched=true; };  // SANITIZER REPRO: batched on (tc_fp4 off) to localize the batched-MoE OOB
+        m.use_tc=false; m.batched=true; };  // batched dispatch ON; tc_fp4 MoE OFF — per-layer repack overhead (cache cleared to avoid 82GB OOM) makes it SLOWER (773 vs 559.8); needs repack-at-load
     auto fill_attn=[&](const std::string& pfx, MLAWeights& a, bool compressed){
         std::string p=pfx+"attn.";
         a.wq_a=L.raw(p+"wq_a.weight"); a.wq_a_s=L.scale(p+"wq_a.scale"); a.wq_b=L.raw(p+"wq_b.weight"); a.wq_b_s=L.scale(p+"wq_b.scale");

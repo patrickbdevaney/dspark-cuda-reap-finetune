@@ -50,6 +50,7 @@ These are the correctness-first shapes — chosen for provable correctness, alwa
 | 2 | MoE fp4 GEMM | **tc_fp4_gemm + CACHED repack** (ptr-keyed) | **M=8: 0.080 ms / M=1: 0.065 ms** | **M=8: 19.7× / M=1: 2.71×** | **CHAMPION** (cosine 1.0). Swapped into moe.cu behind MoEWeights.use_tc. TC win GROWS with M -> BATCH tokens. |
 | — | note | full-model enable: caching every expert repack DOUBLES expert mem (~82GB) -> OOM. Repack at LOAD (store repacked in place of original) or per-layer scope. | | | TODO (blocks full-model use_tc) |
 | — | next | **FP4 COMPUTE (2070 TFLOPS = Thor's strongest, 4x fp16)** — HW present but NOT in ptxas for sm_110 (CUDA 13); reach via cuBLASLt/cuDNN FP4 GEMM (library) NOW, or hand-PTX when exposed. A/B vs our TC path. | | up to ~4× | INVESTIGATE (top lever; see FP4_COMPUTE_NOTE.md — cuBLASLt lightest) |
+| E2E | forward.cu | **tc_fp8 dense + batched wired** | **559.8 ms/tok** (vs 687) | **1.23×** | banked; correct (argmax stable). tc_fp4 MoE OFF: per-layer repack (anti-OOM) made it 773 ms/tok — needs repack-at-load. |
 | 3 | dense/attn fp8 GEMM | **tc_fp8_gemm** (native FP8 mma m16n8k32.e4m3, W8A8) | **0.023 ms** (vs 0.413) | **17.88×** | **CHAMPION** (cosine 1.0, max_rel 2e-5 vs fp8_block_gemm; fp8 in, no fp16 upconvert). Dense/attn/shared-expert path. |
 | — | (was) | native FP8 mma m16n8k32 (dequant fp4-wt→fp8, acts already fp8, FP8 tensor core = 2× fp16; FP4 mma NOT on sm_110) | | ~2× over current fp16 TC | TODO (HW-verified path) |
 | — | next | batched/grouped MoE dispatch (kill host per-token loop) | | | TODO |

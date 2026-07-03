@@ -71,6 +71,33 @@ prompt set. This is the number that anchors decode throughput.
 4. `dspark_attn_forward` (main-KV window ⊕ block) — the new attention; reuse sparse_attn + MLA projs.
 5. Verify/accept loop in harness → **block-τ on REAP** (real Gate 2). Then fine-tune to lift it.
 
+## Piece 4 — EXACT DSparkAttention (model.py:750-793), turnkey for CUDA build
+```
+# PREFILL (start_pos==0): build main-KV from main_x, store in sliding-128 kv_cache; return x (no attn output).
+main_kv = kv_norm(wkv(main_x)); rope(main_kv[...,-rd:], main_freqs=freqs_cis[start_pos:+seqlen]); act_quant(main_kv[...,:-rd],64)
+kv_cache[:seqlen] = main_kv   (or ring split if seqlen>win)
+# DECODE (start_pos>0): x = block [bsz, block_size, .]
+q  = wq_b(q_norm(wq_a(x))).unflatten(heads,head_dim); q *= rsqrt(mean(q^2)+eps); rope(q[...,-rd:], freqs_cis[start_pos+seqlen:+block])
+kv = kv_norm(wkv(x)); rope(kv[...,-rd:], same freqs); act_quant(kv[...,:-rd],64)
+topk_idxs = get_dspark_topk_idxs(win,bsz,block,start_pos) = cat([arange(min(win,start_pos+1)), win+arange(block)])
+kv_cache[start_pos % win] = main_kv.squeeze(1)          # append this step's main context token
+kv = cat([kv_cache[:bsz], kv], dim=1)                   # [main-KV window ⊕ block-KV]
+o = sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale); rope(o[...,-rd:], freqs, inverse=True)
+o = einsum("bsgd,grd->bsgr", o.view(bsz,block,n_groups,-1), wo_a); x = wo_b(o.flatten)
+```
+CUDA: identical primitives to `mla_forward` (wq_a/wq_b/wkv fp8 gemms, q_norm/kv_norm rmsnorm, rope, act_quant,
+sparse_attn, ogroup_gemm wo_a, wo_b) — ONLY difference is KV = [main-KV window (from main_x) ⊕ block-KV] and the
+get_dspark_topk_idxs index set. For the block-τ MEASUREMENT: build main-KV from main_x[0..t] per anchor t (sliding
+win=128), block[0]=x_{t+1}, predict x_{t+2..t+block+1}; loop anchors t∈[0, s-block-1] (each its own window).
+
+## MEASUREMENT (piece 5) — real block-τ
+For anchors t: draft proposes block via forward_embed→dspark_attn(decode)→block MoE/HC→forward_head → output_ids[1:].
+Ground truth = prompt tokens x_{t+2..} (teacher-forced) OR target greedy. **block-τ = E[longest matching prefix len]**.
+Report per-anchor + mean. This is the number that anchors throughput; then fine-tune to lift it.
+
+## STATUS: pieces 1,2,3 built+compile (dspark_real.cu). Pieces 4,5 = the new per-anchor block attention +
+## the anchor-loop harness — need a full run to validate (fresh-context build; all interfaces + exact code above).
+
 ## Weights (mtp.* from DSpark-head repo, ~11GB shards 46-48; run on REAP taps)
 Per stage: full Block (attn wq_a/wq_b/wkv/wo_a/wo_b+scale, q_norm/kv_norm, attn_sink, attn_norm/ffn_norm,
 hc_attn/ffn, ffn gate+bias+experts[256]+shared). Stage0: `main_proj.{weight,scale}` `main_norm.weight`.

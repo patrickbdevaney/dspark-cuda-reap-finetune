@@ -167,7 +167,8 @@ compressed_block_forward L2-42) + hc_head/norm/lm_head → **Gate 1** (first ful
 
 ### REORDERED PLAN (user directive, turn ~42) + strategy corrections
 **Order:** (a) build the REAL DSpark block-diffusion head + true block-τ  →  (b) **optimize decode kernels
-until no more levers** (Marlin-class mma.sync GEMMs + gemma-cuda-hybrid techniques + our opts, in concert
+until no more levers** (per **OPTIMIZATION_METHODOLOGY.md**: champion-survivor A/B evolution → stop at
+diminishing returns → literature-driven black-swan saltatory leaps; co-optimize target+head SYSTEM tok/s) (Marlin-class mma.sync GEMMs + gemma-cuda-hybrid techniques + our opts, in concert
 with the draft head; target **38–50 tok/s**) — PREREQUISITE that makes capture feasible (current correctness-
 first kernels ~1 tok/s → capture would take years)  →  (c) SOTA **representative** capture set + max block-
 acceptance training.

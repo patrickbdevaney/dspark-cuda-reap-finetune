@@ -55,7 +55,8 @@ that read quantized data directly (no fp32 dequant) and in-place transforms.
 | DEQUANT — memory-NEUTRAL scheme (cache REVERTED: starved RAM) | blocked-on-memory | ~30% of warm fwd; needs in-place/arena, not on-top |
 | **2x warmup (steady-state, memory-neutral)** | ✅ done | **pass1 WARM 451.2 ms/tok (2.22 tok/s), 1.52× base** |
 | **TC-ify attn-out (fp16 mma per group, cosine 1.0)** | ✅ done | **388.5 ms/tok (2.57 tok/s, 1.77× base), −14%** |
-| **aligned MoE load (funnel-shift, cosine 1.0)** | ✅ gated, measuring | pending warm |
+| aligned MoE load (funnel-shift, cosine 1.0) | ✅ done | 383.5 ms/tok (−1.3% only — confirms MoE GEMM is ~14%, not the bottleneck) |
+| **KEY INSIGHT: kernel-compute LARGELY TAPPED** (687→383.5=1.8×) | — | remaining path = STRUCTURAL + decode-engine, not more TC |
 | TC-ify gemm_fp32 (compressor/indexer/head, ~14% warm) | TODO | — |
 | CUDA graphs + device MoE routing + fusion | TODO | — |
 | DSpark spec decode (block verify) | TODO (τ≈0.815 proven) | — |

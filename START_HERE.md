@@ -16,6 +16,11 @@ preserved first-class repo artifact.
 ## 2. The arc (the bigger picture — hold this)
 1. **Peak base + DSpark decode** — fastest kernels + the structural multipliers. **← WE ARE HERE.** Kernel phase
    DONE (1.81× banked). Next: the **decode engine** (see §6).
+   **DECODE ENGINE BUILT + OPTIMIZING** (see `DECODE_STEP4_DESIGN.md`): full 43-layer M=1 KV-cache decode runs
+   correct on the real 180B (argmax=270), attention all bit-exact-gated. Decode optimized **0.50 → 4.67 tok/s
+   (9.3×)** across 7 gated wins (native e8m0/wo_a scales, arena, structs-once, fused fp8 ogroup, warp router).
+   Remaining to ~50 tok/s: M=1 GEMV + CUDA graphs (base → bandwidth floor) then **DSpark spec-decode** (block
+   verify, the multiplier — where the draft head integrates).
 2. **OpenAI-compatible, feature-rich inference server** — vLLM/SGLang parity (streaming, tool-calling schema,
    think-block/reasoning delineation, terminal + WebUI clients, configurable KV, prefix cache), adapted for
    DeepSeek-V4-Flash. Memory-lean, quick-start, faster decode than vLLM/SGLang on Thor. **The banked product win.**

@@ -15,7 +15,34 @@ first path where **decode tok/s** is actually measured (everything so far is s=8
 - ✅ **Milestone 2b — ratio-4 DSA-indexer decode step** (`compressed_decode_step_indexer` + `..._cache_r4`).
   Gate `tests/gate_indexer_decode.cu`: **cosine 1.0, rms 0, maxabs 0**. **All three attention flavors decode
   bit-exact** (sliding / strided-128 / indexer-4).
-- ⬜ **Milestone 3 (NEXT) — full 43-layer decode loop + head.** Per-layer `KVCache` arena (pre-alloc → forces Step 2);
+- ✅ **Milestone 3 — full 43-layer decode loop + head** (`src/decode.cu` + `kernels/block_decode.cu`). GATE PASS
+  on the real 180B: first decoded token argmax=270 (== gated prefill logits[s-1]). **First measured 0.50 tok/s.**
+
+## DECODE OPTIMIZATION TRAJECTORY (measured, warm M=1, argmax=270 throughout) — 0.50 → 4.67 tok/s (9.3×)
+1. native-e8m0 expert scales (no per-token dequant): 0.50 → 1.47 (3.0×)
+2. per-step bump-arena scratch (Step 2, graph-ready): 1.47 → 1.55
+3. hc/ogroup → arena (kill per-call syncs): 1.55 → 1.72
+4. native wo_a (fp8→f16 one-pass): 1.72 → 2.21
+5. build per-layer structs ONCE (persistent): 2.21 → 3.02
+6. fused fp8 wo_a in TC ogroup (no per-token wo16 conv): 3.02 → 4.27
+7. warp-per-expert MoE router: 4.27 → 4.67
+   (all committed + pushed; A/B + mechanism in OPTIMIZATION_LEDGER, nsys-guided.)
+
+## REMAINING PATH TO ~50 tok/s (bandwidth bound ~273 GB/s) — nsys per-token: tc_fp8 attn ~91ms, MoE grouped ~78ms, tc_ogroup ~30ms
+- ⬜ **M=1 GEMV for fp8 (attn) + fp4 (MoE)** — the m16-tile mma wastes 15/16 at M=1; a bandwidth-optimal
+  M=1 GEMV (vectorized uint4 weight loads, warp-reduce) should cut tc_fp8 (91→~25ms) + MoE (78→~25ms).
+  (NOTE: the naive warp-per-output oracle was A/B'd SLOWER than TC at M=1 — needs a proper vectorized GEMV.)
+- ⬜ **CUDA-graph capture (Step 3)** — collapse ~2500 launches/token (~100ms host overhead) into one graph
+  launch. Blocker: move the host-side idx generation (comb vectors, k_win_idx base/width, T counter, pos math)
+  fully on-device so the per-token launch sequence is static. Arena (done) already removed mid-token malloc.
+- ⬜ **DSpark spec-decode (Step 5) — the multiplier to reach ~50 tok/s.** The draft head (dspark_real.cu +
+  the Gate-2-real block-acceptance harness, already proven) proposes block_size=5; the target verifies the
+  block in ONE forward (M=block, amortizes the weight bandwidth ~block×), accept longest matching prefix
+  (τ≈0.75-0.8). Effective tok/s = base_forward_rate × accepted_len. Once base is near the bandwidth floor
+  (~40ms), block-verify + ~3 accepted → ~13ms/tok = ~75 tok/s. This is where the DSpark head integrates.
+
+## MILESTONE 3 (original)
+- Per-layer `KVCache` arena (pre-alloc → forces Step 2);
   L0-1 use `mla_decode_step`, L2-42 the compressed steps; HC + `moe_forward(bs=1)` (grouped path shines at M=1);
   hc_head→norm→lm_head→argmax. Gate: decode logits == prefill logits[s-1] (argmax + cosine), then multi-step
   KV==recompute. **Measure decode tok/s** (the point of Step 4). Detached, memory-neutral.

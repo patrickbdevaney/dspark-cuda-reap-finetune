@@ -10,15 +10,12 @@ first path where **decode tok/s** is actually measured (everything so far is s=8
 - ✅ **Milestone 2 crux — incremental compressor emit** (`compressor_emit_group`, `kernels/compressor.cu`).
   Gate `tests/gate_compressor_emit.cu`: **bit-exact** for ratio-128 non-overlap, ratio-4 overlap, and the
   indexer's own hadamard+fp4 compressor (d=128). The append-only compressed KV cache is proven correct.
-- ⬜ **Milestone 2a — strided (ratio-128) compressed decode step.** Wire: window KV cache (m1 pattern) +
-  `compressor_emit_group` on `(pos+1)%ratio==0` + strided idxs (`t < (pos+1)/ratio`) + `sparse_attn` over
-  `[win_kv[0..pos] ⊕ comp_kv[0..T-1]]` (compressed idx = `t + (pos+1)`, matching prefill's `t + s` at pos=s-1)
-  + de-rotate/ogroup/wo_b. Gate: equivalence vs `compressed_attn_forward` (ratio=128, indexer weights null) —
-  expect bit-exact (same primitives as m1 + m2-crux). ~150 lines, mirrors `mla_decode_step`.
-- ⬜ **Milestone 2b — ratio-4 indexer decode step.** As 2a + the DSA indexer for M=1: run the indexer's own
-  compressor emit + score the single query against `kv_comp[0..T-1]`, take top-`min(512,T)` → those compressed
-  idxs (reuse `indexer_forward` scoring path at m=1). Gate vs `compressed_attn_forward` (ratio=4).
-- ⬜ **Milestone 3 — full 43-layer decode loop + head.** Per-layer `KVCache` arena (pre-alloc → forces Step 2);
+- ✅ **Milestone 2a — strided (ratio-128) compressed decode step** (`compressed_decode_step_strided`,
+  `kernels/compressed_decode.cu`). Gate `tests/gate_compressed_decode.cu`: **cosine 1.0, rms 0, maxabs 0**.
+- ✅ **Milestone 2b — ratio-4 DSA-indexer decode step** (`compressed_decode_step_indexer` + `..._cache_r4`).
+  Gate `tests/gate_indexer_decode.cu`: **cosine 1.0, rms 0, maxabs 0**. **All three attention flavors decode
+  bit-exact** (sliding / strided-128 / indexer-4).
+- ⬜ **Milestone 3 (NEXT) — full 43-layer decode loop + head.** Per-layer `KVCache` arena (pre-alloc → forces Step 2);
   L0-1 use `mla_decode_step`, L2-42 the compressed steps; HC + `moe_forward(bs=1)` (grouped path shines at M=1);
   hc_head→norm→lm_head→argmax. Gate: decode logits == prefill logits[s-1] (argmax + cosine), then multi-step
   KV==recompute. **Measure decode tok/s** (the point of Step 4). Detached, memory-neutral.

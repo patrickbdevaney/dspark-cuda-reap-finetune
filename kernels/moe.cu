@@ -1,6 +1,7 @@
 // moe.cu — MoE primitives, correctness-first (Gate K oracle: ref/gen_units.py).
 #include "moe.h"
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 
 __constant__ float E2M1_MAG[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
 
@@ -92,6 +93,7 @@ void moe_router_score(float* weights, int* indices, const float* x, const float*
 #include <vector>
 #include <cstdio>
 void tc_fp4_gemm(float*, const uint8_t*, const float*, const uint8_t*, const float*, int, int, int, cudaStream_t); // Marlin TC W4A8 (tc_moe_gemm.cu)
+bool g_moe_grouped=false;   // STRUCTURAL_PLAN Step 1b: zero-sync grouped-GEMM MoE (removes off[] D2H, graph-capturable)
 #define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 
 __global__ void compute_scores_kernel(float* sc, const float* x, const float* gw, int bs, int dim, int nr){
@@ -176,6 +178,75 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
     } else {
         router_topk_kernel<<<bs,32,nr*sizeof(float),stream>>>(wt,idx,sc,w.gate_bias,bs,nr,na,w.route_scale);
     }
+    // ================= GROUPED zero-sync MoE (STRUCTURAL_PLAN Step 1b) =================
+    // ONE grouped GEMM per stage (gate/up/down) over ALL experts, expert map built on-device from off[] — the
+    // last per-layer host sync (the off[] D2H copy) is GONE, so this path is CUDA-graph-capturable. Gated
+    // cosine-1.0 vs the per-expert path (gate_grouped_moe + the full-forward argmax gate).
+    extern bool g_moe_grouped;
+    if(w.batched && w.device_route && g_moe_grouped && w.w1p){
+        void tc_ensure_repacked(uint8_t*, int, int, cudaStream_t);
+        void tc_a_to_fp16(__half*, const uint8_t*, const float*, int, int, cudaStream_t);
+        void tc_build_tiles(int*, int*, int*, const int*, int, cudaStream_t);
+        void tc_fp4_grouped_gemm(float*, const __half*, const uint8_t* const*, const float* const*,
+                                 const int*, const int*, const int*, const int*, int, int, int, cudaStream_t);
+        const int maxm = bs*na;
+        // -- device counting-sort grouping (off_d KEPT on device; NO D2H) --
+        int *counts,*off_d,*cursor,*alltok_d; float* allwt_d;
+        CU(cudaMalloc(&counts,nr*4)); CU(cudaMalloc(&off_d,(nr+1)*4)); CU(cudaMalloc(&cursor,nr*4));
+        CU(cudaMalloc(&alltok_d,(size_t)maxm*4)); CU(cudaMalloc(&allwt_d,(size_t)maxm*4));
+        CU(cudaMemsetAsync(counts,0,nr*4,stream)); CU(cudaMemsetAsync(cursor,0,nr*4,stream));
+        k_moe_count<<<(bs*na+63)/64,64,0,stream>>>(counts,idx,bs*na);
+        k_moe_prefix<<<1,1,0,stream>>>(off_d,counts,nr);
+        k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,cursor,idx,wt,off_d,bs,na);
+        // -- tile descriptors (device) --
+        int *tile_e,*tile_row0,*ntiles_d; CU(cudaMalloc(&tile_e,maxm*4)); CU(cudaMalloc(&tile_row0,maxm*4)); CU(cudaMalloc(&ntiles_d,4));
+        tc_build_tiles(tile_e,tile_row0,ntiles_d,off_d,nr,stream);
+        // -- repack every expert weight in place once (idempotent) + upload per-expert ptr tables to device --
+        for(int e=0;e<nr;++e){ tc_ensure_repacked((uint8_t*)w.w1p[e],inter,dim,stream);
+            tc_ensure_repacked((uint8_t*)w.w3p[e],inter,dim,stream); tc_ensure_repacked((uint8_t*)w.w2p[e],dim,inter,stream); }
+        const uint8_t **w1d,**w3d,**w2d; const float **s1d,**s3d,**s2d;
+        CU(cudaMalloc(&w1d,nr*sizeof(void*))); CU(cudaMalloc(&w3d,nr*sizeof(void*))); CU(cudaMalloc(&w2d,nr*sizeof(void*)));
+        CU(cudaMalloc(&s1d,nr*sizeof(void*))); CU(cudaMalloc(&s3d,nr*sizeof(void*))); CU(cudaMalloc(&s2d,nr*sizeof(void*)));
+        CU(cudaMemcpyAsync(w1d,w.w1p,nr*sizeof(void*),cudaMemcpyHostToDevice,stream)); CU(cudaMemcpyAsync(w3d,w.w3p,nr*sizeof(void*),cudaMemcpyHostToDevice,stream));
+        CU(cudaMemcpyAsync(w2d,w.w2p,nr*sizeof(void*),cudaMemcpyHostToDevice,stream)); CU(cudaMemcpyAsync(s1d,w.w1sp,nr*sizeof(void*),cudaMemcpyHostToDevice,stream));
+        CU(cudaMemcpyAsync(s3d,w.w3sp,nr*sizeof(void*),cudaMemcpyHostToDevice,stream)); CU(cudaMemcpyAsync(s2d,w.w2sp,nr*sizeof(void*),cudaMemcpyHostToDevice,stream));
+        // -- scratch (maxm rows) --
+        float *Xe,*Xes,*Gb,*Ub,*Hb,*Hsb,*OEb; uint8_t *Xeq,*Hqb; __half *x16,*h16;
+        CU(cudaMalloc(&Xe,(size_t)maxm*dim*4)); CU(cudaMalloc(&Xeq,(size_t)maxm*dim)); CU(cudaMalloc(&Xes,(size_t)maxm*(dim/128)*4));
+        CU(cudaMalloc(&x16,(size_t)maxm*dim*2)); CU(cudaMalloc(&h16,(size_t)maxm*inter*2));
+        CU(cudaMalloc(&Gb,(size_t)maxm*inter*4)); CU(cudaMalloc(&Ub,(size_t)maxm*inter*4)); CU(cudaMalloc(&Hb,(size_t)maxm*inter*4));
+        CU(cudaMalloc(&Hqb,(size_t)maxm*inter)); CU(cudaMalloc(&Hsb,(size_t)maxm*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)maxm*dim*4));
+        // -- routed experts: gather -> quant -> fp16 -> grouped gate/up -> swiglu -> quant -> fp16 -> grouped down -> scatter --
+        k_gather_x<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(Xe,x,alltok_d,maxm,dim);
+        act_quant_fp8(Xeq,Xes,Xe,maxm,dim,128,stream);
+        tc_a_to_fp16(x16,Xeq,Xes,maxm,dim,stream);
+        tc_fp4_grouped_gemm(Gb,x16,w1d,s1d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
+        tc_fp4_grouped_gemm(Ub,x16,w3d,s3d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
+        swiglu_wrow<<<((size_t)maxm*inter+255)/256,256,0,stream>>>(Hb,Gb,Ub,allwt_d,maxm,inter,w.swiglu_limit);
+        act_quant_fp8(Hqb,Hsb,Hb,maxm,inter,128,stream);
+        tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream);
+        tc_fp4_grouped_gemm(OEb,h16,w2d,s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);
+        k_scatter_add<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(out,OEb,alltok_d,maxm,dim);
+        // -- shared expert (fp8, all bs tokens, weight 1) --
+        if(!getenv("NOSHARED")){
+            act_quant_fp8(Xeq,Xes,x,bs,dim,128,stream);
+            fp8_block_gemm(Gb,Xeq,Xes,w.sw1,w.sw1s,bs,inter,dim,stream);
+            fp8_block_gemm(Ub,Xeq,Xes,w.sw3,w.sw3s,bs,inter,dim,stream);
+            swiglu_kernel<<<((size_t)bs*inter+63)/64,64,0,stream>>>(Hb,Gb,Ub,bs*inter,w.swiglu_limit,1.f);
+            act_quant_fp8(Hqb,Hsb,Hb,bs,inter,128,stream);
+            fp8_block_gemm(OEb,Hqb,Hsb,w.sw2,w.sw2s,bs,dim,inter,stream);
+            accum_kernel<<<((size_t)bs*dim+63)/64,64,0,stream>>>(out,OEb,bs*dim);
+        }
+        CU(cudaStreamSynchronize(stream));
+        cudaFree(counts);cudaFree(off_d);cudaFree(cursor);cudaFree(alltok_d);cudaFree(allwt_d);
+        cudaFree(tile_e);cudaFree(tile_row0);cudaFree(ntiles_d);
+        cudaFree(w1d);cudaFree(w3d);cudaFree(w2d);cudaFree(s1d);cudaFree(s3d);cudaFree(s2d);
+        cudaFree(Xe);cudaFree(Xeq);cudaFree(Xes);cudaFree(x16);cudaFree(h16);
+        cudaFree(Gb);cudaFree(Ub);cudaFree(Hb);cudaFree(Hqb);cudaFree(Hsb);cudaFree(OEb);
+        cudaFree(sc);cudaFree(wt);cudaFree(idx);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);cudaFree(h);cudaFree(hq);cudaFree(hs);cudaFree(oe);
+        return;
+    }
+
     std::vector<int> hidx; std::vector<float> hw;
     if(!(w.batched && w.device_route)){                       // device_route does the grouping on-GPU (no host copy)
         hidx.resize((size_t)bs*na); hw.resize((size_t)bs*na);

@@ -173,5 +173,29 @@ TC-ify ogroup_gemm + gemm_fp32 (23% combined, still warp/fp32). Profile-first ca
 more effort was wasted — exactly the discipline. Next: dequant-at-load (start with e8m0 scales — biggest single
 at 17%, smallest memory since scales are ~weight/128).
 
+**STRUCTURAL_PLAN Step 1b — zero-sync GROUPED-GEMM MoE: DONE, gated, WIN (−12.5% warm).** Replaced the
+per-expert MoE GEMM loop (which needed an `off[]` D2H copy every layer to size per-expert launch grids — the
+LAST per-layer host sync, and the blocker for CUDA-graph capture) with a SINGLE grouped W4A8 GEMM per stage
+(gate/up/down). A "tile" = up-to-16 rows of one expert; the tile→expert map is built ON DEVICE from `off[]`
+(`k_build_tiles`), so the host never reads `off[]`. Grid.y = maxtiles = bs*na (host upper bound, no sync);
+extra tiles early-exit. Per-expert weight byte-alignment handled by the existing funnel-shift, computed per
+tile. Weights/scales are the SAME in-place-repacked bytes the pp path uses → identical mma.
+- **Gate (unit, `tests/gate_grouped_moe.cu`):** grouped vs `fp4_gemm` oracle **cosine 0.9999999, rms 3.4e-4**,
+  covering empty experts (me=0) and multi-tile experts (me=17,20). **Gate (full forward):** argmax=270 (correct),
+  mem 109.6/122.8 (memory-neutral).
+- **A/B (same session, s=8 prefill, warm):** per-expert device_route **365.7 ms/tok** → grouped **319.8 ms/tok**
+  = **−12.5% (1.14×)**. Mechanism: 3 grouped launches/layer replace ~48 tiny per-expert launches ×3 GEMMs, AND
+  the `off[]` D2H sync ×43 layers is gone. (Pass-0 warmup is slower — 886.9 vs 534.9 ms/tok — the one-time
+  repack-all up front; amortized, irrelevant to steady-state decode.)
+- **TWO bugs the gate caught (why real-weights/oracle gating matters):** (1) *test harness* — my loop var `e`
+  was shadowed by the `CU(...)` macro's own `cudaError_t e` inside its initializer (`cudaMalloc(&Wp[e],…)` read
+  the uninitialized macro `e`), so `Wp[0]` stayed null → compute-sanitizer showed a base-~0 read. Renamed to
+  `ex`. (2) *latent kernel limit* — the champion `tc_w4a8_pp_kernel` has NO row-tiling: it only ever computes
+  rows 0–15 (M≤16). Never hit in the s=8 prefill (per-expert me is tiny), but my me=17/20 experts exposed it as
+  cosine 0.938 (exactly the 5 rows>16 wrong). The grouped kernel tiles correctly; switched the oracle to
+  `fp4_gemm` (arbitrary M) to gate it honestly. LESSON: a champion validated only on small M can hide an M-range
+  bug — gate new kernels against the arbitrary-M oracle, not against another shape-limited fast path.
+- **Unblocks:** MoE is now graph-capturable (no mid-forward host sync) → STRUCTURAL_PLAN Step 3 (CUDA graphs).
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

@@ -187,3 +187,85 @@ void tc_fp4_gemm_pp_auto(float* C, const uint8_t* A_fp8, const float* a_s, const
     }
     tc_fp4_gemm_pp(C, A_fp8, a_s, B_fp4, b_s, M, N, K, s);
 }
+
+// Idempotently repack one expert weight IN PLACE (shared g_pp_done set with pp_auto, so a weight already warmed
+// by either path is never re-repacked -> bytes stay identical -> grouped path is cosine-1.0 with the pp path).
+void tc_ensure_repacked(uint8_t* B_fp4, int N, int K, cudaStream_t s){
+    if(g_pp_done.find(B_fp4)!=g_pp_done.end()) return;
+    size_t bytes=(size_t)(N/8)*(K/128)*512;
+    if(bytes>g_pp_tmpsz){ if(g_pp_tmp) cudaFree(g_pp_tmp); CT(cudaMalloc(&g_pp_tmp,bytes)); g_pp_tmpsz=bytes; }
+    tc_repack_weight_inplace(B_fp4, N, K, g_pp_tmp, s);
+    g_pp_done.insert(B_fp4);
+}
+// fp8[M,K]+a_s -> fp16[M,K] (act-scale folded), exposed so the grouped path converts ALL gathered rows once.
+void tc_a_to_fp16(__half* x16, const uint8_t* A_fp8, const float* a_s, int M, int K, cudaStream_t s){
+    k_a_to_fp16<<<((long)M*K+255)/256,256,0,s>>>(x16, A_fp8, a_s, M, K);
+}
+
+// ===================== GROUPED (zero-sync) W4A8 GEMM — STRUCTURAL_PLAN Step 1b =====================
+// ONE launch over ALL experts. A "tile" = up to 16 rows of ONE expert (its own repacked weight+scale). The
+// tile->expert map is built ON DEVICE from off[] (k_build_tiles) so the host never needs off[] -> removes the
+// last per-layer host sync (the off[] D2H copy) that blocked CUDA-graph capture. Per-expert byte alignment of
+// the in-place repacked weight is handled by funnel-shift, computed per tile (uniform across the block).
+// Weights & scales are the SAME bytes the pp path uses -> identical mma -> cosine 1.0 vs the per-expert loop.
+
+// For each expert e, emit ceil(me/16) tiles at rows off[e], off[e]+16, ...  (single thread; nr<=~160).
+__global__ void k_build_tiles(int* tile_e, int* tile_row0, int* ntiles, const int* off, int nr){
+    if(threadIdx.x||blockIdx.x) return;
+    int nt=0;
+    for(int e=0;e<nr;++e){ int r0=off[e], r1=off[e+1];
+        for(int r=r0;r<r1;r+=16){ tile_e[nt]=e; tile_row0[nt]=r; ++nt; } }
+    *ntiles=nt;
+}
+
+// gridDim.x = N/8 (n-blocks); gridDim.y = maxtiles (host UPPER BOUND = total gathered rows; extra tiles early-exit).
+__global__ void k_grouped_w4a8_kernel(float* out, const uint8_t* const* wptr, const float* const* sptr,
+        const int* __restrict__ tile_e, const int* __restrict__ tile_row0, const int* __restrict__ ntiles,
+        const int* __restrict__ off, const __half* x16all, int N, int K){
+    int tile = blockIdx.y; if(tile >= *ntiles) return;
+    int e = tile_e[tile]; int row0 = tile_row0[tile];
+    int me = off[e+1]-row0; if(me>16) me=16;                    // rows this tile owns (<=16)
+    const uint8_t* wprE = wptr[e]; const float* b_s = sptr[e];
+    int off_b=(int)((uintptr_t)wprE & 15); int k0f=off_b>>2; unsigned shf=(off_b&3)*8;   // per-expert alignment
+    int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
+    int n_block=blockIdx.x; if((long)n_block*8>=N) return; int n0=n_block*8;
+    float c[4]={0,0,0,0}; int kg8=K/128, Ks32=K/32;
+    const uint8_t* wb = wprE + (long)n_block*kg8*512;
+    const __half* xg0 = x16all + (size_t)(row0+gid)*K, *xg8 = x16all + (size_t)(row0+gid+8)*K;
+    const float* bsr = b_s + (long)(n0+gid)*Ks32;
+    bool m0=gid<me, m8=(gid+8)<me;
+    for(int g=0; g<kg8; ++g){
+        const uint8_t* wa = wb + (long)g*512 + lane*16 - off_b;             // funnel-aligned coalesced load
+        uint4 A=__ldcs((const uint4*)wa), B=__ldcs((const uint4*)(wa+16));
+        uint4 W=tcm_funnel16(A,B,k0f,shf); const uint8_t* wby=(const uint8_t*)&W;
+        #pragma unroll
+        for(int kl=0; kl<8; ++kl){ int k_tile=g*8+kl, k0=k_tile*16;
+            unsigned a[4];
+            a[0]=m0? *(const unsigned*)(xg0+k0+2*t4)   : 0u;
+            a[1]=m8? *(const unsigned*)(xg8+k0+2*t4)   : 0u;
+            a[2]=m0? *(const unsigned*)(xg0+k0+2*t4+8) : 0u;
+            a[3]=m8? *(const unsigned*)(xg8+k0+2*t4+8) : 0u;
+            __half2 sc2 = __half2half2(__float2half(bsr[k_tile/2]));
+            __half2 b0 = __hmul2(tcm_fp4x2(wby[2*kl]),   sc2);
+            __half2 b1 = __hmul2(tcm_fp4x2(wby[2*kl+1]), sc2);
+            unsigned bb[2]; bb[0]=*(unsigned*)&b0; bb[1]=*(unsigned*)&b1;
+            mma_m16n8k16(c, a, bb);
+        }
+    }
+    int cn=2*t4;
+    if(gid<me   && n0+cn  <N) out[(size_t)(row0+gid)*N   + n0+cn  ]=c[0];
+    if(gid<me   && n0+cn+1<N) out[(size_t)(row0+gid)*N   + n0+cn+1]=c[1];
+    if(gid+8<me && n0+cn  <N) out[(size_t)(row0+gid+8)*N + n0+cn ]=c[2];
+    if(gid+8<me && n0+cn+1<N) out[(size_t)(row0+gid+8)*N + n0+cn+1]=c[3];
+}
+// Build tile descriptors on device from off[] (no host sync).
+void tc_build_tiles(int* tile_e, int* tile_row0, int* ntiles_d, const int* off_d, int nr, cudaStream_t s){
+    k_build_tiles<<<1,1,0,s>>>(tile_e, tile_row0, ntiles_d, off_d, nr);
+}
+// Grouped W4A8: out[total,N] = per-tile (expert wptr[e]) mma over x16all rows. maxtiles = host upper bound on tiles.
+void tc_fp4_grouped_gemm(float* out, const __half* x16all, const uint8_t* const* wptr_d, const float* const* sptr_d,
+        const int* off_d, const int* tile_e, const int* tile_row0, const int* ntiles_d,
+        int maxtiles, int N, int K, cudaStream_t s){
+    dim3 grid(N/8, maxtiles);
+    k_grouped_w4a8_kernel<<<grid, 32, 0, s>>>(out, wptr_d, sptr_d, tile_e, tile_row0, ntiles_d, off_d, x16all, N, K);
+}

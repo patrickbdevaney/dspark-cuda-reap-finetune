@@ -55,10 +55,12 @@ measured delta (`OPTIMIZATION_LEDGER.md`) + rationale (`GATE_LOG.md`). Stop-rule
 ## FINDINGS while implementing (technical reality of zero-sync + capture)
 - **Step 1 DONE + gated** (device grouping, cosine 1.0, integrated 378.8 ms/tok correct). But it keeps one
   small `off[]` D2H copy for the per-expert launch grid sizes.
-- **Zero-sync (Step 1b) is NOT a small tweak.** Removing the `off[]` sync means the host can't size per-expert
-  grids. Fixed maxm-per-expert grids are catastrophic (nr=160 experts × maxm=bs*na rows = ~160× wasted compute).
-  The correct form is a SINGLE **grouped-GEMM** kernel: one launch over all tokens, each tile reads device
-  `off[]` to pick its expert's weight (CUTLASS-grouped-GEMM style). That's a substantial NEW kernel.
+- **Zero-sync (Step 1b) — DONE + gated + WIN (−12.5% warm).** Built the SINGLE grouped W4A8 GEMM: one launch
+  per stage over all experts, each tile reads device `off[]` to pick its expert's weight (tile→expert map built
+  on-device by `k_build_tiles`; grid.y = bs*na host upper bound, extra tiles early-exit). The `off[]` D2H copy
+  is GONE. Unit gate cosine 0.9999999 vs `fp4_gemm` oracle (covers empty + multi-tile experts). Full-forward
+  A/B: 365.7 → **319.8 ms/tok** (argmax=270, mem 109.6). MoE is now graph-capturable. `g_moe_grouped` (default
+  on; `NOGROUPED=1` = old per-expert path). Kernel: `tc_moe_gemm.cu`; gate: `tests/gate_grouped_moe.cu`.
 - **Graph capture (Step 3) needs the WHOLE forward static**, not just the MoE. cudaGraph records stream ops with
   FIXED args; the Loader dequants+`cudaMalloc/Free` PER LAYER, and pp/funnel/x16 malloc per call — all illegal
   during capture and all data-dependent. Capturing means pre-allocating EVERY buffer + removing all per-layer

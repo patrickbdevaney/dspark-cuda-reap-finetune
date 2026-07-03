@@ -120,3 +120,16 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   per-expert blocking cudaMemcpy into tok_d silently failed to update (every expert saw stale [1,0,..]) ->
   only tok1's output landed. FIX: upload ALL tokens/weights ONCE as flat device arrays + per-expert OFFSET
   pointers (no reused buffer, no per-expert copy). cosine 1.0 vs oracle; oracle stays bit-exact.
+
+## Grind — STRUCTURAL_PLAN Step 1b: zero-sync GROUPED-GEMM MoE — DONE, WIN
+- **A/B (same session, s=8 prefill, warm ms/tok, argmax=270 both):**
+  per-expert device_route (`NOGROUPED=1`) **365.7** → grouped (`g_moe_grouped`, default) **319.8** = **−12.5% (1.14×)**.
+  Memory 109.6/122.8 both (memory-neutral). Unit gate cosine 0.9999999 vs fp4_gemm oracle.
+- **Mechanism:** one grouped W4A8 GEMM per stage (gate/up/down) over ALL experts, replacing ~48 tiny per-expert
+  launches ×3 ×43 layers; tile→expert map built on-device from `off[]` (`k_build_tiles`), so the per-layer
+  `off[]` D2H copy — the last mid-forward host sync — is GONE. Grid.y = bs*na (host upper bound, extra tiles
+  early-exit). Weights = same in-place-repacked fp4 bytes as the pp path (funnel-shift alignment per tile).
+- **Structural payoff (beyond the 12.5%):** MoE is now CUDA-graph-capturable → enables Step 3 (graphs), where
+  the M=1 launch-bound decode regime is where this compounds hardest.
+- kernel: `kernels/tc_moe_gemm.cu` (`k_grouped_w4a8_kernel`, `k_build_tiles`, `tc_fp4_grouped_gemm`);
+  integration `kernels/moe.cu` (`g_moe_grouped` branch); gate `tests/gate_grouped_moe.cu`.

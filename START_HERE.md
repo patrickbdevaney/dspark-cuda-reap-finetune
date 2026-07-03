@@ -29,7 +29,9 @@ spec-decode) IS the core of the server. Build it once; it delivers the multiplie
 ## 3. Where we are RIGHT NOW (measured, gated, correct)
 - **Gates 0/K/1/1.5/2 all PASSED.** Full 180B runs on Thor, numerically correct ("Paris"), and the **unfine-tuned
   DSpark draft head transfers to REAP at τ@0 = 0.815** (Gate 2 GO — light fine-tune should suffice).
-- **Warm decode (2× warmup, steady-state, s=8 prefill): 378.8 ms/tok (2.64 tok/s) = 1.81× over the 687 baseline.**
+- **Warm (2× warmup, steady-state, s=8 prefill): 319.8 ms/tok (3.13 tok/s) = 2.15× over the 687 baseline.**
+  (was 378.8; STRUCTURAL_PLAN **Step 1b zero-sync grouped-GEMM MoE** landed −12.5% same-session A/B: 365.7→319.8,
+  argmax=270, memory-neutral — and it removed the last per-layer host sync so the MoE is now graph-capturable.)
 - **Banked champions (all gated cosine 1.0, memory-safe):** `tc_fp8_gemm` (dense/attn W8A8, 17.9×) · `tc_fp4_gemm`
   (MoE W4A8, 19.7×) + **repack-at-load** (in-place, zero extra memory) + **funnel-shift** aligned coalesced load ·
   **batched** MoE dispatch · **TC attention-output** (fp16 mma per group) · **device-side MoE routing** (GPU
@@ -65,8 +67,9 @@ spec-decode) IS the core of the server. Build it once; it delivers the multiplie
 Do this as ONE focused build, gated + detached, memory-neutral. Order (details + rationale in `STRUCTURAL_PLAN.md`):
 1. **Static M=1 KV-cache decode step** (Step 4 there) — the real decode regime (we've only measured 8-tok prefill).
    MLA/attention over cached latent KV (append new token's KV, attend over history). KV is tiny (MLA+SWA+DSA).
-2. **Zero-sync grouped-GEMM MoE** (Step 1b) — one launch over all tokens, each tile reads device `off[]` to pick
-   its expert's weight (CUTLASS-grouped-GEMM style). Fixed per-expert grids are ~160× waste — do the grouped kernel.
+2. **Zero-sync grouped-GEMM MoE** (Step 1b) — **DONE + gated + WIN (−12.5%, 365.7→319.8 ms/tok, argmax=270).**
+   One grouped W4A8 launch per stage over all experts; tile→expert map built on-device from `off[]` → the last
+   per-layer host sync is gone → MoE is graph-capturable. `g_moe_grouped` default-on. Next levers are 3/4/5 below.
 3. **Pre-allocate every buffer + static launch sequence** (Step 2) — remove all mid-forward `cudaMalloc/Free`
    (Loader per-layer dequant, pp `x16`, funnel temps). Memory-neutral (same peak, allocated once).
 4. **CUDA-graph capture** of the M=1 step (Step 3) — `cudaStreamBeginCapture`/`EndCapture`, instantiate,

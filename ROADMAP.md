@@ -17,19 +17,16 @@ artifact — nothing disposable.**
 
 ## WHERE WE ARE NOW (turn ~28)
 Building **`forward.cu`** (the full-model loop → Gate 1). All kernels + both attention variants + full
-Block are validated on real weights. **Immediate blocker just hit:** weight-to-device loading.
-- `tools/load_device.cu` tried **`cudaHostRegister`** (zero-copy mmap→device) → **"operation not supported"**
-  on Jetson (Tegra can't register file-backed `MAP_PRIVATE` mmap). Confirmed: 46 shards, 43843 tensors
-  parse fine; 122 GiB box, ~101 GiB free.
-- **RESOLUTION PLAN (next step):** Jetson has an **integrated** GPU (`cudaDevAttrIntegrated=1`), so host &
-  device share physical LPDDR. Avoid the double-copy (mmap 96 + device 96 > 122 → OOM, the exact risk the
-  user flagged). Use **single-copy into GPU-accessible memory**: per shard, `cudaHostAlloc(..., cudaHostAllocMapped)`
-  (or `cudaMallocManaged`) a buffer sized to the shard's data blob, `pread` the shard file's data region
-  directly into it (NOT mmap), then `cudaHostGetDevicePointer`. 96 GiB resident single copy fits in 122.
-  Alternative to test: plain `cudaMalloc`+`cudaMemcpy` per shard streaming from mmap then `munmap` each
-  shard after copy (keeps peak ≈ 96 + one-shard). Probe `cudaDevAttrHostRegisterSupported` /
-  `cudaDevAttrCanUseHostPointerForRegisteredMem` first. The inherited Gemma engine's loader is NOT in this
-  repo's `src/` — design fresh.
+Block are validated on real weights. **Weight-to-device loader path: SOLVED & PROVEN** (`tools/load_device.cu`).
+- Probed: `integrated=1, hostRegisterSupported=1, canUseHostPtrForRegMem=1, canMapHostMem=1`.
+- `cudaHostRegister` of the file-backed `MAP_PRIVATE` mmap → "operation not supported" (Tegra limitation on
+  that mapping type — NOT registration in general).
+- **WORKING PATH (verified on shard-0, GPU read-back MATCH):** per shard `cudaHostAlloc(bytes, cudaHostAllocMapped)`
+  → copy the shard data blob in → `cudaHostGetDevicePointer`. Integrated GPU ⇒ that buffer IS device memory,
+  **single copy, no mmap+device doubling → no OOM.**
+- **forward.cu TODO:** scale to all 46 shards; to stay single-copy at 96 GiB peak, either `pread` each shard's
+  data region straight into the pinned buffer (no mmap), or `munmap` each shard right after copying it in.
+  Then build the name→device-ptr map from tensor offsets within each shard's pinned buffer.
 
 ---
 

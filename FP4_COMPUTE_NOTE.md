@@ -44,3 +44,13 @@ OR ptxas accepts fp4 for sm_110a, build the FP4 GEMM. Until then, **FP8 mma (m16
 ## Lineage
 The `sm_110a` arch-specific-feature path was pushed in the gemma-cuda-hybrid server work too; this note unifies
 the FP4-compute decision so both repos converge on the same lightweight, correct approach as CUDA matures.
+
+## Other FP4 access paths investigated (July 2026, CUDA 13.0) — ALL blocked on sm_110
+- **cuDNN FP4 GEMM:** shares cuBLAS's tensor-core backend → same 0-FP4-algos gap on sm_110; AND bloated (fused
+  conv/attention lib, heavy dep for a lean server). No.
+- **PTX hack:** none — ptxas gates fp4 by target arch (rejects sm_110); sm_100a-compiled SASS won't run on Thor.
+- **Inline SASS:** infeasible — nvcc has no inline-SASS; no assembler (CuAssembler/turingas) supports sm_110
+  Blackwell; FP4 SASS opcodes undocumented. Blackwell-FP4 microbench papers all use sm_100 via PTX, not sm_110 SASS.
+- **TensorRT:** whole-graph, too heavy; not a GEMM primitive.
+CONCLUSION: FP4 compute is a CUDA-13.0 software-maturity gap on Thor (forums confirm active work), not permanent.
+`tools/cublas_fp4_probe.cu` re-tests it per toolkit. PROCEEDING on the FP8 path (m16n8k32, 2× fp16) meanwhile.

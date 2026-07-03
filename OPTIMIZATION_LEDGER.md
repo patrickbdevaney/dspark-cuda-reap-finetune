@@ -190,3 +190,12 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   the TC mma decodes fp4x2->half2 in hardware far cheaper. UNLIKE fp8 (opt #8) where simple uint decode won.
   LESSON: M=1 GEMV wins only when the per-element decode is cheap (fp8), not for packed fp4. Kept default-OFF
   (`g_moe_gemv`, env MOE_GEMV=1) as a gated reference; MoE stays on the TC grouped path. Champion 148.5 ms/tok.
+
+## DSpark spec-decode — integrated, working, 0.67x (unfine-tuned head + un-captured verify)
+- Full loop: block-diffusion draft (block=5) -> M=K verify (weights once) -> accept-longest-prefix + correction
+  -> advance; compressor T rollback on rejection. Correct (coherent tokens). Mean 1.91 tok/verify, 220.7 ms/tok.
+- SLOWER than base (6.81 tok/s) because: unfine-tuned head accept ~0.9 drafts/verify (+ MoE near-tie
+  non-determinism rejecting valid drafts) AND M=5 verify = 2.9x M=1 (not weight-bound). Both are the remaining
+  phases: (a) fine-tune the head (Phase 3, higher accept), (b) determinize MoE scatter (stable target argmax ->
+  more accepts), (c) CUDA graphs (verify -> weight-bound floor). Then ~4 accepted x ~160ms verify = ~40ms/tok ~25
+  tok/s, and with a faster base -> ~50. Head mem 10 GiB -> 120.9/122.8 peak (tight).

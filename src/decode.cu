@@ -15,6 +15,8 @@
 #include "mla_attn.h"
 #include "compressor.h"
 #include "dscratch.h"
+#include "dspark_real.h"   // DSpark head: main_x, tap_pool, forward_head, markov
+#include "dspark_attn.h"   // dspark_main_kv, dspark_block_forward
 #include "yarn.h"
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
@@ -76,8 +78,9 @@ int main(int argc, char** argv){
     else { for(int i=0;i<8;++i) ids.push_back((int[]){671,6102,294,8760,344,270,106523,294}[i]); }
     int s = ids.size();
     int NDEC = argc>3?atoi(argv[3]):6;                 // tokens to decode (autoregressive) after prefill
+    int NGEN0 = argc>5?atoi(argv[5]):24;               // spec-decode tokens (if head given)
     int PS = s-1;                                      // prefill positions 0..PS-1; decode starts at pos PS (=s-1)
-    int seqmax = s + NDEC + 4;
+    int seqmax = s + (NDEC>NGEN0?NDEC:NGEN0) + DSPARK_BLOCK + 8;   // room for spec block overshoot
     printf("[decode] loading %s ... s=%d NDEC=%d seqmax=%d\n", dir, s, NDEC, seqmax);
     st::WeightStore W(dir, key_map); Loader L(W);
     printf("[decode] loaded %.2f GiB, %zu tensors\n", W.loadedGiB(), W.count());
@@ -266,6 +269,115 @@ int main(int argc, char** argv){
         // run-to-run). gate_mla_verify proves the M=K math bit-exact; full-model deterministic positions match.
         printf("[spec-verify] MATCH %d/%d -> %s  (M=K verify == K sequential decodes; diffs = MoE-atomic near-ties)\n",
                match, VK, match>=VK-1?"PASS":"FAIL");
+    }
+    // ================= DSpark SPEC-DECODE (draft head + accept loop) =================
+    if(argc>4){
+        const char* headdir=argv[4]; const int BLK=DSPARK_BLOCK, hf=ROPE_DIM/2;
+        printf("\n[spec] loading DSpark head %s ...\n", headdir);
+        st::WeightStore WH(headdir, key_map, "mtp."); Loader LH(WH);
+        printf("[spec] head loaded %.2f GiB, %zu mtp tensors\n", WH.loadedGiB(), WH.count());
+        std::vector<float> bc,bs2; yarn::freqs(bc,bs2,seqmax,ROPE_DIM,0,ROPE_THETA,YARN_FACTOR,YARN_BETA_FAST,YARN_BETA_SLOW);
+        const float* blk_cos=up_f(bc,keep); const float* blk_sin=up_f(bs2,keep);
+        const uint8_t* main_proj=LH.raw("mtp.0.main_proj.weight"); const float* main_proj_s=LH.scale("mtp.0.main_proj.scale");
+        const float* main_norm=LH.bf16("mtp.0.main_norm.weight");
+        int NSTAGE=0; while(WH.has("mtp."+std::to_string(NSTAGE)+".attn_norm.weight")) NSTAGE++;
+        int NE=0; while(WH.has("mtp.0.ffn.experts."+std::to_string(NE)+".w1.weight")) NE++;
+        printf("[spec] NSTAGE=%d head-experts=%d BLK=%d\n", NSTAGE, NE, BLK);
+        std::vector<BlockWeights> mb(NSTAGE); std::vector<float*> mkv(NSTAGE);
+        std::vector<std::vector<const uint8_t*>> HP1(NSTAGE),HP2(NSTAGE),HP3(NSTAGE);
+        std::vector<std::vector<const float*>> HS1(NSTAGE),HS2(NSTAGE),HS3(NSTAGE);
+        for(int st=0; st<NSTAGE; ++st){
+            std::string b="mtp."+std::to_string(st)+".", p=b+"attn."; MLAWeights& a=mb[st].attn;
+            a.wq_a=LH.raw(p+"wq_a.weight");a.wq_a_s=LH.scale(p+"wq_a.scale");a.wq_b=LH.raw(p+"wq_b.weight");a.wq_b_s=LH.scale(p+"wq_b.scale");
+            a.wkv=LH.raw(p+"wkv.weight");a.wkv_s=LH.scale(p+"wkv.scale");a.wo_b=LH.raw(p+"wo_b.weight");a.wo_b_s=LH.scale(p+"wo_b.scale");
+            a.q_norm=LH.bf16(p+"q_norm.weight");a.kv_norm=LH.bf16(p+"kv_norm.weight");
+            a.wo_a=LH.wo_a(p+"wo_a.weight",p+"wo_a.scale");a.attn_sink=LH.f32(p+"attn_sink");a.cosT=blk_cos;a.sinT=blk_sin;
+            mb[st].dim=DIM;mb[st].hc=HC_MULT;mb[st].attn_norm=LH.bf16(b+"attn_norm.weight");mb[st].ffn_norm=LH.bf16(b+"ffn_norm.weight");
+            mb[st].hc_attn_fn=LH.f32(b+"hc_attn_fn");mb[st].hc_attn_scale=LH.f32(b+"hc_attn_scale");mb[st].hc_attn_base=LH.f32(b+"hc_attn_base");
+            mb[st].hc_ffn_fn=LH.f32(b+"hc_ffn_fn");mb[st].hc_ffn_scale=LH.f32(b+"hc_ffn_scale");mb[st].hc_ffn_base=LH.f32(b+"hc_ffn_base");
+            MoEWeights& m=mb[st].ffn; std::string fp=b+"ffn.";
+            m.gate_w=LH.bf16(fp+"gate.weight");m.is_hash=false;m.gate_bias=WH.has(fp+"gate.bias")?LH.f32(fp+"gate.bias"):nullptr;m.tid2eid=nullptr;
+            for(int e=0;e<NE;++e){ std::string ep=fp+"experts."+std::to_string(e)+".";
+                HP1[st].push_back(LH.raw(ep+"w1.weight"));HP2[st].push_back(LH.raw(ep+"w2.weight"));HP3[st].push_back(LH.raw(ep+"w3.weight"));
+                HS1[st].push_back(LH.scale(ep+"w1.scale"));HS2[st].push_back(LH.scale(ep+"w2.scale"));HS3[st].push_back(LH.scale(ep+"w3.scale")); }
+            m.w1p=HP1[st].data();m.w2p=HP2[st].data();m.w3p=HP3[st].data();m.w1sp=HS1[st].data();m.w2sp=HS2[st].data();m.w3sp=HS3[st].data();
+            std::string sp2=fp+"shared_experts."; m.sw1=LH.raw(sp2+"w1.weight");m.sw2=LH.raw(sp2+"w2.weight");m.sw3=LH.raw(sp2+"w3.weight");
+            m.sw1s=LH.scale(sp2+"w1.scale");m.sw2s=LH.scale(sp2+"w2.scale");m.sw3s=LH.scale(sp2+"w3.scale");
+            m.n_routed=NE;m.n_act=N_ACT;m.dim=DIM;m.inter=MOE_INTER;m.vocab=VOCAB;m.route_scale=ROUTE_SCALE;m.swiglu_limit=SWIGLU_LIMIT;
+            m.use_tc_pp=true;m.batched=true;m.device_route=true; CU(cudaMalloc(&mkv[st],(size_t)seqmax*HEAD_DIM*4));
+        }
+        std::string LS="mtp."+std::to_string(NSTAGE-1)+".";
+        const float* hh_fn=LH.f32(LS+"hc_head_fn");const float* hh_sc=LH.f32(LS+"hc_head_scale");const float* hh_ba=LH.f32(LS+"hc_head_base");
+        const float* hnorm=LH.bf16(LS+"norm.weight");
+        const float* mw1=LH.bf16(LS+"markov_head.markov_w1.weight");const float* mw2=LH.bf16(LS+"markov_head.markov_w2.weight");
+        const __nv_bfloat16* emb=(const __nv_bfloat16*)W.get("embed.weight").dev;
+        { size_t fb,tb; cudaMemGetInfo(&fb,&tb); printf("[spec] head built. mem %.1f/%.1f GiB\n",(tb-fb)/1073741824.0,tb/1073741824.0); }
+
+        // main_x accumulator + tapped re-prefill over [0..PS-1]
+        float *main_x,*mh_pre; CU(cudaMalloc(&main_x,(size_t)seqmax*d*4)); CU(cudaMalloc(&mh_pre,(size_t)PS*3*d*4));
+        for(int L=0;L<N_LAYERS;++L) KV[L].T=0;
+        k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,emb,d_ids,PS,d); k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2);
+            if(Lyr==40) dspark_tap_pool(mh_pre,h,PS,hc,d,0,3); else if(Lyr==41) dspark_tap_pool(mh_pre,h,PS,hc,d,1,3); else if(Lyr==42) dspark_tap_pool(mh_pre,h,PS,hc,d,2,3); }
+        dspark_main_x(main_x, mh_pre, main_proj, main_proj_s, main_norm, PS, d, EPS); CU(cudaDeviceSynchronize());
+
+        // buffers
+        int *dbid,*dfid,*dout; CU(cudaMalloc(&dbid,BLK*4)); CU(cudaMalloc(&dfid,4)); CU(cudaMalloc(&dout,(BLK+1)*4));
+        float *xemb,*xa,*xb; CU(cudaMalloc(&xemb,(size_t)BLK*d*4)); CU(cudaMalloc(&xa,(size_t)BLK*hc*d*4)); CU(cudaMalloc(&xb,(size_t)BLK*hc*d*4));
+        float *hv,*hv2,*collK,*logK,*mh_v; CU(cudaMalloc(&hv,(size_t)BLK*hc*d*4)); CU(cudaMalloc(&hv2,(size_t)BLK*hc*d*4));
+        CU(cudaMalloc(&collK,(size_t)BLK*d*4)); CU(cudaMalloc(&logK,(size_t)BLK*VOCAB*4)); CU(cudaMalloc(&mh_v,(size_t)BLK*3*d*4));
+        int NGEN=NGEN0;
+        int cur=ids[s-1], cpos=PS;                 // cur = token at position cpos (=PS=s-1), not yet in cache
+        std::vector<int> sgen; int nverify=0, timed_tok=0; float spec_ms=0; cudaEvent_t s0,s1; cudaEventCreate(&s0); cudaEventCreate(&s1);
+        printf("[spec] decoding %d tokens (block=%d)...\n", NGEN, BLK);
+        while((int)sgen.size()<NGEN && cpos+BLK+1<seqmax){
+            cudaEventRecord(s0);
+            int anchor=cpos-1, ctx=cpos;           // main context [0..cpos-1]
+            // rebuild head main-KV over the context
+            for(int st=0;st<NSTAGE;++st) dspark_main_kv(mkv[st], main_x, mb[st].attn, ctx, EPS);
+            // DRAFT: block [cur, noise x (BLK-1)]
+            std::vector<int> bid(BLK,DSPARK_NOISE_TID); bid[0]=cur; CU(cudaMemcpy(dbid,bid.data(),BLK*4,cudaMemcpyHostToDevice));
+            k_embed<<<((size_t)BLK*d+255)/256,256>>>(xemb,emb,dbid,BLK,d); k_hc_expand<<<((size_t)BLK*hc*d+255)/256,256>>>(xa,xemb,BLK,hc,d); CU(cudaDeviceSynchronize());
+            float *cb=xa,*nb=xb;
+            for(int st=0;st<NSTAGE;++st){ dspark_block_forward(nb,cb,dbid,mkv[st],anchor,mb[st],blk_cos+(size_t)ctx*hf,blk_sin+(size_t)ctx*hf,BLK,WINDOW,HC_SINKHORN_ITERS,EPS); std::swap(cb,nb); }
+            CU(cudaMemcpy(dfid,&cur,4,cudaMemcpyHostToDevice));
+            dspark_forward_head(dout,cb,dfid,hh_fn,hh_sc,hh_ba,hnorm,head_w,mw1,mw2,1,BLK,hc,d,VOCAB,DSPARK_MARKOV_RANK,EPS); CU(cudaDeviceSynchronize());
+            std::vector<int> oo(BLK+1); CU(cudaMemcpy(oo.data(),dout,(BLK+1)*4,cudaMemcpyDeviceToHost));
+            std::vector<int> draft(BLK); for(int i=0;i<BLK;++i) draft[i]=oo[1+i];     // proposals for cpos+1..cpos+BLK
+            // VERIFY block [cur, draft[0..BLK-2]] at [cpos..cpos+BLK-1]
+            std::vector<int> vtok(BLK); vtok[0]=cur; for(int i=1;i<BLK;++i) vtok[i]=draft[i-1];
+            std::vector<int> Tbefore(N_LAYERS); for(int L=0;L<N_LAYERS;++L) Tbefore[L]=KV[L].T;
+            int* dvt; dvt=d_ids+cpos; CU(cudaMemcpy(dvt,vtok.data(),BLK*4,cudaMemcpyHostToDevice));
+            k_embed<<<((size_t)BLK*d+255)/256,256>>>(h0,emb,dvt,BLK,d); k_hc_expand<<<((size_t)BLK*hc*d+255)/256,256>>>(hv,h0,BLK,hc,d); CU(cudaDeviceSynchronize());
+            float* vin=hv; float* vout=hv2;
+            for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); int ratio=compress_ratio(Lyr);
+                if(ratio==0) block_verify_step (vout,vin,dvt,BW[Lyr],cpos,BLK,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+                else         cblock_verify_step (vout,vin,dvt,CW[Lyr],cpos,BLK,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+                std::swap(vin,vout);
+                if(Lyr==40) dspark_tap_pool(mh_v,vin,BLK,hc,d,0,3); else if(Lyr==41) dspark_tap_pool(mh_v,vin,BLK,hc,d,1,3); else if(Lyr==42) dspark_tap_pool(mh_v,vin,BLK,hc,d,2,3); }
+            hc_head(collK,vin,hc_fn,hc_sc,hc_bs,BLK,hc,d,HC_EPS); rmsnorm(collK,collK,norm_w,BLK,d,EPS,true,0);
+            gemm_fp32(logK,collK,head_w,BLK,VOCAB,d,0); CU(cudaDeviceSynchronize());
+            std::vector<float> lg((size_t)BLK*VOCAB); CU(cudaMemcpy(lg.data(),logK,(size_t)BLK*VOCAB*4,cudaMemcpyDeviceToHost));
+            std::vector<int> tam(BLK); for(int i=0;i<BLK;++i){const float*r=&lg[(size_t)i*VOCAB];int aa=0;for(int v=1;v<VOCAB;++v)if(r[v]>r[aa])aa=v;tam[i]=aa;}
+            // ACCEPT longest matching prefix: draft[i]==tam[i] (target's token for pos cpos+1+i)
+            int acc=0; while(acc<BLK-1 && draft[acc]==tam[acc]) ++acc;
+            int correction=tam[acc];                        // target's token for pos cpos+acc+1
+            for(int i=0;i<acc;++i) sgen.push_back(draft[i]); sgen.push_back(correction);
+            // update main_x for the accepted range [cpos..cpos+acc] from verify taps; rollback compressor T
+            dspark_main_x(main_x+(size_t)cpos*d, mh_v, main_proj, main_proj_s, main_norm, acc+1, d, EPS); CU(cudaDeviceSynchronize());
+            for(int L=0;L<N_LAYERS;++L){ int ratio=compress_ratio(L); if(!ratio) continue; int valid=0;
+                for(int j=cpos;j<=cpos+acc;++j) if((j+1)%ratio==0) ++valid; KV[L].T=Tbefore[L]+valid; }   // drop rows from rejected drafts
+            cpos += acc+1; cur = correction;
+            cudaEventRecord(s1); cudaEventSynchronize(s1); float ms=0; cudaEventElapsedTime(&ms,s0,s1);
+            if(nverify>0){ spec_ms+=ms; timed_tok+=acc+1; } ++nverify;   // exclude round 0 (warmup: head repack)
+            printf("  verify %d: accepted %d/%d + correction -> +%d tokens (%.1f ms)  cpos=%d\n", nverify, acc, BLK-1, acc+1, ms, cpos);
+        }
+        double avg_acc=(double)sgen.size()/nverify;
+        double ms_per_tok = timed_tok>0 ? spec_ms/timed_tok : 0;
+        printf("\n[spec] generated %d tokens over %d verifies: mean tokens/verify = %.2f (block=%d, max %d)\n", (int)sgen.size(), nverify, avg_acc, BLK, BLK);
+        printf("[spec] tokens:"); for(int i=0;i<(int)sgen.size() && i<40;++i) printf(" %d",sgen[i]); printf("\n");
+        printf("[spec] SPEC-DECODE: %.1f ms/tok = %.2f tok/s  (vs base M=1 %.1f ms/tok = %.2f tok/s -> %.2fx)\n",
+               ms_per_tok, ms_per_tok>0?1000.0/ms_per_tok:0, warm_ms, 1000.0/warm_ms, ms_per_tok>0?warm_ms/ms_per_tok:0);
     }
     size_t fb,tb; cudaMemGetInfo(&fb,&tb); printf("[decode] mem %.1f/%.1f GiB\n",(tb-fb)/1073741824.0,tb/1073741824.0);
     return first_am==270?0:1;

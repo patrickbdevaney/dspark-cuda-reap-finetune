@@ -261,3 +261,17 @@ forward = **67.9 ms/tok if all accepted vs 149.3 M=1 = 2.2x**, argmax matches th
 positions (270/9829/16/983); the single diff (pos1: 3924 vs 6919) is a MoE-atomic near-tie the decode itself
 flips run-to-run (documented non-determinism), not a verify bug. Next: draft (DSpark head) proposes the K
 candidates + accept-longest-prefix loop -> real spec-decode throughput.
+
+**DSpark spec-decode — INTEGRATED end-to-end (draft head + accept loop).** `decode.cu` (arg4=headdir): loads
+the block-diffusion DSpark head (mtp.0/1/2, 256 experts/stage), tapped re-prefill fills `main_x` from the
+L40/41/42 taps, then the loop: rebuild head main-KV over `main_x` → `dspark_block_forward` ×3 stages +
+`dspark_forward_head` propose block=5 → **M=K verify** (built above) the block in ONE forward → accept longest
+prefix where draft==target-argmax + take the correction → advance; compressor `T` rolled back per layer to drop
+rows emitted from rejected drafts. Generates coherent tokens (270 6919 9829 16 983 344 260 5217... = base-decode
+continuation). **Measured: mean 1.91 tokens/verify, 220.7 ms/tok = 0.67× base** — SLOWER right now, for two
+EXPECTED reasons: (1) the head is UNFINE-TUNED (block acceptance low; the project's Phase-3 fine-tune is exactly
+for this) and MoE-atomic near-tie non-determinism rejects valid drafts (determinize the scatter → higher accept);
+(2) the M=5 verify is 2.9× M=1 (not yet at the weight-bound floor → CUDA graphs). At the floor + a fine-tuned
+head (~4 accepted) this is ~2× toward the ~50 tok/s target. MEMORY: head = 10.1 GiB → 120.9/122.8 peak (1.9 GiB
+headroom — TIGHT; only run deliberately). The spec-decode MECHANISM is complete and correct; throughput is the
+head-quality + base-speed problem the remaining phases address.

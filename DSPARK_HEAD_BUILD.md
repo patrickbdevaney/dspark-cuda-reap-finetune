@@ -103,3 +103,20 @@ Per stage: full Block (attn wq_a/wq_b/wkv/wo_a/wo_b+scale, q_norm/kv_norm, attn_
 hc_attn/ffn, ffn gate+bias+experts[256]+shared). Stage0: `main_proj.{weight,scale}` `main_norm.weight`.
 Last stage: `norm.weight` `markov_head.markov_w1.weight` `markov_head.markov_w2.weight` `confidence_head.proj.weight`
 `hc_head_{fn,scale,base}`. Head's MoE is 256-expert (its own capacity) — per-expert ptr tables like the main MoE.
+
+## Piece 5 — measurement integration (the ONE thing left; produces the block-τ number)
+All compute kernels exist + compile (pieces 1-4). Piece 5 = orchestrate them on real DSpark-head weights:
+1. **Selective DSpark-head loader.** The DSpark-head repo (`~/models/DeepSeek-V4-Flash-DSpark-head`) has only
+   shards 46-48 present (the mtp.* head, ~11GB); its index references shards 1-48. `WeightStore`/`ShardedSafeTensors`
+   opens ALL referenced shards → fails on missing 1-45. FIX: add a filtered load — accept a name prefix ("mtp.")
+   and skip shards that don't exist / hold no matching tensor. Small, bounded addition to `safetensors.h`+`weight_store.h`.
+2. **Tap L40/41/42 in forward.cu.** In the 43-layer loop, at Lyr∈{40,41,42} call `dspark_tap_pool(main_hidden, h,
+   s, hc, DIM, slot, 3)` (slot 0/1/2). After the loop: `dspark_main_x(main_x, main_hidden, mtp.0.main_proj, ...,
+   mtp.0.main_norm)` → `dspark_main_kv(main_kv, main_x, mtpBlock.attn, s)`.
+3. **Anchor loop** (t ∈ [0, s-block-1]): draft_ids=[x_{t+1}, noise×4]; embed(bf16)+HC-expand → x_block[block,hc,d];
+   `dspark_block_forward(xb, x_block, draft_ids, main_kv, t, mtpBlockW, blkCos[t+1..], blkSin[..], block, win)`;
+   `dspark_forward_head(out_ids, xb, x_{t+1}, hc_head/norm/lm_head/markov, ...)`; compare out_ids[1..block] vs
+   ground-truth x_{t+2..t+block+1} → longest matching prefix.
+4. **block-τ = mean(prefix_len) over anchors** on a representative prompt set (real Gate-2). Then fine-tune to lift.
+Freqs: DSpark block has compress_ratio=0 → sliding rope_theta (yarn off). Build a `[s+block, rd/2]` table; main_kv
+uses [0..s-1], the block at anchor t uses [t+1..t+block]. Head's MoE is 256-expert → per-expert ptr tables (mtp).

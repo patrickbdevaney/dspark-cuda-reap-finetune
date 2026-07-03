@@ -3,6 +3,7 @@
 // Weights load zero-copy via WeightStore; dtypes the kernels need as fp32 (e8m0 scales, wo_a fp8, bf16
 // norms/compressor/head) are dequantized at load. See ROADMAP Phase A. Gate 1 = this runs on real weights.
 //   build: nvcc -O2 -std=c++17 -arch=sm_110a -I include src/forward.cu kernels/*.cu -o build/forward
+#include <unordered_map>
 #include "weight_store.h"
 #include "deepseek_v4.h"
 #include "block.h"
@@ -47,6 +48,10 @@ __global__ void k_hc_expand(float* out, const float* h, int s, int hc, int dim){
 }
 
 // ---------------- dequant-caching loader ----------------
+// NOTE: dequant-at-load CACHING was REVERTED — persisting scales (+5.5GB) on top of the 112.9GB forward
+// footprint starved this shared unified-memory device (user had to power-cycle). On Thor, unified RAM is shared
+// with the host/OS/Claude Code; the forward already uses ~92% of it, so NO persistent additions are safe here.
+// Dequant stays per-layer with release() (memory-safe). Killing the re-dequant needs a memory-NEUTRAL scheme.
 struct Loader {
     st::WeightStore& W; std::vector<void*> allocs;
     Loader(st::WeightStore& w):W(w){}

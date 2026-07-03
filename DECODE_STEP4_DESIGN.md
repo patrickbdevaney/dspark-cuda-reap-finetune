@@ -35,11 +35,20 @@ first path where **decode tok/s** is actually measured (everything so far is s=8
 - ⬜ **CUDA-graph capture (Step 3)** — collapse ~2500 launches/token (~100ms host overhead) into one graph
   launch. Blocker: move the host-side idx generation (comb vectors, k_win_idx base/width, T counter, pos math)
   fully on-device so the per-token launch sequence is static. Arena (done) already removed mid-token malloc.
-- ⬜ **DSpark spec-decode (Step 5) — the multiplier to reach ~50 tok/s.** The draft head (dspark_real.cu +
-  the Gate-2-real block-acceptance harness, already proven) proposes block_size=5; the target verifies the
-  block in ONE forward (M=block, amortizes the weight bandwidth ~block×), accept longest matching prefix
-  (τ≈0.75-0.8). Effective tok/s = base_forward_rate × accepted_len. Once base is near the bandwidth floor
-  (~40ms), block-verify + ~3 accepted → ~13ms/tok = ~75 tok/s. This is where the DSpark head integrates.
+- 🟡 **DSpark spec-decode (Step 5) — IN PROGRESS. The M=K VERIFY primitive is DONE + gated (the hard part).**
+  - ✅ **M=K verify forward** (`mla_verify_step`, `compressed_verify_step_{strided,indexer}`, `block_verify_step`,
+    `cblock_verify_step`): K tokens in ONE forward, GEMMs at M=K read weights ONCE. `gate_mla_verify` cosine 1.0;
+    full 180B M=5 verify = **67.9 ms/tok if accepted vs 149.3 M=1 = 2.2×** (`decode.cu` spec-verify gate).
+  - ⬜ **DSpark block-head draft + accept loop.** Block draft REQUIRES the separate block-diffusion DSpark-head
+    model (`~/models/DeepSeek-V4-Flash-DSpark-head/`, mtp.* shards) — the REAP built-in `mtp.0` is only 1-ahead,
+    not chainable. Head forward EXISTS (`kernels/dspark_real.cu`: `dspark_main_x`, `dspark_main_kv`,
+    `dspark_block_forward`, `dspark_forward_head`) and is proven τ≈0.8 (Gate-2-real in `forward.cu` — copy that
+    wiring). Loop: (1) verify emits the L40/41/42 main-hidden tap for the accepted position (add the tap to the
+    verify path, as `forward.cu` does with `dspark_tap_pool`); (2) DSpark head drafts block=5 from that tap;
+    (3) M=K verify the drafts (built above) → target argmax + fresh taps; (4) accept longest matching prefix,
+    advance. Effective ms/tok = verify_ms / accepted_len. With ~4 accepted → ~85 ms/tok now; once base nears the
+    bandwidth floor (CUDA graphs) → ~40ms verify → ~50 tok/s. **Determinize the MoE scatter (sorted, not atomic)
+    for a clean accept gate** — the current run-to-run near-tie flips are benign but muddy strict-match checks.
 
 ## MILESTONE 3 (original)
 - Per-layer `KVCache` arena (pre-alloc → forces Step 2);

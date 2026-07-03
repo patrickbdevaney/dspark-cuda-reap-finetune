@@ -47,6 +47,8 @@ struct Loader {
     st::WeightStore& W; std::vector<void*> allocs;
     Loader(st::WeightStore& w):W(w){}
     ~Loader(){ for(void*p:allocs) cudaFree(p); }
+    size_t mark(){ return allocs.size(); }                           // per-layer dequant scoping: free
+    void release(size_t m){ for(size_t i=m;i<allocs.size();++i) cudaFree(allocs[i]); allocs.resize(m); }  // buffers after the block runs (synced)
     const uint8_t* raw(const std::string& n){ return W.dev<uint8_t>(n); }
     const float* f32(const std::string& n){ return W.dev<float>(n); }
     float* alloc(size_t nb){ void* p; CU(cudaMalloc(&p,nb)); allocs.push_back(p); return (float*)p; }
@@ -65,6 +67,7 @@ static std::vector<float> stride_rows(const std::vector<float>& in, int s, int h
     std::vector<float> o((size_t)(s/ratio)*half); for(int g=0; g<s/ratio; ++g) for(int j=0;j<half;++j) o[(size_t)g*half+j]=in[(size_t)(g*ratio)*half+j]; return o; }
 
 int main(int argc, char** argv){
+    setvbuf(stdout, nullptr, _IONBF, 0);          // unbuffered: see progress live (esp. if killed)
     const char* dir = argc>1?argv[1]:"/home/patrickd/models/DeepSeek-V4-Flash-180B";
     int s = argc>2?atoi(argv[2]):8;
     printf("[forward] loading %s (single-tenant, ~96 GiB)...\n", dir);
@@ -118,6 +121,7 @@ int main(int argc, char** argv){
     for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){
         int ratio=compress_ratio(Lyr);
         std::string lp="layers."+std::to_string(Lyr)+".";
+        size_t mk=L.mark();                                   // free this layer's dequant buffers after the block
         if(ratio==0){
             BlockWeights b{}; fill_attn(Lyr,b.attn,false);
             fill_moe(Lyr,b.ffn,P1[Lyr],P2[Lyr],P3[Lyr],S1[Lyr],S2[Lyr],S3[Lyr]);
@@ -147,7 +151,9 @@ int main(int argc, char** argv){
             compressed_block_forward(h2,h,d_ids,b,s,HC_SINKHORN_ITERS,EPS);
         }
         std::swap(h,h2);
-        if(Lyr%8==0){ CU(cudaDeviceSynchronize()); printf("  layer %d/%d done (ratio %d)\n",Lyr,N_LAYERS,ratio); }
+        L.release(mk);                                        // block synced internally -> safe to free layer dequant
+        if(Lyr%4==0){ size_t fb,tb; cudaMemGetInfo(&fb,&tb);
+            printf("  layer %d/%d done (ratio %d)  mem %.1f/%.1f GiB\n",Lyr,N_LAYERS,ratio,(tb-fb)/1073741824.0,tb/1073741824.0); }
     }
 
     // --- head: hc_head (4->1) -> final norm -> lm_head -> logits[s,vocab] ---

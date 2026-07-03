@@ -15,9 +15,16 @@ artifact — nothing disposable.**
 
 ---
 
-## WHERE WE ARE NOW (turn ~28)
-Building **`forward.cu`** (the full-model loop → Gate 1). All kernels + both attention variants + full
-Block are validated on real weights. **Weight-to-device loader path: SOLVED & PROVEN** (`tools/load_device.cu`).
+## WHERE WE ARE NOW (turn ~34)
+**`forward.cu` WRITTEN and COMPILES** (`src/forward.cu`, `scripts/build_forward.sh`) — full 180B assembled:
+WeightStore load + dequant (e8m0 scales→fp32, wo_a fp8-block→fp32, bf16→fp32) + per-layer struct
+population + YaRN freqs + embed→HC-expand→43-layer loop (block/compressed_block)→hc_head→norm→lm_head.
+**Gate 1 (first full run on Thor) is executing/iterating now.** Expect first-run bugs (name typos, dtype/
+shape mismatches, freq indexing) — iterate: read run output, fix, `bash scripts/build_forward.sh`, re-run
+`./build/forward <dir> <s>`. Loader + both attention variants + Block all validated, so failures are
+integration wiring, not kernel math.
+
+### (historical) Weight-to-device loader path: SOLVED & PROVEN (`tools/load_device.cu`)
 - Probed: `integrated=1, hostRegisterSupported=1, canUseHostPtrForRegMem=1, canMapHostMem=1`.
 - `cudaHostRegister` of the file-backed `MAP_PRIVATE` mmap → "operation not supported" (Tegra limitation on
   that mapping type — NOT registration in general).

@@ -120,5 +120,18 @@ same values as the oracle's dec_e4m3 fp32 dot; only accumulation-order rounding 
 the FP8 tensor-core lever (Thor's 1035 TFLOPS FP8, 2x its fp16); FP4 (2070) stays blocked in CUDA 13. Both
 dominant kernel classes now TC-accelerated: MoE experts (tc_fp4_gemm 19.7x) + dense/attn (tc_fp8_gemm 17.9x).
 
+**Wiring champions into forward.cu — real-model-shape OOB (IN PROGRESS, honest status).** Finding: tc_fp8_gemm
+(cosine 1.0, 17.9x) + batched MoE (cosine 1.0) each PASS their unit gates, but enabling them in the full 180B
+forward crashes with an illegal memory access in the batched-MoE path (moe.cu:215 sync catches it; also seen at
+tc_moe_gemm.cu:104 with tc_fp4 on). The PLAIN forward (champions OFF) still runs correctly (Gate 1 Paris).
+Root cause: NOT found by inspection — every batched kernel (k_gather_x/swiglu_wrow/k_scatter_add/act_quant) and
+GEMM shape (incl. the w2 N=4096/K=2048 the unit gates never covered) checks in-bounds on paper; weight indexing
+is identical to the working per-token path (w1p[e]). This is the class of bug tiny-shape gates + inspection
+miss — needs `compute-sanitizer` on the forward to localize (the recurring 'real weights catch what synthetic
+gates can't' lesson). ACTION: forward reverted to working config (champions wired but flagged OFF: g_tc_fp8=false,
+use_tc=false, batched=false); tc_fp8_gemm banked as a validated KERNEL; end-to-end measurement BLOCKED pending
+the sanitizer localization. Why logged: honesty > a green checkmark; the integration is unfinished and the doc
+must say so.
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

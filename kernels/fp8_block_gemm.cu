@@ -41,9 +41,15 @@ __global__ void fp8_block_gemm_kernel(float* __restrict__ C,
     if (lane == 0) C[(size_t)m * N + n] = acc;
 }
 
+// Global toggle: route dense fp8 GEMMs through the native FP8 tensor core (tc_fp8_gemm, ~18x). Default OFF so
+// gates use this warp-per-output oracle (bit-exact). forward.cu sets it true for decode. All our fp8 GEMM
+// shapes satisfy N%8==0 && K%128==0 (checked); fall back to the oracle otherwise.
+bool g_tc_fp8 = false;
+void tc_fp8_gemm(float*, const uint8_t*, const float*, const uint8_t*, const float*, int, int, int, cudaStream_t);
 void fp8_block_gemm(float* C, const uint8_t* A_fp8, const float* a_s,
                     const uint8_t* B_fp8, const float* b_s,
                     int M, int N, int K, cudaStream_t stream) {
+    if (g_tc_fp8 && (N % 8 == 0) && (K % 128 == 0)) { tc_fp8_gemm(C, A_fp8, a_s, B_fp8, b_s, M, N, K, stream); return; }
     dim3 grid(N, M);
     fp8_block_gemm_kernel<<<grid, 32, 0, stream>>>(C, A_fp8, a_s, B_fp8, b_s, M, N, K);
 }

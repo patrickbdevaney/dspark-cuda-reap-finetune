@@ -103,3 +103,7 @@ void tc_fp4_gemm(float* C, const uint8_t* A_fp8, const float* a_s, const uint8_t
     dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, w.wpr, w.wsr, x16, M, N, K);
     CT(cudaStreamSynchronize(s)); cudaFree(x16);
 }
+
+// Free the repack cache — call per-layer in forward.cu so the full model doesn't accumulate ~82GB of repacked
+// expert weights (the cache is a decode-across-forwards optimization; per single forward it's per-layer scoped).
+void tc_moe_clear_cache(){ for(auto& kv : g_tc_cache){ cudaFree(kv.second.wpr); cudaFree(kv.second.wsr); } g_tc_cache.clear(); }

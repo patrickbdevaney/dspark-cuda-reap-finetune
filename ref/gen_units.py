@@ -322,6 +322,20 @@ def gen_indexer(out_dir, s=16, dim=256, q_lora=128, n_heads=8, idx_hd=128, rd=64
     print("[indexer] s=%d T=%d n_heads=%d idx_hd=%d  valid|score|max=%.4f" % (s, T, n_heads, idx_hd, isc[isc > -1e29].abs().max().item()))
 
 
+def gen_yarn(out_dir, seqlen=64, dim=64):
+    """RoPE/YaRN freq precompute (model.py precompute_freqs_cis): compressed (YaRN on) + sliding (off)."""
+    import deepseek_v4_ref as MM
+    def cs(orig, base):
+        fc = MM.precompute_freqs_cis(dim, seqlen, orig, base, 16, 32, 1)
+        r = torch.view_as_real(fc); return r[..., 0].contiguous(), r[..., 1].contiguous()
+    cy, sy = cs(65536, 160000.0)          # compressed (YaRN)
+    co, so = cs(0, 10000.0)               # pure-sliding (no YaRN)
+    save_file({"cos_yarn": cy, "sin_yarn": sy, "cos_off": co, "sin_off": so,
+               "dims": torch.tensor([seqlen, dim], dtype=torch.int32)},
+              os.path.join(out_dir, "unit_yarn.safetensors"))
+    print("[yarn] seqlen=%d dim=%d" % (seqlen, dim))
+
+
 def gen_hadamard(out_dir, rows=8, D=128):
     from fast_hadamard_transform import hadamard_transform
     torch.manual_seed(114)
@@ -452,4 +466,5 @@ if __name__ == "__main__":
     gen_index_score(a.out)
     gen_act_quant_fp4(a.out)
     gen_indexer(a.out)
+    gen_yarn(a.out)
     print("units written to", a.out)

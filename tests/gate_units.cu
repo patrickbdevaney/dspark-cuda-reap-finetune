@@ -10,6 +10,7 @@
 #include "hc.h"
 #include "compressor.h"
 #include "indexer.h"
+#include "yarn.h"
 #include <cstdio>
 #include <vector>
 #include <cmath>
@@ -341,9 +342,24 @@ static bool gate_indexer(const std::string& dir) {
     return ok;
 }
 
+static bool gate_yarn(const std::string& dir) {
+    st::SafeTensors S(dir + "/unit_yarn.safetensors");
+    const auto& dm=S.get("dims"); int seqlen=i32(dm,0), dim=i32(dm,1); int half=dim/2;
+    std::vector<float> cy,sy,co,so;
+    yarn::freqs(cy,sy,seqlen,dim,65536,160000.0,16,32,1);   // compressed
+    yarn::freqs(co,so,seqlen,dim,0,10000.0,16,32,1);        // sliding
+    auto cmp2=[&](const std::vector<float>& g,const char* name)->double{
+        const float* r=f32(S.get(name)); double m=0; for(size_t i=0;i<g.size();++i) m=fmax(m,fabs((double)g[i]-r[i])); return m; };
+    double e = fmax(fmax(cmp2(cy,"cos_yarn"),cmp2(sy,"sin_yarn")), fmax(cmp2(co,"cos_off"),cmp2(so,"sin_off")));
+    bool ok = e < 1e-5;
+    printf("[yarn] seqlen=%d dim=%d  max_abs=%.2e (yarn+off) -> %s\n",seqlen,dim,e,ok?"PASS":"FAIL");
+    return ok;
+}
+
 int main(int argc, char** argv) {
     std::string dir = argc>1 ? argv[1] : "ref/goldens";
     bool ok = true;
+    ok &= gate_yarn(dir);
     ok &= gate_indexer(dir);
     ok &= gate_compressor(dir);
     ok &= gate_compressor_overlap(dir);

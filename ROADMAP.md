@@ -101,7 +101,7 @@ container `vllm-dflash-thor:sglang`. Never `--runtime nvidia` (wedges containers
      the real checkpoint.** Per-expert layout: `layers.L.ffn.experts.{e}.w1.weight` = `[inter=2048, dim/2=2048]`
      dtype **I8** (FP4 packed, 4.19 MB each); `.w2.weight`=[dim, inter/2]; `.w3` like w1; scales `.scale`
      (F32). shared_experts `.{w1,w2,w3}.{weight,scale}`. gate `.weight` + `.tid2eid` (layers 0,1,2 are hash).
-     **FIX (next task):** add a `moe_forward` variant taking **per-expert device-pointer tables**
+     **FIX — DONE:** `moe_forward` now takes optional per-expert device-pointer tables
      (`const uint8_t* w1[E], w2[E], w3[E]` + `const float* w1s[E]...`) instead of base+stride — moe.cu already
      loops per selected expert, so swap `w1 + e*stride` → `w1_ptrs[e]` (localized; keep the stacked version so
      gate_block/gate_units still pass). Model loader builds the 160-ptr tables per layer via WeightStore.

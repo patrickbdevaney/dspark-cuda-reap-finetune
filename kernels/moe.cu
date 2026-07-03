@@ -160,12 +160,17 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         // routed experts (fp4)
         for(int s=0;s<na;++s){
             int e=hidx[(size_t)t*na+s]; float wgt=hw[(size_t)t*na+s];
+            // stacked base+stride, OR per-expert pointer table (real checkpoint) when w1p != null.
+            const uint8_t *W1 = w.w1p? w.w1p[e] : w.w1+(size_t)e*w13n, *W3 = w.w3p? w.w3p[e] : w.w3+(size_t)e*w13n,
+                          *W2 = w.w2p? w.w2p[e] : w.w2+(size_t)e*w2n;
+            const float *W1s = w.w1sp? w.w1sp[e] : w.w1s+(size_t)e*w13s, *W3s = w.w3sp? w.w3sp[e] : w.w3s+(size_t)e*w13s,
+                        *W2s = w.w2sp? w.w2sp[e] : w.w2s+(size_t)e*w2s;
             act_quant_fp8(xq,xs,xr,1,dim,128,stream);
-            fp4_gemm(g,xq,xs, w.w1+(size_t)e*w13n, w.w1s+(size_t)e*w13s, 1,inter,dim,stream);
-            fp4_gemm(u,xq,xs, w.w3+(size_t)e*w13n, w.w3s+(size_t)e*w13s, 1,inter,dim,stream);
+            fp4_gemm(g,xq,xs, W1, W1s, 1,inter,dim,stream);
+            fp4_gemm(u,xq,xs, W3, W3s, 1,inter,dim,stream);
             swiglu_kernel<<<(inter+63)/64,64,0,stream>>>(h,g,u,inter,w.swiglu_limit,wgt);
             act_quant_fp8(hq,hs,h,1,inter,128,stream);
-            fp4_gemm(oe,hq,hs, w.w2+(size_t)e*w2n, w.w2s+(size_t)e*w2s, 1,dim,inter,stream);
+            fp4_gemm(oe,hq,hs, W2, W2s, 1,dim,inter,stream);
             accum_kernel<<<(dim+63)/64,64,0,stream>>>(out+(size_t)t*dim,oe,dim);
         }
         // shared expert (fp8), no routing weight

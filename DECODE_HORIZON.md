@@ -54,7 +54,8 @@ that read quantized data directly (no fp32 dequant) and in-place transforms.
 | **tc_fp4 pp ALIGNED load** (funnel-shift OR loader 16B-align) | **NEXT (unlocks MoE 19.7×)** | — |
 | DEQUANT — memory-NEUTRAL scheme (cache REVERTED: starved RAM) | blocked-on-memory | ~30% of warm fwd; needs in-place/arena, not on-top |
 | **2x warmup (steady-state, memory-neutral)** | ✅ done | **pass1 WARM 451.2 ms/tok (2.22 tok/s), 1.52× base** |
-| **TC-ify attn-out: use fp8 wo_a via tc_fp8 (drops dequant+fp32 GEMM)** | **NEXT (memory-neutral, ~18%)** | — |
+| **TC-ify attn-out (fp16 mma per group, cosine 1.0)** | ✅ done | **388.5 ms/tok (2.57 tok/s, 1.77× base), −14%** |
+| **aligned MoE load (funnel-shift, cosine 1.0)** | ✅ gated, measuring | pending warm |
 | TC-ify gemm_fp32 (compressor/indexer/head, ~14% warm) | TODO | — |
 | CUDA graphs + device MoE routing + fusion | TODO | — |
 | DSpark spec decode (block verify) | TODO (τ≈0.815 proven) | — |

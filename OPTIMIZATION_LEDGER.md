@@ -52,7 +52,8 @@ These are the correctness-first shapes — chosen for provable correctness, alwa
 | — | next | **FP4 COMPUTE (2070 TFLOPS = Thor's strongest, 4x fp16)** — HW present but NOT in ptxas for sm_110 (CUDA 13); reach via cuBLASLt/cuDNN FP4 GEMM (library) NOW, or hand-PTX when exposed. A/B vs our TC path. | | up to ~4× | INVESTIGATE (top lever; see FP4_COMPUTE_NOTE.md — cuBLASLt lightest) |
 | E2E | forward.cu | tc_fp8 dense + batched | 559.8 ms/tok | 1.23× | banked, correct (argmax stable). |
 | E2E | forward.cu | + tc_fp4 repack-at-load pp (single fwd) | 555.9 ms/tok | — | double-counts one-time repack. |
-| E2E | forward.cu | **2x WARM steady-state** (repack amortized, memory-neutral) | **451.2 ms/tok (2.22 tok/s)** | **1.52× base** | pass0 539.2 (repack) / pass1 451.2 (warm); correct, 107.9GB. Warm bottlenecks: dequant ~30% (memory-blocked), MoE byte-load ~19%, ogroup fp32 ~18%, gemm_fp32 ~14%. |
+| E2E | forward.cu | 2x WARM (repack amortized) | 451.2 ms/tok (2.22 tok/s) | 1.52× | pass0 539.2/pass1 451.2. |
+| E2E | forward.cu | + **TC attn-output** (fp16 mma per group, cosine 1.0) | **388.5 ms/tok (2.57 tok/s)** | **1.77× base** | −14% (attn-out warp→TC). correct, 109.4GB. Next: funnel-shift MoE coalescing. |
 | 3 | dense/attn fp8 GEMM | **tc_fp8_gemm** (native FP8 mma m16n8k32.e4m3, W8A8) | **0.023 ms** (vs 0.413) | **17.88×** | **CHAMPION** (cosine 1.0, max_rel 2e-5 vs fp8_block_gemm; fp8 in, no fp16 upconvert). Dense/attn/shared-expert path. |
 | — | (was) | native FP8 mma m16n8k32 (dequant fp4-wt→fp8, acts already fp8, FP8 tensor core = 2× fp16; FP4 mma NOT on sm_110) | | ~2× over current fp16 TC | TODO (HW-verified path) |
 | — | next | batched/grouped MoE dispatch (kill host per-token loop) | | | TODO |

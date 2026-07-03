@@ -18,3 +18,11 @@ void compressed_attn_cache(float* win_kv, float* comp_kv, int* T, const float* x
 void compressed_decode_step_strided(float* out, const float* x_full, int pos, const CompressedAttnWeights& w,
                                     float* win_kv, float* comp_kv, int* T, int ratio, float eps,
                                     cudaStream_t stream = 0);
+
+// ratio-4 (DSA indexer) variant: adds the indexer-compressor cache (idx_ckv) for scoring; the main compressed
+// KV (comp_kv) is OVERLAP-pooled. Decode: score query vs idx_ckv -> top-k main-compressed rows to attend.
+void compressed_attn_cache_r4(float* win_kv, float* comp_kv, float* idx_ckv, int* T, const float* x,
+                              const CompressedAttnWeights& w, int s0, int ratio, float eps, cudaStream_t stream = 0);
+void compressed_decode_step_indexer(float* out, const float* x_full, int pos, const CompressedAttnWeights& w,
+                                    float* win_kv, float* comp_kv, float* idx_ckv, int* T, int ratio,
+                                    float eps, cudaStream_t stream = 0);

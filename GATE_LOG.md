@@ -228,3 +228,13 @@ comp_kv[0..T-1]]` (compressed idx = `t + (pos+1)`, matching prefill's `t + s` at
 (`tests/gate_compressed_decode.cu`, ratio=128, s=256): prefill vs cache(0..s-2)+decode(s-1) = **cosine 1.0,
 rms 0, maxabs 0.** `kernels/compressed_decode.cu`. Remaining: m2b (ratio-4 = this + DSA-indexer M=1 top-512),
 m3 (full 43-layer loop + head + decode tok/s).
+
+**Step 4 milestone 2b — ratio-4 DSA-indexer compressed decode step: BIT-EXACT.** Adds to 2a: MAIN compressed KV
+is OVERLAP-pooled; a separate INDEXER-compressor cache (`idx_ckv`, overlap+rotate=hadamard+fp4, d=128) scores
+the single query (fp4-sim'd hadamard-rotated q · idx_ckv, relu-weighted per head) → top-k selects which
+main-compressed rows to attend. Reuses `compressor_emit_group` (all 3 variants gated) + `index_score` +
+`sparse_attn(m=1)` over `[window ⊕ indexer-selected compressed]`. Gate (`tests/gate_indexer_decode.cu`,
+ratio=4, s=16, T=4): prefill vs cache+decode = **cosine 1.0, rms 0, maxabs 0**. (top-k order is irrelevant —
+sparse_attn softmaxes over the selected SET.) **All three attention flavors now decode bit-exact** (sliding /
+strided-128 / indexer-4). Remaining for Step 4: milestone 3 — full 43-layer decode loop (per-layer caches +
+HC + moe_forward(bs=1) + head), gate decode logits == prefill logits[s-1] on the real model, measure tok/s.

@@ -2,7 +2,7 @@
 
 **Durable progress record for `dspark-cuda-reap-finetune`.** If context is lost, start here. Read alongside
 `CONSTITUTION.md` (rules), `ADAPTATION_PLAN.md` (arch delta), `CAPTURE_TRAIN_PLAN.md` (training research),
-`reference/DEEPSEEK_V4_MODELING_NOTES.md` (numeric spec), and the memory file
+`reference/DEEPSEEK_V4_MODELING_NOTES.md` (numeric spec), `GATE_LOG.md` (finding+rationale per gate — explainability), and the memory file
 `~/.claude/projects/-home-patrickd/memory/dspark-v4flash-180b-thor.md`.
 
 ## HIGH-LEVEL OVERVIEW (user, turn ~55) — AGILE RE-SEQUENCE: ship the product first, then improve the head

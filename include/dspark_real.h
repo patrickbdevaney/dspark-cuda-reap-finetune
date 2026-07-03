@@ -15,3 +15,15 @@ void dspark_main_x(float* main_x, const float* main_hidden, const uint8_t* main_
 void dspark_markov(float* logits_bias, float* markov_embed, const int* token_ids,
                    const float* markov_w1, const float* markov_w2, int n, int vocab, int rank,
                    cudaStream_t stream = 0);
+
+// Piece 2: mean-pool one tapped layer state h:[s,hc,d] over hc -> writes into main_hidden[:, slot*d : slot*d+d]
+// (main_hidden is [s, n_taps*d]; call once per tap layer 40/41/42 with slot 0/1/2).
+void dspark_tap_pool(float* main_hidden, const float* h, int s, int hc, int d, int slot, int n_taps,
+                     cudaStream_t stream = 0);
+
+// Piece 3: forward_head. x_block:[s, block, hc, d] (draft block hidden). first_ids:[s] (real token per anchor).
+// hc_head params + norm + shared lm_head (f32) + markov tables. -> output_ids:[s, block+1] greedy proposed block.
+void dspark_forward_head(int* output_ids, const float* x_block, const int* first_ids,
+                         const float* hc_head_fn, const float* hc_head_scale, const float* hc_head_base,
+                         const float* norm, const float* lm_head, const float* markov_w1, const float* markov_w2,
+                         int s, int block, int hc, int d, int vocab, int rank, float eps, cudaStream_t stream = 0);

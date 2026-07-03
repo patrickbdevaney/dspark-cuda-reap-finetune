@@ -64,7 +64,7 @@ positions (one target forward) → target greedy tokens. **Accept the longest ma
 can early-exit. **Block-τ (Gate 2-real) = E[accepted prefix length per target forward]** over a representative
 prompt set. This is the number that anchors decode throughput.
 
-## Build order (tractable → hard)
+## Build order (tractable → hard)   [1,2,3 DONE — compile; 4,5 remain]
 1. `DSparkMarkovHead` kernel (`k_markov`) — small, self-contained. Gate vs a torch golden.
 2. `main_x` = fp8_gemm(main_proj, 3d→d) + rmsnorm(main_norm). Tap-pool kernel in forward.cu (layers 40/41/42).
 3. `forward_head` AR loop (reuse hc_head+rmsnorm+lm_head gemm + markov + sample) — host-orchestrated.

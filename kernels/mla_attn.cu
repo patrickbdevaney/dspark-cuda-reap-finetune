@@ -87,6 +87,21 @@ void rope_interleaved(float* x, const float* cosT, const float* sinT,
     rope_kernel<<<rows, 64, 0, stream>>>(x, cosT, sinT, rows, rope_dim, inverse ? 1 : 0,
                                          row_stride, cos_stride_rows);
 }
+// DEVICE-POS rope (for CUDA-graph capture): cos row = (*d_pos) + row/cos_stride_rows, read from the FULL table.
+// M=1 decode: q rows=N_HEADS,stride=N_HEADS -> crow=pos; kv rows=1,stride=1 -> crow=pos. No pos baked into args.
+__global__ void rope_kernel_dp(float* __restrict__ x, const float* __restrict__ cosT, const float* __restrict__ sinT,
+                               int rows, int rope_dim, int inv, int row_stride, int cos_stride_rows, const int* __restrict__ d_pos){
+    int row=blockIdx.x; if(row>=rows) return; int half=rope_dim/2;
+    float* xr = x + (size_t)row*row_stride; int crow=(*d_pos) + row/cos_stride_rows;
+    const float* c=cosT + (size_t)crow*half; const float* s=sinT + (size_t)crow*half;
+    for(int j=threadIdx.x;j<half;j+=blockDim.x){ float a=xr[2*j], bb=xr[2*j+1]; float sj=inv?-s[j]:s[j], cj=c[j];
+        xr[2*j]=a*cj-bb*sj; xr[2*j+1]=a*sj+bb*cj; }
+}
+void rope_interleaved_dp(float* x, const float* cosT, const float* sinT, int rows, int rope_dim, bool inverse,
+                         int row_stride, int cos_stride_rows, const int* d_pos, cudaStream_t stream){
+    if(row_stride<0) row_stride=rope_dim;
+    rope_kernel_dp<<<rows,64,0,stream>>>(x,cosT,sinT,rows,rope_dim,inverse?1:0,row_stride,cos_stride_rows,d_pos);
+}
 
 // ---------------- rmsnorm ----------------
 __global__ void rmsnorm_kernel(float* __restrict__ y, const float* __restrict__ x,

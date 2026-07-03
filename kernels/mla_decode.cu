@@ -119,3 +119,40 @@ void mla_verify_step(float* out, const float* x, const MLAWeights& w, float* kvc
     dsync(stream);
     dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(didx);
 }
+
+// ================= device-pos sliding decode (CUDA-graph capturable) =================
+__global__ void k_win_idx_dp(int* idx, const int* d_pos){
+    int k=blockIdx.x*blockDim.x+threadIdx.x; if(k>=WINDOW) return; int pos=*d_pos, base=pos-WINDOW+1; if(base<0)base=0;
+    int v=base+k; idx[k]=(v<=pos)? v : -1; }                       // fixed WINDOW slots (pad -1) -> static grid
+__global__ void k_append_at(float* kvcache, const float* scr, const int* d_pos, int hd){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=hd) return; kvcache[(size_t)(*d_pos)*hd + i]=scr[i]; }
+__global__ void k_incr(int* p){ if(threadIdx.x==0&&blockIdx.x==0) (*p)++; }
+void dpos_incr(int* d_pos, cudaStream_t s){ k_incr<<<1,1,0,s>>>(d_pos); }
+
+// M=1 decode fully driven by device *d_pos (no pos baked into args/pointers) -> capturable + replayable.
+void mla_decode_step_dp(float* out, const float* x, const MLAWeights& w, float* kvcache, const int* d_pos, int nkv, cudaStream_t stream){
+    const int Kd=N_HEADS*HEAD_DIM, GKd=Kd/O_GROUPS, OB=O_GROUPS*O_LORA; const float scale=1.f/sqrtf((float)HEAD_DIM);
+    uint8_t *xq,*qrq,*ogq; float *xs,*qrs,*ogs,*qr,*q,*o,*og,*kvs; int* didx;
+    xq=(uint8_t*)dmalloc(DIM); xs=(float*)dmalloc((DIM/128)*4);
+    qr=(float*)dmalloc(Q_LORA*4); qrq=(uint8_t*)dmalloc(Q_LORA); qrs=(float*)dmalloc((Q_LORA/128)*4);
+    q=(float*)dmalloc(Kd*4); o=(float*)dmalloc(Kd*4); og=(float*)dmalloc(OB*4);
+    ogq=(uint8_t*)dmalloc(OB); ogs=(float*)dmalloc((OB/128)*4); kvs=(float*)dmalloc(HEAD_DIM*4); didx=(int*)dmalloc(WINDOW*4);
+    act_quant_fp8(xq,xs,x,1,DIM,128,stream);
+    fp8_block_gemm(qr,xq,xs,w.wq_a,w.wq_a_s,1,Q_LORA,DIM,stream); rmsnorm(qr,qr,w.q_norm,1,Q_LORA,EPS,true,stream);
+    act_quant_fp8(qrq,qrs,qr,1,Q_LORA,128,stream); fp8_block_gemm(q,qrq,qrs,w.wq_b,w.wq_b_s,1,Kd,Q_LORA,stream);
+    rmsnorm(q,q,nullptr,N_HEADS,HEAD_DIM,EPS,false,stream);
+    rope_interleaved_dp(q+NOPE_DIM,w.cosT,w.sinT,N_HEADS,ROPE_DIM,false,HEAD_DIM,N_HEADS,d_pos,stream);
+    // new KV -> scratch -> append at *d_pos
+    fp8_block_gemm(kvs,xq,xs,w.wkv,w.wkv_s,1,HEAD_DIM,DIM,stream); rmsnorm(kvs,kvs,w.kv_norm,1,HEAD_DIM,EPS,true,stream);
+    rope_interleaved_dp(kvs+NOPE_DIM,w.cosT,w.sinT,1,ROPE_DIM,false,HEAD_DIM,1,d_pos,stream);
+    act_quant_fp8sim(kvs,1,NOPE_DIM,64,HEAD_DIM,stream);
+    k_append_at<<<(HEAD_DIM+255)/256,256,0,stream>>>(kvcache,kvs,d_pos,HEAD_DIM);
+    k_win_idx_dp<<<(WINDOW+63)/64,64,0,stream>>>(didx,d_pos);
+    sparse_attn(o,q,kvcache,w.attn_sink,didx,1,1,N_HEADS,HEAD_DIM,nkv,WINDOW,scale,stream);
+    rope_interleaved_dp(o+NOPE_DIM,w.cosT,w.sinT,N_HEADS,ROPE_DIM,true,HEAD_DIM,N_HEADS,d_pos,stream);
+    if(w.wo_a_native) ogroup_gemm_fp8(og,o,w.wo_a_fp8,w.wo_a_sc,1,O_GROUPS,O_LORA,GKd,stream);
+    else              ogroup_gemm    (og,o,w.wo_a,               1,O_GROUPS,O_LORA,GKd,stream);
+    act_quant_fp8(ogq,ogs,og,1,OB,128,stream); fp8_block_gemm(out,ogq,ogs,w.wo_b,w.wo_b_s,1,DIM,OB,stream);
+    dsync(stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(kvs);dfree(didx);
+}

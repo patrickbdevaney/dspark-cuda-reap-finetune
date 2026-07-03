@@ -18,6 +18,9 @@ void sparse_attn(float* o, const float* q, const float* kv, const float* attn_si
 void rope_interleaved(float* x, const float* cosT, const float* sinT,
                       int rows, int rope_dim, bool inverse,
                       int row_stride = -1, int cos_stride_rows = 1, cudaStream_t stream = 0);
+// Device-pos variant (CUDA-graph capturable): cos/sin row = (*d_pos)+row/cos_stride_rows from the full table.
+void rope_interleaved_dp(float* x, const float* cosT, const float* sinT, int rows, int rope_dim, bool inverse,
+                         int row_stride, int cos_stride_rows, const int* d_pos, cudaStream_t stream = 0);
 
 // y[rows,dim] = x * rsqrt(mean(x^2)+eps) * (weight if has_weight). fp32.
 void rmsnorm(float* y, const float* x, const float* weight, int rows, int dim,

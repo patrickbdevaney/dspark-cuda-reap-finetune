@@ -275,3 +275,16 @@ for this) and MoE-atomic near-tie non-determinism rejects valid drafts (determin
 head (~4 accepted) this is ~2× toward the ~50 tok/s target. MEMORY: head = 10.1 GiB → 120.9/122.8 peak (1.9 GiB
 headroom — TIGHT; only run deliberately). The spec-decode MECHANISM is complete and correct; throughput is the
 head-quality + base-speed problem the remaining phases address.
+
+**CUDA graphs — capture MECHANISM proven BIT-EXACT (device-pos decode step).** Built the device-pos
+infrastructure: `rope_interleaved_dp` (cos row = *d_pos + row/stride, no baked offset), `k_append_at` (writes new
+KV to kvcache[*d_pos]), `k_win_idx_dp` (fixed WINDOW=128 idx slots, pad -1 -> static grid), `mla_decode_step_dp`
+(the whole M=1 sliding step driven by a device `d_pos` int — nothing baked into args/pointers). Gate
+`tests/gate_mla_graph.cu`: `cudaStreamBeginCapture` -> `cudaGraphInstantiate` -> replay the graph 12× advancing
+`d_pos` (memcpy the token + pos between launches) == 12 sequential `mla_decode_step` = **cosine 1.0, maxabs 0**.
+Capture succeeds (no illegal ops — the arena removed mid-step malloc, dsync is a no-op, idxs are device-built
+from d_pos). Per-step timing on ONE synthetic layer = 1.01× (single layer is GPU-bound on the slow oracle GEMM;
+launch overhead is a tiny fraction there). The WIN is capturing the full 43-layer real step (thousands of
+launches). REMAINING: device-pos versions of the compressed flavors (same pattern: rope_dp + append_at +
+device-pos comb from d_pos/d_T + occasional host-orchestrated compressor emit updating device T), then capture
+the whole per-token step in decode.cu. Mechanism + correctness are proven; the rest is applying the pattern.

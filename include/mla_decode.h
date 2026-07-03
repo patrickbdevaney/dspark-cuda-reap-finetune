@@ -22,5 +22,7 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
 // at M=K read the weights ONCE for all K tokens (the spec-decode bandwidth win). Appends their KV to
 // kvcache[pos..pos+K-1]; query i attends the sliding window [max(0,pos+i-W+1)..pos+i] (causal among the K +
 // the existing cache). Equivalent to K sequential mla_decode_step calls (gate: tests/gate_mla_verify.cu).
+void mla_decode_step_dp(float* out, const float* x, const MLAWeights& w, float* kvcache, const int* d_pos, int nkv, cudaStream_t stream=0);
+void dpos_incr(int* d_pos, cudaStream_t stream=0);
 void mla_verify_step(float* out, const float* x, const MLAWeights& w, float* kvcache, int pos, int K,
                      cudaStream_t stream = 0);

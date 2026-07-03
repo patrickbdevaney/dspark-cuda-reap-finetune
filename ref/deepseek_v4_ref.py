@@ -252,7 +252,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
-    assert x.dtype == torch.bfloat16
+    assert x.dtype in (torch.bfloat16, torch.float32)   # relaxed for fp32 goldens (harness)
     from fast_hadamard_transform import hadamard_transform
     return hadamard_transform(x, scale=x.size(-1) ** -0.5)
 

@@ -218,10 +218,65 @@ def mla(ckpt, config, layer, seq, out_dir):
     print("   |o_ref|max=%.4f  x%s wq_b%s wo_a%s" % (o.abs().max().item(), tuple(x.shape), tuple(attn.wq_b.weight.shape), tuple(g['wo_a'].shape)))
 
 
+def cmla(ckpt, config, layer, seq, out_dir):
+    """Real-weights golden for a COMPRESSED+indexer MLA layer (ratio-4). fp32; dumps input + all attn +
+    main-compressor + indexer weights + query/compressed freqs so gate_cmla.cu replays compressed_attn_forward."""
+    from safetensors.torch import save_file
+    import raw_loader
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.set_default_dtype(torch.float32); torch.set_default_device(dev)
+    args = build_args(json.load(open(config)))
+    args.max_batch_size = 1; args.max_seq_len = max(256, seq * 2)
+    assert args.compress_ratios[layer] == 4, f"cmla needs a ratio-4 indexer layer (got {args.compress_ratios[layer]})"
+    M.world_size = 1; M.rank = 0
+    M.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+    M.scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
+    M.scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
+    a = M.Attention(layer, args)
+    class Wrap(torch.nn.Module):
+        def __init__(s): super().__init__(); s.layers = torch.nn.ModuleList()
+    w = Wrap()
+    for _ in range(layer): w.layers.append(torch.nn.Module())
+    holder = torch.nn.Module(); holder.attn = a; w.layers.append(holder)
+    raw_loader.load_state_into(w, ckpt, only_prefixes=[f"layers.{layer}.attn."])
+    a.wo_a.weight.data = a.wo_a.weight.data.float()
+    a.indexer.weights_proj.weight.data = a.indexer.weights_proj.weight.data.float()   # bf16 -> fp32 for fp32 path
+
+    torch.manual_seed(1234)
+    x = torch.randn(1, seq, args.dim)
+    o = a(x, 0)                                          # full compressed-path forward
+    mc, idx = a.compressor, a.indexer; ic = idx.compressor
+    def u8(p): return p.detach().view(torch.uint8).contiguous().cpu()
+    def ff(p): return p.detach().float().contiguous().cpu()
+    fq = a.freqs_cis[:seq]; fc = a.freqs_cis[:seq:args.compress_ratios[layer]]
+    g = {
+        "x": ff(x[0]), "o_ref": ff(o[0]),
+        "wq_a": u8(a.wq_a.weight), "wq_a_s": ff(a.wq_a.scale), "wq_b": u8(a.wq_b.weight), "wq_b_s": ff(a.wq_b.scale),
+        "wkv": u8(a.wkv.weight), "wkv_s": ff(a.wkv.scale), "wo_b": u8(a.wo_b.weight), "wo_b_s": ff(a.wo_b.scale),
+        "q_norm": ff(a.q_norm.weight), "kv_norm": ff(a.kv_norm.weight),
+        "wo_a": ff(a.wo_a.weight.view(args.o_groups, args.o_lora_rank, -1)), "attn_sink": ff(a.attn_sink),
+        "cos": torch.view_as_real(fq)[..., 0].contiguous().cpu(), "sin": torch.view_as_real(fq)[..., 1].contiguous().cpu(),
+        "cc_cos": torch.view_as_real(fc)[..., 0].contiguous().cpu(), "cc_sin": torch.view_as_real(fc)[..., 1].contiguous().cpu(),
+        "mc_wkv": ff(mc.wkv.weight), "mc_wgate": ff(mc.wgate.weight), "mc_ape": ff(mc.ape), "mc_norm": ff(mc.norm.weight),
+        "idx_wq_b": u8(idx.wq_b.weight), "idx_wq_b_s": ff(idx.wq_b.scale), "idx_weights_proj": ff(idx.weights_proj.weight),
+        "idx_c_wkv": ff(ic.wkv.weight), "idx_c_wgate": ff(ic.wgate.weight), "idx_c_ape": ff(ic.ape), "idx_c_norm": ff(ic.norm.weight),
+        "dims": torch.tensor([seq, args.dim, args.q_lora_rank, args.window_size, args.compress_ratios[layer],
+                              args.index_n_heads, args.index_head_dim, args.index_topk], dtype=torch.int32),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"cmla_layer{layer}_seq{seq}.safetensors")
+    save_file({k: v.contiguous() for k, v in g.items()}, path)
+    print(f"[cmla] layer={layer} seq={seq} wrote {path} ({os.path.getsize(path)/1e9:.3f} GB)  |o|max={o.abs().max():.4f}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
     sub.add_parser("smoke")
+    cm = sub.add_parser("cmla")
+    cm.add_argument("--ckpt", required=True); cm.add_argument("--config", required=True)
+    cm.add_argument("--layer", type=int, default=2); cm.add_argument("--seq", type=int, default=16)
+    cm.add_argument("--out", default="goldens")
     b = sub.add_parser("block")
     b.add_argument("--ckpt", required=True); b.add_argument("--config", required=True)
     b.add_argument("--layer", type=int, default=2); b.add_argument("--seq", type=int, default=32)
@@ -233,4 +288,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.mode == "smoke": smoke()
     elif a.mode == "block": block(a.ckpt, a.config, a.layer, a.seq, a.out)
+    elif a.mode == "cmla": cmla(a.ckpt, a.config, a.layer, a.seq, a.out)
     else: mla(a.ckpt, a.config, a.layer, a.seq, a.out)

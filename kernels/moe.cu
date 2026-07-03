@@ -132,6 +132,21 @@ __global__ void swiglu_kernel(float* h, const float* g, const float* u, int n, f
 __global__ void accum_kernel(float* y, const float* v, int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) y[i]+=v[i];
 }
+// --- batched/grouped-dispatch helpers ---
+__global__ void k_gather_x(float* Xe, const float* x, const int* tok, int me, int dim){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)me*dim) return; int r=i/dim, c=i%dim;
+    Xe[i]=x[(long)tok[r]*dim+c];
+}
+__global__ void k_scatter_add(float* out, const float* OE, const int* tok, int me, int dim){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)me*dim) return; int r=i/dim, c=i%dim;
+    atomicAdd(&out[(long)tok[r]*dim+c], OE[i]);
+}
+// swiglu with per-row (per-token) routing weight; gate+up already share the quantized input tile.
+__global__ void swiglu_wrow(float* h, const float* g, const float* u, const float* wrow, int me, int inter, float lim){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)me*inter) return; int r=i/inter;
+    float gg=g[i], uu=u[i]; if(lim>0.f){ gg=fminf(gg,lim); uu=fminf(fmaxf(uu,-lim),lim); }
+    h[i]= wrow[r] * (gg/(1.f+expf(-gg))) * uu;
+}
 
 void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeights& w, int bs, cudaStream_t stream){
     const int dim=w.dim, inter=w.inter, nr=w.n_routed, na=w.n_act;
@@ -156,6 +171,43 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
 
     size_t w13n=(size_t)inter*(dim/2), w13s=(size_t)inter*(dim/32);
     size_t w2n=(size_t)dim*(inter/2),  w2s=(size_t)dim*(inter/32);
+    auto GEMM = w.use_tc ? tc_fp4_gemm : fp4_gemm;
+    if(w.batched){
+        // group tokens by expert -> one GEMM per expert at M=count (amortize weight loads); shared expert M=bs.
+        std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);
+        for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
+        float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb,*wrow; uint8_t *Xeq,*Hqb; int *tok_d;
+        CU(cudaMalloc(&Xe,(size_t)bs*dim*4)); CU(cudaMalloc(&Xeq,(size_t)bs*dim)); CU(cudaMalloc(&Xes2,(size_t)bs*(dim/128)*4));
+        CU(cudaMalloc(&Gb,(size_t)bs*inter*4)); CU(cudaMalloc(&Ub,(size_t)bs*inter*4)); CU(cudaMalloc(&Hb,(size_t)bs*inter*4));
+        CU(cudaMalloc(&Hqb,(size_t)bs*inter)); CU(cudaMalloc(&Hsb,(size_t)bs*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)bs*dim*4));
+        CU(cudaMalloc(&wrow,(size_t)bs*4)); CU(cudaMalloc(&tok_d,(size_t)bs*4));
+        for(int e=0;e<nr;++e){ int me=etok[e].size(); if(!me) continue;
+            CU(cudaMemcpyAsync(tok_d,etok[e].data(),(size_t)me*4,cudaMemcpyHostToDevice,stream));
+            CU(cudaMemcpyAsync(wrow,ewt[e].data(),(size_t)me*4,cudaMemcpyHostToDevice,stream));
+            const uint8_t *W1=w.w1p?w.w1p[e]:w.w1+(size_t)e*w13n, *W3=w.w3p?w.w3p[e]:w.w3+(size_t)e*w13n, *W2=w.w2p?w.w2p[e]:w.w2+(size_t)e*w2n;
+            const float *W1s=w.w1sp?w.w1sp[e]:w.w1s+(size_t)e*w13s, *W3s=w.w3sp?w.w3sp[e]:w.w3s+(size_t)e*w13s, *W2s=w.w2sp?w.w2sp[e]:w.w2s+(size_t)e*w2s;
+            k_gather_x<<<((size_t)me*dim+255)/256,256,0,stream>>>(Xe,x,tok_d,me,dim);
+            act_quant_fp8(Xeq,Xes2,Xe,me,dim,128,stream);
+            GEMM(Gb,Xeq,Xes2, W1,W1s, me,inter,dim,stream);   // gate+up share the quantized input tile Xeq
+            GEMM(Ub,Xeq,Xes2, W3,W3s, me,inter,dim,stream);
+            swiglu_wrow<<<((size_t)me*inter+255)/256,256,0,stream>>>(Hb,Gb,Ub,wrow,me,inter,w.swiglu_limit);
+            act_quant_fp8(Hqb,Hsb,Hb,me,inter,128,stream);
+            GEMM(OEb,Hqb,Hsb, W2,W2s, me,dim,inter,stream);
+            k_scatter_add<<<((size_t)me*dim+255)/256,256,0,stream>>>(out,OEb,tok_d,me,dim);
+        }
+        // shared expert, all bs tokens (fp8, weight 1)
+        act_quant_fp8(Xeq,Xes2,x,bs,dim,128,stream);
+        fp8_block_gemm(Gb,Xeq,Xes2, w.sw1,w.sw1s, bs,inter,dim,stream);
+        fp8_block_gemm(Ub,Xeq,Xes2, w.sw3,w.sw3s, bs,inter,dim,stream);
+        swiglu_kernel<<<((size_t)bs*inter+63)/64,64,0,stream>>>(Hb,Gb,Ub,bs*inter,w.swiglu_limit,1.f);
+        act_quant_fp8(Hqb,Hsb,Hb,bs,inter,128,stream);
+        fp8_block_gemm(OEb,Hqb,Hsb, w.sw2,w.sw2s, bs,dim,inter,stream);
+        accum_kernel<<<((size_t)bs*dim+63)/64,64,0,stream>>>(out,OEb,bs*dim);
+        CU(cudaStreamSynchronize(stream));
+        cudaFree(Xe);cudaFree(Xeq);cudaFree(Xes2);cudaFree(Gb);cudaFree(Ub);cudaFree(Hb);cudaFree(Hqb);cudaFree(Hsb);cudaFree(OEb);cudaFree(wrow);cudaFree(tok_d);
+        cudaFree(sc);cudaFree(wt);cudaFree(idx);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);cudaFree(h);cudaFree(hq);cudaFree(hs);cudaFree(oe);
+        return;
+    }
     for(int t=0;t<bs;++t){
         const float* xr=x+(size_t)t*dim;
         // routed experts (fp4)
@@ -167,7 +219,6 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
             const float *W1s = w.w1sp? w.w1sp[e] : w.w1s+(size_t)e*w13s, *W3s = w.w3sp? w.w3sp[e] : w.w3s+(size_t)e*w13s,
                         *W2s = w.w2sp? w.w2sp[e] : w.w2s+(size_t)e*w2s;
             act_quant_fp8(xq,xs,xr,1,dim,128,stream);
-            auto GEMM = w.use_tc ? tc_fp4_gemm : fp4_gemm;   // TC Marlin (~3x, cosine 1.0) or bit-exact oracle
             GEMM(g,xq,xs, W1, W1s, 1,inter,dim,stream);
             GEMM(u,xq,xs, W3, W3s, 1,inter,dim,stream);
             swiglu_kernel<<<(inter+63)/64,64,0,stream>>>(h,g,u,inter,w.swiglu_limit,wgt);

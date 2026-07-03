@@ -97,3 +97,17 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 
 ## REVISED GRIND ORDER (bandwidth-first): batch loads (1) → fuse gate+up (2) → native-dtype no-dequant (3) →
 ## W4A8 grouped GEMM single-launch (4) → CUDA graphs (5) → MLA dequant-cut crossover (6). Each A/B'd + logged.
+
+## Grind round #2 (batch MoE + fuse gate+up) — IN PROGRESS, gate caught a bug
+- **gate+up input-share: DONE** — the routed w1/w3 GEMMs share the single quantized input tile `Xeq` (act_quant
+  once, feed both). (Full register-fusion of g,u+swiglu into one kernel = further follow-up.)
+- **Batched/grouped dispatch: IMPLEMENTED behind `MoEWeights.batched`** (moe.cu): group tokens by expert
+  (host, from hidx) → gather → one GEMM per expert at M=count → swiglu_wrow(per-token weight) → scatter_add;
+  shared expert at M=bs. Per-token oracle kept as `else` branch (default, still **bit-exact max_rel 0.0**).
+- **STATUS: batched FAILS its gate — and the failure is NON-DETERMINISTIC** (cosine 0.649 one run, -0.197 next
+  run, same code). Non-determinism ⇒ **uninitialized-device-memory read or a race**, NOT atomicAdd reorder.
+  Gate K stays GREEN on the oracle; `batched` is NOT enabled anywhere. DEBUG next:
+  (1) cudaMemcpyAsync of host std::vector (etok/ewt) is PAGEABLE→async — may race the gather reading tok_d/wrow;
+      try pinned host buffers or a sync, OR stage tok/wrow once. (2) run compute-sanitizer on the batched path.
+  (3) check every batched scratch buffer is fully written before read for the me<bs rows.
+  The oracle is safe; this is a contained WIP. Do not enable `batched` until its gate PASSES (cosine>0.9999).

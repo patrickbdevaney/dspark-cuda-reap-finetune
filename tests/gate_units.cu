@@ -205,6 +205,15 @@ static bool gate_moe(const std::string& dir) {
     std::vector<float> y((size_t)n*dim); CU(cudaMemcpy(y.data(),out,y.size()*4,cudaMemcpyDeviceToHost));
     const float* yref=f32(S.get("y_ref")); double mx=0; for(size_t i=0;i<y.size();++i) mx=fmax(mx,fabs((double)yref[i]));
     Err e=compare(y,yref,y.size(),mx); bool ok=e.max_rel<2e-2;
+    // batched/grouped dispatch vs per-token oracle (scatter atomicAdd reorders -> cosine, not bit-exact)
+    w.batched=true; float* out2; CU(cudaMalloc(&out2,(size_t)n*dim*4));
+    moe_forward(out2, x, nullptr, w, n); CU(cudaDeviceSynchronize());
+    std::vector<float> y2((size_t)n*dim); CU(cudaMemcpy(y2.data(),out2,y2.size()*4,cudaMemcpyDeviceToHost));
+    double dt=0,n1=0,n2=0; for(size_t i=0;i<y.size();++i){dt+=y[i]*y2[i];n1+=y[i]*y[i];n2+=y2[i]*y2[i];}
+    double cosb=dt/(sqrt(n1)*sqrt(n2)+1e-30);
+    // INFORMATIONAL (not gating Gate K): batched dispatch is WIP — gate caught a correctness bug (cosine<1).
+    // Per-token oracle (above) stays bit-exact and is the default. Do NOT enable MoEWeights.batched until this PASSES.
+    printf("[moe batched WIP] cosine vs per-token oracle=%.7f -> %s (informational; not enabled)\n", cosb, cosb>0.9999?"PASS":"FAIL(WIP)");
     printf("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
            n,dim,inter,nr,na,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
     return ok;

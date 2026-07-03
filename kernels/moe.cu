@@ -148,6 +148,18 @@ __global__ void swiglu_wrow(float* h, const float* g, const float* u, const floa
     h[i]= wrow[r] * (gg/(1.f+expf(-gg))) * uu;
 }
 
+// device-side MoE grouping (Step 1 -> CUDA graphs): counting-sort tokens by expert on the GPU (no host vector
+// work / big copies). Within-expert order is nondeterministic (atomic) but each token's expert output is scattered
+// back independently, so the final result is order-invariant -> gates cosine 1.0 vs the host grouping.
+__global__ void k_moe_count(int* counts, const int* idx, int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) atomicAdd(&counts[idx[i]],1); }
+__global__ void k_moe_prefix(int* off, const int* counts, int nr){   // nr<=~160: single-thread exclusive scan
+    if(threadIdx.x||blockIdx.x) return; off[0]=0; for(int e=0;e<nr;++e) off[e+1]=off[e]+counts[e]; }
+__global__ void k_moe_scatter(int* alltok, float* allwt, int* cursor, const int* idx, const float* wt,
+                              const int* off, int bs, int na){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=bs*na) return; int t=i/na, e=idx[i];
+    int pos=atomicAdd(&cursor[e],1); alltok[off[e]+pos]=t; allwt[off[e]+pos]=wt[i]; }
+
 void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeights& w, int bs, cudaStream_t stream){
     const int dim=w.dim, inter=w.inter, nr=w.n_routed, na=w.n_act;
     float *sc,*wt,*g,*u,*h,*hs,*xs,*oe; uint8_t *xq,*hq; int *idx;
@@ -164,36 +176,48 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
     } else {
         router_topk_kernel<<<bs,32,nr*sizeof(float),stream>>>(wt,idx,sc,w.gate_bias,bs,nr,na,w.route_scale);
     }
-    std::vector<int> hidx((size_t)bs*na); std::vector<float> hw((size_t)bs*na);
-    CU(cudaStreamSynchronize(stream));
-    CU(cudaMemcpy(hidx.data(),idx,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
-    CU(cudaMemcpy(hw.data(),wt,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
+    std::vector<int> hidx; std::vector<float> hw;
+    if(!(w.batched && w.device_route)){                       // device_route does the grouping on-GPU (no host copy)
+        hidx.resize((size_t)bs*na); hw.resize((size_t)bs*na);
+        CU(cudaStreamSynchronize(stream));
+        CU(cudaMemcpy(hidx.data(),idx,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(hw.data(),wt,(size_t)bs*na*4,cudaMemcpyDeviceToHost));
+    }
 
     size_t w13n=(size_t)inter*(dim/2), w13s=(size_t)inter*(dim/32);
     size_t w2n=(size_t)dim*(inter/2),  w2s=(size_t)dim*(inter/32);
     void tc_fp4_gemm_pp_auto(float*, const uint8_t*, const float*, const uint8_t*, const float*, int,int,int, cudaStream_t);
     auto GEMM = w.use_tc_pp ? tc_fp4_gemm_pp_auto : (w.use_tc ? tc_fp4_gemm : fp4_gemm);
     if(w.batched){
-        // group tokens by expert -> one GEMM per expert at M=count (amortize weight loads); shared expert M=bs.
-        std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);
-        for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
-        if(getenv("MDBG")){ int tt=0,ne=0; for(int e=0;e<nr;++e){tt+=etok[e].size(); ne+=!etok[e].empty();} fprintf(stderr,"[batched] bs=%d na=%d nr=%d grouped=%d nonempty=%d\n",bs,na,nr,tt,ne,bs*na);
-            for(int e=0;e<nr;++e){ if(etok[e].empty()) continue; fprintf(stderr,"  e%d me=%zu tok=",e,etok[e].size()); for(int t:etok[e]) fprintf(stderr,"%d,",t); fprintf(stderr,"\n"); } }
-        // Scratch must hold the LARGEST per-expert group. A token can route to the same expert in multiple of
-        // its na slots (esp. hash layers), so me can exceed bs — up to bs*na total assignments. Size for bs*na.
-        // (compute-sanitizer caught k_gather_x writing past bs*dim when me>bs; moe.cu:138.)
+        // Scratch must hold the LARGEST per-expert group: a token can route to the same expert in multiple na
+        // slots (esp. hash layers), so me can exceed bs — up to bs*na total assignments. Size for bs*na.
         const int maxm = bs*na;
         float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb; uint8_t *Xeq,*Hqb;
         CU(cudaMalloc(&Xe,(size_t)maxm*dim*4)); CU(cudaMalloc(&Xeq,(size_t)maxm*dim)); CU(cudaMalloc(&Xes2,(size_t)maxm*(dim/128)*4));
         CU(cudaMalloc(&Gb,(size_t)maxm*inter*4)); CU(cudaMalloc(&Ub,(size_t)maxm*inter*4)); CU(cudaMalloc(&Hb,(size_t)maxm*inter*4));
         CU(cudaMalloc(&Hqb,(size_t)maxm*inter)); CU(cudaMalloc(&Hsb,(size_t)maxm*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)maxm*dim*4));
-        // upload ALL tokens/weights once as flat arrays + per-expert offsets (robust; reused per-expert copy failed)
-        std::vector<int> alltok; std::vector<float> allwt; std::vector<int> off(nr+1,0);
-        for(int e=0;e<nr;++e){ for(int t:etok[e]) alltok.push_back(t); for(float w:ewt[e]) allwt.push_back(w); off[e+1]=alltok.size(); }
-        int* alltok_d; float* allwt_d;
-        CU(cudaMalloc(&alltok_d,(size_t)alltok.size()*4)); CU(cudaMalloc(&allwt_d,(size_t)allwt.size()*4));
-        CU(cudaMemcpy(alltok_d,alltok.data(),(size_t)alltok.size()*4,cudaMemcpyHostToDevice));
-        CU(cudaMemcpy(allwt_d,allwt.data(),(size_t)allwt.size()*4,cudaMemcpyHostToDevice));
+        std::vector<int> off(nr+1,0); int* alltok_d; float* allwt_d;
+        if(w.device_route){
+            // DEVICE grouping: counting-sort on GPU (no host vector build / big idx-wt-alltok copies).
+            int *counts,*off_d,*cursor;
+            CU(cudaMalloc(&counts,nr*4)); CU(cudaMalloc(&off_d,(nr+1)*4)); CU(cudaMalloc(&cursor,nr*4));
+            CU(cudaMalloc(&alltok_d,(size_t)maxm*4)); CU(cudaMalloc(&allwt_d,(size_t)maxm*4));
+            CU(cudaMemsetAsync(counts,0,nr*4,stream)); CU(cudaMemsetAsync(cursor,0,nr*4,stream));
+            k_moe_count<<<(bs*na+63)/64,64,0,stream>>>(counts,idx,bs*na);
+            k_moe_prefix<<<1,1,0,stream>>>(off_d,counts,nr);
+            k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,cursor,idx,wt,off_d,bs,na);
+            CU(cudaMemcpy(off.data(),off_d,(nr+1)*4,cudaMemcpyDeviceToHost));   // small sync (grid sizes); zero-sync = Step 1b
+            cudaFree(counts); cudaFree(off_d); cudaFree(cursor);
+        } else {
+            // HOST grouping (oracle): build per-expert lists on host, upload flat arrays + offsets.
+            std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);
+            for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
+            std::vector<int> alltok; std::vector<float> allwt;
+            for(int e=0;e<nr;++e){ for(int t:etok[e]) alltok.push_back(t); for(float wv:ewt[e]) allwt.push_back(wv); off[e+1]=alltok.size(); }
+            CU(cudaMalloc(&alltok_d,(size_t)alltok.size()*4)); CU(cudaMalloc(&allwt_d,(size_t)allwt.size()*4));
+            CU(cudaMemcpy(alltok_d,alltok.data(),(size_t)alltok.size()*4,cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(allwt_d,allwt.data(),(size_t)allwt.size()*4,cudaMemcpyHostToDevice));
+        }
         for(int e=0;e<nr;++e){ int me=off[e+1]-off[e]; if(!me) continue;
             const int* tok_d = alltok_d+off[e]; const float* wrow = allwt_d+off[e];
             const uint8_t *W1=w.w1p?w.w1p[e]:w.w1+(size_t)e*w13n, *W3=w.w3p?w.w3p[e]:w.w3+(size_t)e*w13n, *W2=w.w2p?w.w2p[e]:w.w2+(size_t)e*w2n;

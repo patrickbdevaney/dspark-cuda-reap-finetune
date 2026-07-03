@@ -228,6 +228,14 @@ static bool gate_moe(const std::string& dir) {
     // INFORMATIONAL (not gating Gate K): batched dispatch is WIP — gate caught a correctness bug (cosine<1).
     // Per-token oracle (above) stays bit-exact and is the default. Do NOT enable MoEWeights.batched until this PASSES.
     bool okb=cosb>0.9999; printf("[moe batched] cosine vs per-token oracle=%.7f -> %s\n", cosb, okb?"PASS":"FAIL"); ok=ok&&okb;
+    // device-side grouping (Step 1 -> graphs): GPU counting-sort, order-invariant -> cosine 1.0 vs oracle
+    w.device_route=true; float* outd; CU(cudaMalloc(&outd,(size_t)n*dim*4));
+    moe_forward(outd, x, nullptr, w, n); CU(cudaDeviceSynchronize());
+    std::vector<float> yd((size_t)n*dim); CU(cudaMemcpy(yd.data(),outd,yd.size()*4,cudaMemcpyDeviceToHost));
+    double dd=0,nd1=0,nd2=0; for(size_t i=0;i<y.size();++i){dd+=(double)y[i]*yd[i];nd1+=(double)y[i]*y[i];nd2+=(double)yd[i]*yd[i];}
+    double cosd=dd/(sqrt(nd1)*sqrt(nd2)+1e-30); bool okd=cosd>0.9999; ok=ok&&okd;
+    printf("[moe device_route] cosine vs per-token oracle=%.7f -> %s\n", cosd, okd?"PASS":"FAIL");
+    w.device_route=false; cudaFree(outd);
     // compounded fast path: batched dispatch + TC GEMM (use_tc) — the real decode win. cosine (batched reorder + fp16-act).
     w.use_tc=true; float* out3; CU(cudaMalloc(&out3,(size_t)n*dim*4));
     moe_forward(out3, x, nullptr, w, n); CU(cudaDeviceSynchronize());

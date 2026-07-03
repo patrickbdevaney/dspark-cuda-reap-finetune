@@ -24,6 +24,16 @@ __global__ void k_topk_decode(int* out, const float* score, int T, int topk, int
         out[k] = (bi<0)? -1 : bi+offset; }
 }
 __global__ void k_iw_scale(float* y, float sc, int n){ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) y[i]*=sc; }
+// device verify top-k (per query, global causal threshold) + combined-idx build -> removes the host D2H sync.
+__global__ void k_topk_verify(int* dtop, const float* score, int K, int Tf, int topkc, int pos, int ratio, int nwin){
+    int i=blockIdx.x; if(i>=K||threadIdx.x) return; extern __shared__ float sh[]; const float* s=score+(size_t)i*Tf;
+    for(int t=0;t<Tf;++t) sh[t]=s[t]; int thr=(pos+i+1)/ratio;
+    for(int k=0;k<topkc;++k){ float best=-1e30f;int bi=-1; for(int t=0;t<thr&&t<Tf;++t) if(sh[t]>best){best=sh[t];bi=t;}
+        if(bi>=0){ sh[bi]=-1e30f; dtop[(size_t)i*topkc+k]=nwin+bi; } else dtop[(size_t)i*topkc+k]=-1; } }
+__global__ void k_comb_verify(int* dcomb, const int* dtop, int K, int topk, int wmax, int topkc, int pos){
+    int gid=blockIdx.x*blockDim.x+threadIdx.x; if(gid>=K*topk) return; int i=gid/topk, k=gid%topk;
+    int ig=pos+i, base=ig-WINDOW+1; if(base<0)base=0; int wid=ig+1-base;
+    if(k<wmax) dcomb[gid]=(k<wid)? base+k : -1; else dcomb[gid]=dtop[(size_t)i*topkc+(k-wmax)]; }
 
 // ---- prefill: fill window-KV + compressed-KV caches ----
 void compressed_attn_cache(float* win_kv, float* comp_kv, int* T, const float* x,
@@ -307,22 +317,14 @@ void compressed_verify_step_indexer(float* out, const float* x_full, int pos, in
     // per-query top-k with GLOBAL causal threshold (t < (pos+i+1)/ratio), offset nwin
     int topkc = (w.index_topk<Tf)?w.index_topk:Tf;
     int* dtop; dtop=(int*)dmalloc((size_t)K*topkc*4);
-    // build on host from iscore
-    std::vector<float> hsc((size_t)K*Tf); CU(cudaMemcpyAsync(hsc.data(),iscore,(size_t)K*Tf*4,cudaMemcpyDeviceToHost,stream)); dsync(stream);
-    std::vector<int> htop((size_t)K*topkc,-1);
-    for(int i=0;i<K;++i){ int ig=pos+i,thr=(ig+1)/ratio; std::vector<float> s(hsc.begin()+(size_t)i*Tf,hsc.begin()+(size_t)i*Tf+Tf);
-        for(int k=0;k<topkc;++k){ float best=-1e30f;int bi=-1; for(int t=0;t<thr&&t<Tf;++t) if(s[t]>best){best=s[t];bi=t;} if(bi>=0){s[bi]=-1e30f; htop[(size_t)i*topkc+k]=nwin+bi;} } }
-    CU(cudaMemcpyAsync(dtop,htop.data(),(size_t)K*topkc*4,cudaMemcpyHostToDevice,stream));
-    // kv_all + combined idxs (window ⊕ indexer-selected compressed)
+    k_topk_verify<<<K,32,(size_t)Tf*4,stream>>>(dtop, iscore, K, Tf, topkc, pos, ratio, nwin);   // device top-k (no D2H sync)
     int ntot=nwin+Tf; float* kv_all; kv_all=(float*)dmalloc((size_t)ntot*HEAD_DIM*4);
     CU(cudaMemcpyAsync(kv_all,win_kv,(size_t)nwin*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
     CU(cudaMemcpyAsync(kv_all+(size_t)nwin*HEAD_DIM,comp_kv,(size_t)Tf*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
     int wmax=0; for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;if(wid>wmax)wmax=wid;}
-    int topk=wmax+topkc; std::vector<int> comb((size_t)K*topk,-1);
-    for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;
-        for(int k=0;k<wid;++k) comb[(size_t)i*topk+k]=b+k;
-        for(int t=0;t<topkc;++t) comb[(size_t)i*topk+wmax+t]=htop[(size_t)i*topkc+t]; }
-    int* dcomb; dcomb=(int*)dmalloc((size_t)K*topk*4); CU(cudaMemcpyAsync(dcomb,comb.data(),(size_t)K*topk*4,cudaMemcpyHostToDevice,stream));
+    int topk=wmax+topkc;
+    int* dcomb; dcomb=(int*)dmalloc((size_t)K*topk*4);
+    k_comb_verify<<<((size_t)K*topk+63)/64,64,0,stream>>>(dcomb, dtop, K, topk, wmax, topkc, pos);
     finish_attn(w, q, kv_all, dcomb, K, pos, ntot, topk, out, eps, stream);
     dsync(stream);
     dfree(q);dfree(xq2);dfree(xs2);dfree(qr2);dfree(iqrq);dfree(iqrs);dfree(qidx);dfree(qtmp);dfree(iw);dfree(iscore);dfree(dtop);dfree(kv_all);dfree(dcomb);

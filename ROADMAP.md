@@ -19,7 +19,7 @@ artifact — nothing disposable.**
 **The full DeepSeek-V4-180B-REAP forward RUNS on Thor** (`src/forward.cu`, `build/forward`, `scripts/build_forward.sh`).
 s=8 prefill: all 43 layers, memory FLAT 120.5/122.8 GiB, finite sane logits (argmax=1822 logit=16.4),
 5494 ms (687 ms/tok, unoptimized). OOM fixed by per-layer dequant scoping (`Loader::mark/release`).
-NOTE: mem tight partly due to **RustDesk GUI overhead — run headless via SSH+tmux** to reclaim ~15-20 GiB.
+MEMORY: after `fadvise(DONTNEED)` fix (weight_store.h) = **107.6/122.8 GiB, ~15 GiB headroom** (page cache was the inflator, NOT the GUI; KV is <0.1GiB by MLA+SWA+DSA design). See MEMORY.md. Correctness: prompt 'The capital of France is' -> ' Paris' (Gate 1.5 PASS).
 RUN: `./build/forward /home/patrickd/models/DeepSeek-V4-Flash-180B <s>`.
 
 **NEXT (recursion):**

@@ -51,7 +51,7 @@ weights. (The exact opposite of a dense-MHA model, where KV would dominate.)
    counts page cache. After `fadvise`, the two converge.
 
 ## Action checklist
-- [x] `posix_fadvise(DONTNEED)` after shard load (weight_store.h).
+- [x] `posix_fadvise(DONTNEED)` after shard load (weight_store.h). **CONFIRMED: 120.7 -> 107.6 GiB used, ~15 GiB headroom.**
 - [ ] Run headless (SSH+tmux); stop GNOME/RustDesk during long runs.
 - [ ] (Phase E) native-dtype kernels: e8m0-in-kernel scales, fp8 `ogroup_gemm`, bf16 lm_head → drop fp32 dequant.
 - [ ] (Training) enforce cache-once-to-disk; never co-resident with the 96 GB target.

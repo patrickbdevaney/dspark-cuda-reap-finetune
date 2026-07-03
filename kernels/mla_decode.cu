@@ -14,6 +14,12 @@ using namespace dsv4;
 __global__ void k_win_idx(int* idx, int base, int width){
     int k = blockIdx.x*blockDim.x + threadIdx.x; if(k>=width) return; idx[k] = base + k;
 }
+// M=K window idxs: query i (global pos+i) attends [max(0,pos+i-W+1) .. pos+i]; pad -1 up to `topk`.
+__global__ void k_verify_win_idx(int* idx, int pos, int K, int topk){
+    int gid=blockIdx.x*blockDim.x+threadIdx.x; if(gid>=K*topk) return; int i=gid/topk, k=gid%topk;
+    int ig=pos+i, base=ig-WINDOW+1; if(base<0) base=0; int v=base+k;
+    idx[gid] = (v<=ig)? v : -1;
+}
 
 // ---- prefill: fill window-KV cache for x[0..s-1] (identical to mla_forward's internal kv) ----
 void mla_cache_kv(float* kvcache, const float* x, const MLAWeights& w, int s, cudaStream_t stream){
@@ -73,4 +79,43 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
     dsync(stream);
     dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);
     dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(didx);
+}
+
+// ---- M=K verify step: K tokens at [pos..pos+K-1], GEMMs at M=K (weights read ONCE) ----
+void mla_verify_step(float* out, const float* x, const MLAWeights& w, float* kvcache, int pos, int K, cudaStream_t stream){
+    const int half = ROPE_DIM/2, Kd = N_HEADS*HEAD_DIM, GKd = Kd/O_GROUPS, OB = O_GROUPS*O_LORA;
+    const float scale = 1.f/sqrtf((float)HEAD_DIM);
+    const float *cosP = w.cosT + (size_t)pos*half, *sinP = w.sinT + (size_t)pos*half;   // per-token rows from pos
+
+    uint8_t *xq,*qrq,*ogq; float *xs,*qrs,*ogs,*qr,*q,*o,*og;
+    xq=(uint8_t*)dmalloc((size_t)K*DIM); xs=(float*)dmalloc((size_t)K*(DIM/128)*4);
+    qr=(float*)dmalloc((size_t)K*Q_LORA*4); qrq=(uint8_t*)dmalloc((size_t)K*Q_LORA); qrs=(float*)dmalloc((size_t)K*(Q_LORA/128)*4);
+    q=(float*)dmalloc((size_t)K*Kd*4); o=(float*)dmalloc((size_t)K*Kd*4); og=(float*)dmalloc((size_t)K*OB*4);
+    ogq=(uint8_t*)dmalloc((size_t)K*OB); ogs=(float*)dmalloc((size_t)K*(OB/128)*4);
+
+    act_quant_fp8(xq, xs, x, K, DIM, 128, stream);
+    fp8_block_gemm(qr, xq, xs, w.wq_a, w.wq_a_s, K, Q_LORA, DIM, stream);
+    rmsnorm(qr, qr, w.q_norm, K, Q_LORA, EPS, true, stream);
+    act_quant_fp8(qrq, qrs, qr, K, Q_LORA, 128, stream);
+    fp8_block_gemm(q, qrq, qrs, w.wq_b, w.wq_b_s, K, Kd, Q_LORA, stream);
+    rmsnorm(q, q, nullptr, K*N_HEADS, HEAD_DIM, EPS, false, stream);
+    rope_interleaved(q + NOPE_DIM, cosP, sinP, K*N_HEADS, ROPE_DIM, false, HEAD_DIM, N_HEADS, stream);  // row t*N_HEADS+h -> cos row t
+    // new tokens' KV -> cache[pos..pos+K-1]
+    float* kvn = kvcache + (size_t)pos*HEAD_DIM;
+    fp8_block_gemm(kvn, xq, xs, w.wkv, w.wkv_s, K, HEAD_DIM, DIM, stream);
+    rmsnorm(kvn, kvn, w.kv_norm, K, HEAD_DIM, EPS, true, stream);
+    rope_interleaved(kvn + NOPE_DIM, cosP, sinP, K, ROPE_DIM, false, HEAD_DIM, 1, stream);
+    act_quant_fp8sim(kvn, K, NOPE_DIM, 64, HEAD_DIM, stream);
+    // per-query window idxs
+    int ncache = pos + K; int topk = (ncache < WINDOW) ? ncache : WINDOW;
+    int* didx; didx=(int*)dmalloc((size_t)K*topk*4);
+    k_verify_win_idx<<<((size_t)K*topk+63)/64,64,0,stream>>>(didx, pos, K, topk);
+    sparse_attn(o, q, kvcache, w.attn_sink, didx, 1, K, N_HEADS, HEAD_DIM, ncache, topk, scale, stream);
+    rope_interleaved(o + NOPE_DIM, cosP, sinP, K*N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
+    if(w.wo_a_native) ogroup_gemm_fp8(og, o, w.wo_a_fp8, w.wo_a_sc, K, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, w.wo_a,                K, O_GROUPS, O_LORA, GKd, stream);
+    act_quant_fp8(ogq, ogs, og, K, OB, 128, stream);
+    fp8_block_gemm(out, ogq, ogs, w.wo_b, w.wo_b_s, K, DIM, OB, stream);
+    dsync(stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(didx);
 }

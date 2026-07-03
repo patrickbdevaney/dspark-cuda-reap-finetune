@@ -17,3 +17,10 @@ void mla_cache_kv(float* kvcache, const float* x, const MLAWeights& w, int s, cu
 // kvcache must already hold rows [0..pos-1] (from mla_cache_kv + prior decode steps).
 void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvcache, int pos,
                      cudaStream_t stream = 0);
+
+// M=K VERIFY step (spec-decode): process K tokens x[K,DIM] at positions [pos..pos+K-1] in ONE forward — GEMMs
+// at M=K read the weights ONCE for all K tokens (the spec-decode bandwidth win). Appends their KV to
+// kvcache[pos..pos+K-1]; query i attends the sliding window [max(0,pos+i-W+1)..pos+i] (causal among the K +
+// the existing cache). Equivalent to K sequential mla_decode_step calls (gate: tests/gate_mla_verify.cu).
+void mla_verify_step(float* out, const float* x, const MLAWeights& w, float* kvcache, int pos, int K,
+                     cudaStream_t stream = 0);

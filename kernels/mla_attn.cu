@@ -198,24 +198,47 @@ __global__ void tc_ogroup_kernel(float* out, const __half* o16, const __half* wo
     if(gid+8<bs && n0+cn  <R) out[((size_t)(gid+8)*G+gg)*R + n0+cn ]=c[2];
     if(gid+8<bs && n0+cn+1<R) out[((size_t)(gid+8)*G+gg)*R + n0+cn+1]=c[3];
 }
-// NATIVE wo_a: fp8 byte * e8m0 block-scale -> f16, in ONE pass (no f32 dequant buffer, no double conversion).
 #include <cuda_fp8.h>
-__global__ void k_wo_fp8_to_f16(__half* wo16, const uint8_t* w, const uint8_t* sc, int GR, int Kd){
-    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if(i>=(size_t)GR*Kd) return; int row=i/Kd, col=i%Kd;
-    __half_raw hr=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)w[i], __NV_E4M3);
-    float wv=__half2float(*reinterpret_cast<__half*>(&hr));
-    int scw=Kd/128; float s=exp2f((float)sc[(size_t)(row/128)*scw + col/128]-127.f);
-    wo16[i]=__float2half(wv*s);
+__device__ __forceinline__ float ogm_e4m3(uint8_t b){
+    __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3); return __half2float(*reinterpret_cast<__half*>(&r)); }
+// FUSED fp8 wo_a TC ogroup: decode fp8 wo_a * e8m0 block-scale -> f16 IN the mma inner loop (no wo16 buffer,
+// no per-token full-tensor conversion). Reads fp8 (half the bytes of f16). Bit-identical to convert-then-mma.
+__global__ void tc_ogroup_fp8_kernel(float* out, const __half* o16, const uint8_t* wo, const uint8_t* wsc,
+                                     int bs, int G, int R, int Kd){
+    int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
+    int gg=blockIdx.y, n0=blockIdx.x*8; if(n0>=R) return;
+    const __half* xg0 = o16 + ((size_t)gid*G+gg)*Kd;
+    const __half* xg8 = o16 + ((size_t)(gid+8)*G+gg)*Kd;
+    const uint8_t* Bg = wo + (size_t)gg*R*Kd; int scw=Kd/128;
+    bool m0=gid<bs, m8=(gid+8)<bs; float c[4]={0,0,0,0};
+    int n=n0+gid; const uint8_t* wr = Bg + (size_t)n*Kd; size_t grow=(size_t)gg*R+n;
+    for(int k0=0;k0<Kd;k0+=16){
+        unsigned a[4],b[2];
+        a[0]=m0?*(const unsigned*)(xg0+k0+2*t4):0u; a[1]=m8?*(const unsigned*)(xg8+k0+2*t4):0u;
+        a[2]=m0?*(const unsigned*)(xg0+k0+2*t4+8):0u; a[3]=m8?*(const unsigned*)(xg8+k0+2*t4+8):0u;
+        if(n<R){ int kk=k0+2*t4;
+            float s0=exp2f((float)wsc[(grow/128)*scw + kk/128]-127.f);
+            float s1=exp2f((float)wsc[(grow/128)*scw + (kk+8)/128]-127.f);
+            __half2 p0=__halves2half2(__float2half(ogm_e4m3(wr[kk])*s0),   __float2half(ogm_e4m3(wr[kk+1])*s0));
+            __half2 p1=__halves2half2(__float2half(ogm_e4m3(wr[kk+8])*s1), __float2half(ogm_e4m3(wr[kk+9])*s1));
+            b[0]=*(unsigned*)&p0; b[1]=*(unsigned*)&p1;
+        } else { b[0]=0u; b[1]=0u; }
+        ogm_mma(c,a,b);
+    }
+    int cn=2*t4;
+    if(gid<bs   && n0+cn  <R) out[((size_t)gid*G+gg)*R + n0+cn  ]=c[0];
+    if(gid<bs   && n0+cn+1<R) out[((size_t)gid*G+gg)*R + n0+cn+1]=c[1];
+    if(gid+8<bs && n0+cn  <R) out[((size_t)(gid+8)*G+gg)*R + n0+cn ]=c[2];
+    if(gid+8<bs && n0+cn+1<R) out[((size_t)(gid+8)*G+gg)*R + n0+cn+1]=c[3];
 }
 bool g_tc_ogroup = false;   // forward.cu sets true; gates use the warp-per-output oracle
-// fp8-native TC ogroup: o(f32)->f16 + wo_a(fp8+e8m0)->f16 in-kernel, then m16n8k16. Kills the wo_a f32 dequant.
+// fp8-native TC ogroup: o(f32)->f16 + fused fp8 wo_a decode in the mma. No per-token wo16 conversion.
 void ogroup_gemm_fp8(float* out, const float* o, const uint8_t* wo_fp8, const uint8_t* wo_sc,
                      int bs, int G, int R, int Kd, cudaStream_t stream){
-    __half *o16,*wo16; o16=(__half*)dmalloc((size_t)bs*G*Kd*2); wo16=(__half*)dmalloc((size_t)G*R*Kd*2);
+    __half* o16; o16=(__half*)dmalloc((size_t)bs*G*Kd*2);
     k_f2h<<<((size_t)bs*G*Kd+255)/256,256,0,stream>>>(o16,o,(size_t)bs*G*Kd);
-    k_wo_fp8_to_f16<<<((size_t)G*R*Kd+255)/256,256,0,stream>>>(wo16, wo_fp8, wo_sc, G*R, Kd);
-    dim3 grid((R+7)/8, G); tc_ogroup_kernel<<<grid,32,0,stream>>>(out,o16,wo16,bs,G,R,Kd);
-    dsync(stream); dfree(o16); dfree(wo16);
+    dim3 grid((R+7)/8, G); tc_ogroup_fp8_kernel<<<grid,32,0,stream>>>(out,o16,wo_fp8,wo_sc,bs,G,R,Kd);
+    dsync(stream); dfree(o16);
 }
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream) {

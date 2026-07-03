@@ -164,3 +164,12 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   Removed ~120 ms/token of per-token dequant+malloc. Cumulative: 0.50 -> 3.02 tok/s (6.0x) across opts #1-5.
 - Remaining (nsys, per token): tc_fp8 attn GEMMs at M=1 ~91 ms (need M=1 GEMV), MoE grouped GEMM ~78 ms,
   tc_ogroup ~44 ms, MoE router compute_scores ~19 ms (serial per-thread dot), + launch overhead (CUDA graphs).
+
+## Decode opt #6 — fused fp8 wo_a in TC ogroup (no per-token wo16 conversion) — WIN -29%
+- **A/B (warm M=1, argmax=270):** 331 -> **234 ms/tok (4.27 tok/s)** = -29%, memory-neutral (110.7).
+- **Mechanism (nsys):** after build-once, `k_wo_fp8_to_f16` was converting the ENTIRE wo_a (33.5M elems x43) to
+  f16 EVERY token = ~80 ms/token (wo_a is constant!). `tc_ogroup_fp8_kernel` decodes fp8 wo_a * e8m0 scale ->
+  f16 INSIDE the mma inner loop (no wo16 buffer, reads fp8 = half the bytes). Bit-identical. argmax=270.
+- **Cumulative decode: 0.50 -> 4.27 tok/s = 8.5x** (opts #1-6). Remaining (nsys): tc_fp8 attn GEMMs ~91 ms,
+  MoE grouped ~78 ms, tc_ogroup mma ~30 ms, router compute_scores ~19 ms (serial dot), + launch overhead.
+  Path to ~50 tok/s = reduce base toward bandwidth floor (~40 ms) + DSpark spec-decode (block verify, ~3-4x).

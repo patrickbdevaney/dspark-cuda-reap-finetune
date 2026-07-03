@@ -49,6 +49,8 @@ void tc_fp8_gemm(float*, const uint8_t*, const float*, const uint8_t*, const flo
 void fp8_block_gemm(float* C, const uint8_t* A_fp8, const float* a_s,
                     const uint8_t* B_fp8, const float* b_s,
                     int M, int N, int K, cudaStream_t stream) {
+    // (A/B result: the m16-tile TC BEATS the warp-per-output oracle even at M=1 — its coalesced weight layout
+    // wins. Kept TC for all M. The M=1 attn GEMM cost is closer to bandwidth than expected.)
     if (g_tc_fp8 && (N % 8 == 0) && (K % 128 == 0)) { tc_fp8_gemm(C, A_fp8, a_s, B_fp8, b_s, M, N, K, stream); return; }
     dim3 grid(N, M);
     fp8_block_gemm_kernel<<<grid, 32, 0, stream>>>(C, A_fp8, a_s, B_fp8, b_s, M, N, K);

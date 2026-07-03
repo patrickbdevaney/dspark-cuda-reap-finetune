@@ -168,10 +168,19 @@ __global__ void k_moe_count(int* counts, const int* idx, int n){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) atomicAdd(&counts[idx[i]],1); }
 __global__ void k_moe_prefix(int* off, const int* counts, int nr){   // nr<=~160: single-thread exclusive scan
     if(threadIdx.x||blockIdx.x) return; off[0]=0; for(int e=0;e<nr;++e) off[e+1]=off[e]+counts[e]; }
-__global__ void k_moe_scatter(int* alltok, float* allwt, int* cursor, const int* idx, const float* wt,
+__global__ void k_moe_scatter(int* alltok, float* allwt, int* allslot, int* cursor, const int* idx, const float* wt,
                               const int* off, int bs, int na){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=bs*na) return; int t=i/na, e=idx[i];
-    int pos=atomicAdd(&cursor[e],1); alltok[off[e]+pos]=t; allwt[off[e]+pos]=wt[i]; }
+    int pos=atomicAdd(&cursor[e],1); alltok[off[e]+pos]=t; allwt[off[e]+pos]=wt[i]; allslot[off[e]+pos]=i%na; }
+// DETERMINISTIC MoE combine: place each grouped expert-output row at its unique (token,slot) slot (no atomics),
+// then sum the na slots per token in FIXED order -> run-to-run reproducible (atomicAdd scatter was the only
+// non-determinism; near-tie argmax flips from it were rejecting valid spec-decode drafts).
+__global__ void k_scatter_ts(float* OEbts, const float* OEb, const int* alltok, const int* allslot, int maxm, int dim, int na){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)maxm*dim) return; int r=i/dim, c=i%dim;
+    OEbts[((long)alltok[r]*na+allslot[r])*dim + c] = OEb[i]; }
+__global__ void k_reduce_ts(float* out, const float* OEbts, int bs, int dim, int na){
+    long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)bs*dim) return; int t=i/dim, c=i%dim;
+    float acc=0.f; for(int s=0;s<na;++s) acc += OEbts[((long)t*na+s)*dim + c]; out[i]=acc; }
 
 void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeights& w, int bs, cudaStream_t stream){
     const int dim=w.dim, inter=w.inter, nr=w.n_routed, na=w.n_act;
@@ -207,13 +216,13 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         extern bool g_moe_gemv;
         const int maxm = bs*na;
         // -- device counting-sort grouping (off_d KEPT on device; NO D2H) --
-        int *counts,*off_d,*cursor,*alltok_d; float* allwt_d;
+        int *counts,*off_d,*cursor,*alltok_d,*allslot_d; float* allwt_d;
         counts=(decltype(counts))dmalloc(nr*4); off_d=(decltype(off_d))dmalloc((nr+1)*4); cursor=(decltype(cursor))dmalloc(nr*4);
-        alltok_d=(decltype(alltok_d))dmalloc((size_t)maxm*4); allwt_d=(decltype(allwt_d))dmalloc((size_t)maxm*4);
+        alltok_d=(decltype(alltok_d))dmalloc((size_t)maxm*4); allwt_d=(decltype(allwt_d))dmalloc((size_t)maxm*4); allslot_d=(decltype(allslot_d))dmalloc((size_t)maxm*4);
         CU(cudaMemsetAsync(counts,0,nr*4,stream)); CU(cudaMemsetAsync(cursor,0,nr*4,stream));
         k_moe_count<<<(bs*na+63)/64,64,0,stream>>>(counts,idx,bs*na);
         k_moe_prefix<<<1,1,0,stream>>>(off_d,counts,nr);
-        k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,cursor,idx,wt,off_d,bs,na);
+        k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,allslot_d,cursor,idx,wt,off_d,bs,na);
         // -- tile descriptors (device) --
         int *tile_e,*tile_row0,*ntiles_d; tile_e=(decltype(tile_e))dmalloc(maxm*4); tile_row0=(decltype(tile_row0))dmalloc(maxm*4); ntiles_d=(decltype(ntiles_d))dmalloc(4);
         tc_build_tiles(tile_e,tile_row0,ntiles_d,off_d,nr,stream);
@@ -238,6 +247,7 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         x16=(decltype(x16))dmalloc((size_t)maxm*dim*2); h16=(decltype(h16))dmalloc((size_t)maxm*inter*2);
         Gb=(decltype(Gb))dmalloc((size_t)maxm*inter*4); Ub=(decltype(Ub))dmalloc((size_t)maxm*inter*4); Hb=(decltype(Hb))dmalloc((size_t)maxm*inter*4);
         Hqb=(decltype(Hqb))dmalloc((size_t)maxm*inter); Hsb=(decltype(Hsb))dmalloc((size_t)maxm*(inter/128)*4); OEb=(decltype(OEb))dmalloc((size_t)maxm*dim*4);
+        float* OEbts=(float*)dmalloc((size_t)bs*na*dim*4);   // deterministic per-(token,slot) combine buffer
         // -- routed experts: gather -> quant -> fp16 -> grouped gate/up -> swiglu -> quant -> fp16 -> grouped down -> scatter --
         k_gather_x<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(Xe,x,alltok_d,maxm,dim);
         act_quant_fp8(Xeq,Xes,Xe,maxm,dim,128,stream);
@@ -258,7 +268,9 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         if(g_moe_gemv)         tc_fp4_grouped_gemv_e8m0(OEb,Hqb,Hsb,w2d,(const uint8_t* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);
         else if(w.e8m0_scales){tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream); tc_fp4_grouped_gemm_e8m0(OEb,h16,w2d,(const uint8_t* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);}
         else                  {tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream); tc_fp4_grouped_gemm(OEb,h16,w2d,(const float* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);}
-        k_scatter_add<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(out,OEb,alltok_d,maxm,dim);
+        // DETERMINISTIC combine: scatter to unique (token,slot) slots (no atomics) then sum na slots in fixed order
+        k_scatter_ts<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(OEbts,OEb,alltok_d,allslot_d,maxm,dim,na);
+        k_reduce_ts<<<((size_t)bs*dim+255)/256,256,0,stream>>>(out,OEbts,bs,dim,na);
         // -- shared expert (fp8, all bs tokens, weight 1) --
         if(!getenv("NOSHARED")){
             act_quant_fp8(Xeq,Xes,x,bs,dim,128,stream);
@@ -302,13 +314,13 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         std::vector<int> off(nr+1,0); int* alltok_d; float* allwt_d;
         if(w.device_route){
             // DEVICE grouping: counting-sort on GPU (no host vector build / big idx-wt-alltok copies).
-            int *counts,*off_d,*cursor;
+            int *counts,*off_d,*cursor,*allslot_d;
             counts=(decltype(counts))dmalloc(nr*4); off_d=(decltype(off_d))dmalloc((nr+1)*4); cursor=(decltype(cursor))dmalloc(nr*4);
-            alltok_d=(decltype(alltok_d))dmalloc((size_t)maxm*4); allwt_d=(decltype(allwt_d))dmalloc((size_t)maxm*4);
+            alltok_d=(decltype(alltok_d))dmalloc((size_t)maxm*4); allwt_d=(decltype(allwt_d))dmalloc((size_t)maxm*4); allslot_d=(decltype(allslot_d))dmalloc((size_t)maxm*4);
             CU(cudaMemsetAsync(counts,0,nr*4,stream)); CU(cudaMemsetAsync(cursor,0,nr*4,stream));
             k_moe_count<<<(bs*na+63)/64,64,0,stream>>>(counts,idx,bs*na);
             k_moe_prefix<<<1,1,0,stream>>>(off_d,counts,nr);
-            k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,cursor,idx,wt,off_d,bs,na);
+            k_moe_scatter<<<(bs*na+63)/64,64,0,stream>>>(alltok_d,allwt_d,allslot_d,cursor,idx,wt,off_d,bs,na);
             CU(cudaMemcpy(off.data(),off_d,(nr+1)*4,cudaMemcpyDeviceToHost));   // small sync (grid sizes); zero-sync = Step 1b
             dfree(counts); dfree(off_d); dfree(cursor);
         } else {

@@ -106,7 +106,10 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   shared expert at M=bs. Per-token oracle kept as `else` branch (default, still **bit-exact max_rel 0.0**).
 - **STATUS: batched FAILS its gate — and the failure is NON-DETERMINISTIC** (cosine 0.649 one run, -0.197 next
   run, same code). Non-determinism ⇒ **uninitialized-device-memory read or a race**, NOT atomicAdd reorder.
-  Gate K stays GREEN on the oracle; `batched` is NOT enabled anywhere. DEBUG next:
+  UPDATE: compute-sanitizer found illegal read at moe.cu (garbage token index from a PAGEABLE async
+  cudaMemcpyAsync of etok/ewt racing the gather) -> FIXED with blocking cudaMemcpy. Now DETERMINISTIC
+  (no more crash/non-determinism) but output≈0 (cosine ~0) -> a remaining correctness bug (scatter/
+  contribution not landing). Gate K still GREEN on oracle; batched still OFF. DEBUG next:
   (1) cudaMemcpyAsync of host std::vector (etok/ewt) is PAGEABLE→async — may race the gather reading tok_d/wrow;
       try pinned host buffers or a sync, OR stage tok/wrow once. (2) run compute-sanitizer on the batched path.
   (3) check every batched scratch buffer is fully written before read for the me<bs rows.

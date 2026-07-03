@@ -182,8 +182,8 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         CU(cudaMalloc(&Hqb,(size_t)bs*inter)); CU(cudaMalloc(&Hsb,(size_t)bs*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)bs*dim*4));
         CU(cudaMalloc(&wrow,(size_t)bs*4)); CU(cudaMalloc(&tok_d,(size_t)bs*4));
         for(int e=0;e<nr;++e){ int me=etok[e].size(); if(!me) continue;
-            CU(cudaMemcpyAsync(tok_d,etok[e].data(),(size_t)me*4,cudaMemcpyHostToDevice,stream));
-            CU(cudaMemcpyAsync(wrow,ewt[e].data(),(size_t)me*4,cudaMemcpyHostToDevice,stream));
+            CU(cudaMemcpy(tok_d,etok[e].data(),(size_t)me*4,cudaMemcpyHostToDevice));   // blocking: land before the gather (pageable async raced)
+            CU(cudaMemcpy(wrow,ewt[e].data(),(size_t)me*4,cudaMemcpyHostToDevice));
             const uint8_t *W1=w.w1p?w.w1p[e]:w.w1+(size_t)e*w13n, *W3=w.w3p?w.w3p[e]:w.w3+(size_t)e*w13n, *W2=w.w2p?w.w2p[e]:w.w2+(size_t)e*w2n;
             const float *W1s=w.w1sp?w.w1sp[e]:w.w1s+(size_t)e*w13s, *W3s=w.w3sp?w.w3sp[e]:w.w3s+(size_t)e*w13s, *W2s=w.w2sp?w.w2sp[e]:w.w2s+(size_t)e*w2s;
             k_gather_x<<<((size_t)me*dim+255)/256,256,0,stream>>>(Xe,x,tok_d,me,dim);

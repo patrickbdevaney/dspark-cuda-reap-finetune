@@ -220,3 +220,11 @@ indexer's own compressor (rotate = hadamard+fp4sim, d=128). Per-(m,n) gemm dots 
 batch-independent, so incremental == prefill exactly. This derisks the whole compressed-decode path: what
 remains is wiring (window+compressed KV caches, strided idxs / DSA-indexer M=1 top-512, sparse_attn over the
 union), analogous to the bit-exact milestone-1 sliding step.
+
+**Step 4 milestone 2a — strided (ratio-128) compressed decode step: BIT-EXACT.** Wires the two bit-exact
+primitives: window-KV cache (m1) + append-only compressed-KV cache (`compressor_emit_group` on
+`(pos+1)%ratio==0`) + strided idxs (`t < (pos+1)/ratio`) + `sparse_attn(m=1)` over `[win_kv[0..pos] ⊕
+comp_kv[0..T-1]]` (compressed idx = `t + (pos+1)`, matching prefill's `t + s` at pos=s-1). Gate
+(`tests/gate_compressed_decode.cu`, ratio=128, s=256): prefill vs cache(0..s-2)+decode(s-1) = **cosine 1.0,
+rms 0, maxabs 0.** `kernels/compressed_decode.cu`. Remaining: m2b (ratio-4 = this + DSA-indexer M=1 top-512),
+m3 (full 43-layer loop + head + decode tok/s).

@@ -101,19 +101,10 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 ## Grind round #2 (batch MoE + fuse gate+up) — IN PROGRESS, gate caught a bug
 - **gate+up input-share: DONE** — the routed w1/w3 GEMMs share the single quantized input tile `Xeq` (act_quant
   once, feed both). (Full register-fusion of g,u+swiglu into one kernel = further follow-up.)
-- **Batched/grouped dispatch: IMPLEMENTED behind `MoEWeights.batched`** (moe.cu): group tokens by expert
-  (host, from hidx) → gather → one GEMM per expert at M=count → swiglu_wrow(per-token weight) → scatter_add;
-  shared expert at M=bs. Per-token oracle kept as `else` branch (default, still **bit-exact max_rel 0.0**).
-- **STATUS: batched FAILS its gate — and the failure is NON-DETERMINISTIC** (cosine 0.649 one run, -0.197 next
-  run, same code). Non-determinism ⇒ **uninitialized-device-memory read or a race**, NOT atomicAdd reorder.
-  UPDATE: compute-sanitizer found illegal read at moe.cu (garbage token index from a PAGEABLE async
-  cudaMemcpyAsync of etok/ewt racing the gather) -> FIXED with blocking cudaMemcpy. Now DETERMINISTIC
-  (no more crash/non-determinism); now DETERMINISTIC cosine 0.649. Grouping VERIFIED correct (grouped=16
-  =bs*na, all experts non-empty via MDBG). Weight application + GEMM-per-M independently identical to
-  oracle. So remaining bug is a subtle VALUE diff (magnitudes vary per token, not reorder) — likely an
-  act_quant/GEMM-at-M interaction or scatter/shared interaction not yet isolated. Gate K GREEN on oracle;
-  batched OFF. DEBUG next (fresh pass):
-  (1) cudaMemcpyAsync of host std::vector (etok/ewt) is PAGEABLE→async — may race the gather reading tok_d/wrow;
-      try pinned host buffers or a sync, OR stage tok/wrow once. (2) run compute-sanitizer on the batched path.
-  (3) check every batched scratch buffer is fully written before read for the me<bs rows.
-  The oracle is safe; this is a contained WIP. Do not enable `batched` until its gate PASSES (cosine>0.9999).
+- **Batched/grouped dispatch: DONE — gate PASSES cosine 1.0** (moe.cu, `MoEWeights.batched`). Group tokens by
+  expert -> one GEMM per expert at M=count -> swiglu_wrow -> scatter_add; shared M=bs. Per-token oracle kept
+  as `else` (default, bit-exact). ROOT CAUSE of the earlier failures (found via compute-sanitizer + per-expert
+  dumps): (1) pageable async cudaMemcpyAsync of etok/ewt raced the gather -> OOB garbage; (2) then a reused
+  per-expert blocking cudaMemcpy into tok_d silently failed to update (every expert saw stale [1,0,..]) ->
+  only tok1's output landed. FIX: upload ALL tokens/weights ONCE as flat device arrays + per-expert OFFSET
+  pointers (no reused buffer, no per-expert copy). cosine 1.0 vs oracle; oracle stays bit-exact.

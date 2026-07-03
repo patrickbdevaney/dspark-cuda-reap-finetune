@@ -213,7 +213,7 @@ static bool gate_moe(const std::string& dir) {
     double cosb=dt/(sqrt(n1)*sqrt(n2)+1e-30);
     // INFORMATIONAL (not gating Gate K): batched dispatch is WIP — gate caught a correctness bug (cosine<1).
     // Per-token oracle (above) stays bit-exact and is the default. Do NOT enable MoEWeights.batched until this PASSES.
-    printf("[moe batched WIP] cosine vs per-token oracle=%.7f -> %s (informational; not enabled)\n", cosb, cosb>0.9999?"PASS":"FAIL(WIP)");
+    bool okb=cosb>0.9999; printf("[moe batched] cosine vs per-token oracle=%.7f -> %s\n", cosb, okb?"PASS":"FAIL"); ok=ok&&okb;
     printf("[moe] n=%d dim=%d inter=%d nr=%d na=%d  |y|max=%.4f max_abs=%.5f max_rel=%.5f -> %s\n",
            n,dim,inter,nr,na,mx,e.max_abs,e.max_rel,ok?"PASS":"FAIL");
     return ok;

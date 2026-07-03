@@ -176,15 +176,21 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         // group tokens by expert -> one GEMM per expert at M=count (amortize weight loads); shared expert M=bs.
         std::vector<std::vector<int>> etok(nr); std::vector<std::vector<float>> ewt(nr);
         for(int t=0;t<bs;++t) for(int s=0;s<na;++s){ int e=hidx[(size_t)t*na+s]; etok[e].push_back(t); ewt[e].push_back(hw[(size_t)t*na+s]); }
-        if(getenv("MDBG")){ int tt=0,ne=0; for(int e=0;e<nr;++e){tt+=etok[e].size(); ne+=!etok[e].empty();} fprintf(stderr,"[batched] bs=%d na=%d nr=%d grouped=%d nonempty=%d (expect grouped=%d)\n",bs,na,nr,tt,ne,bs*na); }
-        float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb,*wrow; uint8_t *Xeq,*Hqb; int *tok_d;
+        if(getenv("MDBG")){ int tt=0,ne=0; for(int e=0;e<nr;++e){tt+=etok[e].size(); ne+=!etok[e].empty();} fprintf(stderr,"[batched] bs=%d na=%d nr=%d grouped=%d nonempty=%d\n",bs,na,nr,tt,ne,bs*na);
+            for(int e=0;e<nr;++e){ if(etok[e].empty()) continue; fprintf(stderr,"  e%d me=%zu tok=",e,etok[e].size()); for(int t:etok[e]) fprintf(stderr,"%d,",t); fprintf(stderr,"\n"); } }
+        float *Xe,*Xes2,*Gb,*Ub,*Hb,*Hsb,*OEb; uint8_t *Xeq,*Hqb;
         CU(cudaMalloc(&Xe,(size_t)bs*dim*4)); CU(cudaMalloc(&Xeq,(size_t)bs*dim)); CU(cudaMalloc(&Xes2,(size_t)bs*(dim/128)*4));
         CU(cudaMalloc(&Gb,(size_t)bs*inter*4)); CU(cudaMalloc(&Ub,(size_t)bs*inter*4)); CU(cudaMalloc(&Hb,(size_t)bs*inter*4));
         CU(cudaMalloc(&Hqb,(size_t)bs*inter)); CU(cudaMalloc(&Hsb,(size_t)bs*(inter/128)*4)); CU(cudaMalloc(&OEb,(size_t)bs*dim*4));
-        CU(cudaMalloc(&wrow,(size_t)bs*4)); CU(cudaMalloc(&tok_d,(size_t)bs*4));
-        for(int e=0;e<nr;++e){ int me=etok[e].size(); if(!me) continue;
-            CU(cudaMemcpy(tok_d,etok[e].data(),(size_t)me*4,cudaMemcpyHostToDevice));   // blocking: land before the gather (pageable async raced)
-            CU(cudaMemcpy(wrow,ewt[e].data(),(size_t)me*4,cudaMemcpyHostToDevice));
+        // upload ALL tokens/weights once as flat arrays + per-expert offsets (robust; reused per-expert copy failed)
+        std::vector<int> alltok; std::vector<float> allwt; std::vector<int> off(nr+1,0);
+        for(int e=0;e<nr;++e){ for(int t:etok[e]) alltok.push_back(t); for(float w:ewt[e]) allwt.push_back(w); off[e+1]=alltok.size(); }
+        int* alltok_d; float* allwt_d;
+        CU(cudaMalloc(&alltok_d,(size_t)alltok.size()*4)); CU(cudaMalloc(&allwt_d,(size_t)allwt.size()*4));
+        CU(cudaMemcpy(alltok_d,alltok.data(),(size_t)alltok.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(allwt_d,allwt.data(),(size_t)allwt.size()*4,cudaMemcpyHostToDevice));
+        for(int e=0;e<nr;++e){ int me=off[e+1]-off[e]; if(!me) continue;
+            const int* tok_d = alltok_d+off[e]; const float* wrow = allwt_d+off[e];
             const uint8_t *W1=w.w1p?w.w1p[e]:w.w1+(size_t)e*w13n, *W3=w.w3p?w.w3p[e]:w.w3+(size_t)e*w13n, *W2=w.w2p?w.w2p[e]:w.w2+(size_t)e*w2n;
             const float *W1s=w.w1sp?w.w1sp[e]:w.w1s+(size_t)e*w13s, *W3s=w.w3sp?w.w3sp[e]:w.w3s+(size_t)e*w13s, *W2s=w.w2sp?w.w2sp[e]:w.w2s+(size_t)e*w2s;
             k_gather_x<<<((size_t)me*dim+255)/256,256,0,stream>>>(Xe,x,tok_d,me,dim);
@@ -197,6 +203,7 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
             k_scatter_add<<<((size_t)me*dim+255)/256,256,0,stream>>>(out,OEb,tok_d,me,dim);
         }
         // shared expert, all bs tokens (fp8, weight 1)
+        if(!getenv("NOSHARED")){
         act_quant_fp8(Xeq,Xes2,x,bs,dim,128,stream);
         fp8_block_gemm(Gb,Xeq,Xes2, w.sw1,w.sw1s, bs,inter,dim,stream);
         fp8_block_gemm(Ub,Xeq,Xes2, w.sw3,w.sw3s, bs,inter,dim,stream);
@@ -204,8 +211,9 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         act_quant_fp8(Hqb,Hsb,Hb,bs,inter,128,stream);
         fp8_block_gemm(OEb,Hqb,Hsb, w.sw2,w.sw2s, bs,dim,inter,stream);
         accum_kernel<<<((size_t)bs*dim+63)/64,64,0,stream>>>(out,OEb,bs*dim);
+        }
         CU(cudaStreamSynchronize(stream));
-        cudaFree(Xe);cudaFree(Xeq);cudaFree(Xes2);cudaFree(Gb);cudaFree(Ub);cudaFree(Hb);cudaFree(Hqb);cudaFree(Hsb);cudaFree(OEb);cudaFree(wrow);cudaFree(tok_d);
+        cudaFree(Xe);cudaFree(Xeq);cudaFree(Xes2);cudaFree(Gb);cudaFree(Ub);cudaFree(Hb);cudaFree(Hqb);cudaFree(Hsb);cudaFree(OEb);cudaFree(alltok_d);cudaFree(allwt_d);
         cudaFree(sc);cudaFree(wt);cudaFree(idx);cudaFree(xq);cudaFree(xs);cudaFree(g);cudaFree(u);cudaFree(h);cudaFree(hq);cudaFree(hs);cudaFree(oe);
         return;
     }
@@ -228,6 +236,7 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
             accum_kernel<<<(dim+63)/64,64,0,stream>>>(out+(size_t)t*dim,oe,dim);
         }
         // shared expert (fp8), no routing weight
+        if(getenv("NOSHARED")) continue;
         act_quant_fp8(xq,xs,xr,1,dim,128,stream);
         fp8_block_gemm(g,xq,xs, w.sw1, w.sw1s, 1,inter,dim,stream);
         fp8_block_gemm(u,xq,xs, w.sw3, w.sw3s, 1,inter,dim,stream);

@@ -47,7 +47,17 @@ int main(int argc, char** argv){
     double dp=0,np=0,nq=0; for(size_t i=0;i<cr.size();++i){ dp+=cr[i]*ctp[i]; np+=cr[i]*cr[i]; nq+=ctp[i]*ctp[i]; }
     double cospp=dp/(sqrt(np)*sqrt(nq)+1e-30); bool okpp=cospp>0.999; ok=ok&&okpp;
     printf("[tc_moe PP repack-at-load] cosine vs fp4_gemm oracle=%.6f -> %s\n", cospp, okpp?"PASS":"FAIL");
-    cudaFree(dBp);cudaFree(tmp);cudaFree(Ctp);
+    // funnel-shift path: repack at an UNALIGNED (off=8) pointer, verify aligned coalesced loads still correct
+    uint8_t* dBu; CU(cudaMalloc(&dBu,B.size()+32)); uint8_t* Bu=dBu+8;
+    CU(cudaMemcpy(Bu,dB,B.size(),cudaMemcpyDeviceToDevice));
+    tc_repack_weight_inplace(Bu,N,K,tmp,0); CU(cudaDeviceSynchronize());
+    float* Ctu; CU(cudaMalloc(&Ctu,(size_t)M*N*4));
+    tc_fp4_gemm_pp(Ctu,dA,das,Bu,dbs,M,N,K,0); CU(cudaDeviceSynchronize());
+    std::vector<float> ctu((size_t)M*N); CU(cudaMemcpy(ctu.data(),Ctu,ctu.size()*4,cudaMemcpyDeviceToHost));
+    double du=0,nu1=0,nu2=0; for(size_t i=0;i<cr.size();++i){du+=cr[i]*ctu[i];nu1+=cr[i]*cr[i];nu2+=ctu[i]*ctu[i];}
+    double cosu=du/(sqrt(nu1)*sqrt(nu2)+1e-30); bool oku=cosu>0.999; ok=ok&&oku;
+    printf("[tc_moe PP funnel off=8] cosine vs oracle=%.6f -> %s\n", cosu, oku?"PASS":"FAIL");
+    cudaFree(dBp);cudaFree(tmp);cudaFree(Ctp);cudaFree(dBu);cudaFree(Ctu);
     // --- A/B timing (full calls; tc includes per-call repack — caching that is a further win) ---
     int IT=30; cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
     for(int i=0;i<3;++i){ fp4_gemm(Cr,dA,das,dB,dbs,M,N,K,0); tc_fp4_gemm(Ct,dA,das,dB,dbs,M,N,K,0);} CU(cudaDeviceSynchronize());

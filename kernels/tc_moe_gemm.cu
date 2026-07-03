@@ -111,22 +111,32 @@ void tc_moe_clear_cache(){ for(auto& kv : g_tc_cache){ cudaFree(kv.second.wpr); 
 // ===================== REPACK-AT-LOAD (zero extra memory) =====================
 // The repacked layout is the SAME byte-size as the fp4 weight (N*K/2), so we repack IN PLACE at load and the
 // kernel reads the ORIGINAL scale b_s[N,K/32] directly (no wsr). Result: no 82GB doubling, no per-layer repack.
+// Funnel-combine two 16B-aligned uint4 loads straddling an unaligned 16B read. off = base&15 (uniform across the
+// kernel: every g*512/lane*16 is a multiple of 16). k0=off>>2, sh=(off&3)*8. Register-based, uniform branch on k0.
+__device__ __forceinline__ uint4 tcm_funnel16(uint4 A, uint4 B, int k0, unsigned sh){
+    uint4 r;
+    if(k0==0){r.x=__funnelshift_r(A.x,A.y,sh);r.y=__funnelshift_r(A.y,A.z,sh);r.z=__funnelshift_r(A.z,A.w,sh);r.w=__funnelshift_r(A.w,B.x,sh);}
+    else if(k0==1){r.x=__funnelshift_r(A.y,A.z,sh);r.y=__funnelshift_r(A.z,A.w,sh);r.z=__funnelshift_r(A.w,B.x,sh);r.w=__funnelshift_r(B.x,B.y,sh);}
+    else if(k0==2){r.x=__funnelshift_r(A.z,A.w,sh);r.y=__funnelshift_r(A.w,B.x,sh);r.z=__funnelshift_r(B.x,B.y,sh);r.w=__funnelshift_r(B.y,B.z,sh);}
+    else          {r.x=__funnelshift_r(A.w,B.x,sh);r.y=__funnelshift_r(B.x,B.y,sh);r.z=__funnelshift_r(B.y,B.z,sh);r.w=__funnelshift_r(B.z,B.w,sh);}
+    return r;   // off==0 (k0=0,sh=0) -> r=A (identity)
+}
 // Pre-packed kernel: weight already in wpr layout; scale read from original b_s (per-32, one 32-block=2 k-tiles).
-__global__ void tc_w4a8_pp_kernel(float* out, const uint8_t* wpr, const float* b_s, const __half* x16, int M, int N, int K){
+__global__ void tc_w4a8_pp_kernel(float* out, const uint8_t* wpr, const float* b_s, const __half* x16, int M, int N, int K, int off){
     int lane=threadIdx.x&31, gid=lane>>2, t4=lane&3;
     int warp=threadIdx.x>>5; int n_block=blockIdx.x*TCM_WARPS+warp; if((long)n_block*8>=N) return; int n0=n_block*8;
-    float c[4]={0,0,0,0}; int kg8=K/128, Ks32=K/32;
+    float c[4]={0,0,0,0}; int kg8=K/128, Ks32=K/32; int k0f=off>>2; unsigned shf=(off&3)*8;
     const uint8_t* wb = wpr + (long)n_block*kg8*512;
     const __half* xg0 = x16 + (size_t)gid*K, *xg8 = x16 + (size_t)(gid+8)*K;
     const float* bsr = b_s + (long)(n0+gid)*Ks32;   // original per-32 scale for this lane's weight row n0+gid
     bool m0=gid<M, m8=(gid+8)<M;
     for(int g=0; g<kg8; ++g){
-        // alignment-safe: the in-place repacked weight sits at an arbitrary WeightStore byte offset, so a 16-byte
-        // uint4 load would fault (misaligned). Byte loads are alignment-agnostic and same granularity as fp4_gemm;
-        // the TC compute win (mma) is preserved. (An aligned fast path is a future optimization.)
-        uint8_t wby[16]; const uint8_t* wsrc = wb + (long)g*512 + lane*16;
-        #pragma unroll
-        for(int i=0;i<16;++i) wby[i]=__ldcs(wsrc+i);
+        // ALIGNED coalesced load via funnel-shift: the in-place repacked weight is at an arbitrary WeightStore byte
+        // offset. Load the two 16B-aligned uint4 straddling this lane's 16B, funnel-combine by the constant `off`.
+        // Recovers coalescing (vs the byte-load fallback) while staying alignment-correct.
+        const uint8_t* wa = wb + (long)g*512 + lane*16 - off;
+        uint4 A=__ldcs((const uint4*)wa), B=__ldcs((const uint4*)(wa+16));
+        uint4 W=tcm_funnel16(A,B,k0f,shf); const uint8_t* wby=(const uint8_t*)&W;
         #pragma unroll
         for(int kl=0; kl<8; ++kl){ int k_tile=g*8+kl, k0=k_tile*16;
             unsigned a[4];
@@ -158,7 +168,8 @@ void tc_fp4_gemm_pp(float* C, const uint8_t* A_fp8, const float* a_s, const uint
                     int M, int N, int K, cudaStream_t s){
     __half* x16; CT(cudaMalloc(&x16,(size_t)M*K*2));
     k_a_to_fp16<<<((long)M*K+255)/256,256,0,s>>>(x16, A_fp8, a_s, M, K);
-    dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_pp_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, Bpacked, b_s, x16, M, N, K);
+    int off = (int)((uintptr_t)Bpacked & 15);   // constant per weight; funnel-shift makes loads aligned+coalesced
+    dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_pp_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, Bpacked, b_s, x16, M, N, K, off);
     CT(cudaStreamSynchronize(s)); cudaFree(x16);
 }
 // Auto variant (drop-in for tc_fp4_gemm): repack B IN PLACE the first time it's seen (zero extra mem), then run

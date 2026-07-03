@@ -123,8 +123,18 @@ container `vllm-dflash-thor:sglang`. Never `--runtime nvidia` (wedges containers
      fp8 path to `ogroup_gemm`. Same-class check for any other tensor a kernel assumes fp32.
    - YaRN freqs via `yarn.h`: per layer type (compressed base=compress_rope_theta orig=65536; sliding
      base=rope_theta orig=0). query freqs = `freqs[:s]`, compressed = `freqs[:s:ratio]`.
-3. **DSpark head names for Phase B:** `mtp.0.{enorm,hnorm,attn_norm,ffn_norm,norm}.weight`,
-   `mtp.0.attn.{q_norm,kv_norm}.weight`, + mtp attn/ffn weights (grep `mtp.` fully when building the head).
+3. **Output head (model.py:771-826, `ParallelHead`):** after 43 blocks `h` is `[s, hc, dim]`; final =
+   **hc_head collapse (hc 4→1)** with top-level `hc_head_{fn,scale,base}` → final `norm.weight` (RMSNorm) →
+   `lm_head` linear → logits `[s, vocab]`. lm_head weight is **bf16 in ckpt, dequant to fp32** (model.py:730
+   comment). embed = `embed.weight` (bf16 lookup kernel). Grep top-level names: `embed.weight`, `norm.weight`,
+   `hc_head_fn/scale/base`, and the lm_head/`head.weight` tensor (confirm exact name). Need a small `hc_head`
+   kernel (already in `hc.h`? `hc_head` exists) + bf16 embed-lookup + a bf16/fp32 lm_head GEMM.
+4. **DSpark head names for Phase B:** `mtp.0.{enorm,hnorm,attn_norm,ffn_norm,norm}.weight`,
+   `mtp.0.attn.{q_norm,kv_norm}.weight`, + mtp attn/ffn weights; `mtp[-1].head` shares the main output head.
+
+**forward.cu is now FULLY SPECIFIED** — loader (done) + per-layer struct population by the exact names above
+(with wo_a fp8→fp32 dequant + per-expert ptr tables) + YaRN freqs + 43-layer loop (block_forward L0-1 /
+compressed_block_forward L2-42) + hc_head/norm/lm_head → **Gate 1** (first full 180B run: memory, KV, tok/s).
 2. **Model assembly:** `embed(input_ids)` → HC-expand → 43 layers → final `rmsnorm` → `lm_head` → logits.
    - Layers 0–1: pure-sliding block (`block_forward` uses `mla_forward`).
    - Layers 2–42: compressed block — need a `compressed_block_forward` = block wrapping

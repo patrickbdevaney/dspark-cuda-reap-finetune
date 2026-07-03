@@ -24,3 +24,9 @@ void cblock_prefill_cache(float* out, const float* x, const int* input_ids, cons
                           int s, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);
 void cblock_decode_step(float* out, const float* x, const int* input_ids, const CompressedBlockWeights& w,
                         int pos, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);
+
+// M=K VERIFY block steps (spec-decode): K tokens [pos..pos+K-1] through the block, GEMMs+MoE at M=K.
+void block_verify_step(float* out, const float* x, const int* input_ids, const BlockWeights& w,
+                       int pos, int K, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);
+void cblock_verify_step(float* out, const float* x, const int* input_ids, const CompressedBlockWeights& w,
+                        int pos, int K, int iters, float eps, LayerKV& kv, cudaStream_t stream = 0);

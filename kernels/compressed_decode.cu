@@ -215,3 +215,115 @@ void compressed_decode_step_indexer(float* out, const float* x_full, int pos, co
     dfree(ogq);dfree(ogs);dfree(iqrq);dfree(iqrs);dfree(qidx);dfree(qtmp);dfree(iw);
     dfree(iscore);dfree(dtop);dfree(kv_all);dfree(comb);
 }
+
+// ================= M=K VERIFY steps (spec-decode) =================
+// Process K tokens at [pos..pos+K-1] in ONE forward: GEMMs at M=K (weights read once), compressor emits any
+// groups completing in the block, per-query combined idxs (window ⊕ compressed). ≡ K sequential decode steps.
+static void build_qKV(const CompressedAttnWeights& w, const float* xK, int K, int pos, float* qOut, float* win_kv,
+                      float eps, cudaStream_t stream){
+    const auto& a=w.attn; const int half=ROPE_DIM/2, Kd=N_HEADS*HEAD_DIM;
+    const float *cosP=a.cosT+(size_t)pos*half, *sinP=a.sinT+(size_t)pos*half;
+    uint8_t *xq,*qrq; float *xs,*qrs,*qr;
+    xq=(uint8_t*)dmalloc((size_t)K*DIM); xs=(float*)dmalloc((size_t)K*(DIM/128)*4);
+    qr=(float*)dmalloc((size_t)K*Q_LORA*4); qrq=(uint8_t*)dmalloc((size_t)K*Q_LORA); qrs=(float*)dmalloc((size_t)K*(Q_LORA/128)*4);
+    act_quant_fp8(xq,xs,xK,K,DIM,128,stream);
+    fp8_block_gemm(qr,xq,xs,a.wq_a,a.wq_a_s,K,Q_LORA,DIM,stream);
+    rmsnorm(qr,qr,a.q_norm,K,Q_LORA,eps,true,stream);
+    act_quant_fp8(qrq,qrs,qr,K,Q_LORA,128,stream);
+    fp8_block_gemm(qOut,qrq,qrs,a.wq_b,a.wq_b_s,K,Kd,Q_LORA,stream);
+    rmsnorm(qOut,qOut,nullptr,K*N_HEADS,HEAD_DIM,eps,false,stream);
+    rope_interleaved(qOut+NOPE_DIM,cosP,sinP,K*N_HEADS,ROPE_DIM,false,HEAD_DIM,N_HEADS,stream);
+    float* kvn=win_kv+(size_t)pos*HEAD_DIM;
+    fp8_block_gemm(kvn,xq,xs,a.wkv,a.wkv_s,K,HEAD_DIM,DIM,stream);
+    rmsnorm(kvn,kvn,a.kv_norm,K,HEAD_DIM,eps,true,stream);
+    rope_interleaved(kvn+NOPE_DIM,cosP,sinP,K,ROPE_DIM,false,HEAD_DIM,1,stream);
+    act_quant_fp8sim(kvn,K,NOPE_DIM,64,HEAD_DIM,stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);
+}
+static void finish_attn(const CompressedAttnWeights& w, const float* q, const float* kv_all, const int* comb,
+                        int K, int pos, int ntot, int topk, float* out, float eps, cudaStream_t stream){
+    const auto& a=w.attn; const int half=ROPE_DIM/2, Kd=N_HEADS*HEAD_DIM, GKd=Kd/O_GROUPS, OB=O_GROUPS*O_LORA;
+    const float *cosP=a.cosT+(size_t)pos*half, *sinP=a.sinT+(size_t)pos*half; const float scale=1.f/sqrtf((float)HEAD_DIM);
+    float *o,*og; uint8_t *ogq; float *ogs;
+    o=(float*)dmalloc((size_t)K*Kd*4); og=(float*)dmalloc((size_t)K*OB*4); ogq=(uint8_t*)dmalloc((size_t)K*OB); ogs=(float*)dmalloc((size_t)K*(OB/128)*4);
+    sparse_attn(o,q,kv_all,a.attn_sink,comb,1,K,N_HEADS,HEAD_DIM,ntot,topk,scale,stream);
+    rope_interleaved(o+NOPE_DIM,cosP,sinP,K*N_HEADS,ROPE_DIM,true,HEAD_DIM,N_HEADS,stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og,o,a.wo_a_fp8,a.wo_a_sc,K,O_GROUPS,O_LORA,GKd,stream);
+    else              ogroup_gemm    (og,o,a.wo_a,               K,O_GROUPS,O_LORA,GKd,stream);
+    act_quant_fp8(ogq,ogs,og,K,OB,128,stream);
+    fp8_block_gemm(out,ogq,ogs,a.wo_b,a.wo_b_s,K,DIM,OB,stream);
+    dfree(o);dfree(og);dfree(ogq);dfree(ogs);
+}
+
+void compressed_verify_step_strided(float* out, const float* x_full, int pos, int K, const CompressedAttnWeights& w,
+                                    float* win_kv, float* comp_kv, int* T, int ratio, float eps, cudaStream_t stream){
+    const int Kd=N_HEADS*HEAD_DIM;
+    float* q; q=(float*)dmalloc((size_t)K*Kd*4);
+    build_qKV(w, x_full+(size_t)pos*DIM, K, pos, q, win_kv, eps, stream);
+    for(int j=pos;j<pos+K;++j) if((j+1)%ratio==0){                         // emit groups completing in the block
+        compressor_emit_group(comp_kv+(size_t)(*T)*HEAD_DIM, x_full, j/ratio, ratio, w.mc_wkv,w.mc_wgate,w.mc_ape,
+                              w.mc_norm,w.cc_cos,w.cc_sin, DIM,HEAD_DIM,false,ROPE_DIM,eps,false,stream); ++(*T); }
+    int Tf=*T, nwin=pos+K, ntot=nwin+Tf;
+    float* kv_all; kv_all=(float*)dmalloc((size_t)ntot*HEAD_DIM*4);
+    CU(cudaMemcpyAsync(kv_all,win_kv,(size_t)nwin*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
+    CU(cudaMemcpyAsync(kv_all+(size_t)nwin*HEAD_DIM,comp_kv,(size_t)Tf*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
+    int wmax=0,tmax=0; for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;if(wid>wmax)wmax=wid;int Ti=(ig+1)/ratio;if(Ti>tmax)tmax=Ti;}
+    int topk=wmax+tmax; std::vector<int> comb((size_t)K*topk,-1);
+    for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;int Ti=(ig+1)/ratio;
+        for(int k=0;k<wid;++k) comb[(size_t)i*topk+k]=b+k;
+        for(int t=0;t<Ti;++t) comb[(size_t)i*topk+wmax+t]=nwin+t; }
+    int* dcomb; dcomb=(int*)dmalloc((size_t)K*topk*4); CU(cudaMemcpyAsync(dcomb,comb.data(),(size_t)K*topk*4,cudaMemcpyHostToDevice,stream));
+    finish_attn(w, q, kv_all, dcomb, K, pos, ntot, topk, out, eps, stream);
+    dsync(stream); dfree(q);dfree(kv_all);dfree(dcomb);
+}
+
+void compressed_verify_step_indexer(float* out, const float* x_full, int pos, int K, const CompressedAttnWeights& w,
+                                    float* win_kv, float* comp_kv, float* idx_ckv, int* T, int ratio, float eps, cudaStream_t stream){
+    const auto& a=w.attn; const int half=ROPE_DIM/2, Kd=N_HEADS*HEAD_DIM, nH=w.index_n_heads, ihd=w.index_head_dim, QD=nH*ihd, rd=ROPE_DIM;
+    const float wscale=rsqrtf((float)ihd)*rsqrtf((float)nH); const float *cosP=a.cosT+(size_t)pos*half, *sinP=a.sinT+(size_t)pos*half;
+    float* q; q=(float*)dmalloc((size_t)K*Kd*4);
+    build_qKV(w, x_full+(size_t)pos*DIM, K, pos, q, win_kv, eps, stream);
+    // emit main + indexer compressed rows for groups completing in the block
+    for(int j=pos;j<pos+K;++j) if((j+1)%ratio==0){ int g=j/ratio; int t=*T;
+        compressor_emit_group(comp_kv+(size_t)t*HEAD_DIM, x_full, g, ratio, w.mc_wkv,w.mc_wgate,w.mc_ape,w.mc_norm,w.cc_cos,w.cc_sin,DIM,HEAD_DIM,true,ROPE_DIM,eps,false,stream);
+        compressor_emit_group(idx_ckv+(size_t)t*ihd, x_full, g, ratio, w.idx_c_wkv,w.idx_c_wgate,w.idx_c_ape,w.idx_c_norm,w.cc_cos,w.cc_sin,DIM,ihd,true,ROPE_DIM,eps,true,stream); ++(*T); }
+    int Tf=*T, nwin=pos+K;
+    // indexer scoring for K queries: qidx = fp4sim(hadamard(rope(idx_wq_b(qr)))) — recompute qr (cheap) at M=K
+    uint8_t *iqrq; float *iqrs,*qr2,*qidx,*qtmp,*iw,*iscore;
+    // qr again (needed for indexer); recompute from x
+    uint8_t* xq2; float* xs2; xq2=(uint8_t*)dmalloc((size_t)K*DIM); xs2=(float*)dmalloc((size_t)K*(DIM/128)*4);
+    act_quant_fp8(xq2,xs2,x_full+(size_t)pos*DIM,K,DIM,128,stream);
+    qr2=(float*)dmalloc((size_t)K*Q_LORA*4); fp8_block_gemm(qr2,xq2,xs2,a.wq_a,a.wq_a_s,K,Q_LORA,DIM,stream); rmsnorm(qr2,qr2,a.q_norm,K,Q_LORA,eps,true,stream);
+    iqrq=(uint8_t*)dmalloc((size_t)K*Q_LORA); iqrs=(float*)dmalloc((size_t)K*(Q_LORA/128)*4);
+    qidx=(float*)dmalloc((size_t)K*QD*4); qtmp=(float*)dmalloc((size_t)K*QD*4); iw=(float*)dmalloc((size_t)K*nH*4);
+    act_quant_fp8(iqrq,iqrs,qr2,K,Q_LORA,128,stream);
+    fp8_block_gemm(qidx,iqrq,iqrs,w.idx_wq_b,w.idx_wq_b_s,K,QD,Q_LORA,stream);
+    rope_interleaved(qidx+(ihd-rd),cosP,sinP,K*nH,rd,false,ihd,nH,stream);
+    hadamard(qtmp,qidx,K*nH,ihd,stream); act_quant_fp4sim(qtmp,K*nH,ihd,32,ihd,stream);
+    gemm_fp32(iw,x_full+(size_t)pos*DIM,w.idx_weights_proj,K,nH,DIM,stream);
+    k_iw_scale<<<((size_t)K*nH+63)/64,64,0,stream>>>(iw,wscale,K*nH);
+    iscore=(float*)dmalloc((size_t)K*Tf*4);
+    index_score(iscore,qtmp,idx_ckv,iw,K,Tf,nH,ihd,stream);
+    // per-query top-k with GLOBAL causal threshold (t < (pos+i+1)/ratio), offset nwin
+    int topkc = (w.index_topk<Tf)?w.index_topk:Tf;
+    int* dtop; dtop=(int*)dmalloc((size_t)K*topkc*4);
+    // build on host from iscore
+    std::vector<float> hsc((size_t)K*Tf); CU(cudaMemcpyAsync(hsc.data(),iscore,(size_t)K*Tf*4,cudaMemcpyDeviceToHost,stream)); dsync(stream);
+    std::vector<int> htop((size_t)K*topkc,-1);
+    for(int i=0;i<K;++i){ int ig=pos+i,thr=(ig+1)/ratio; std::vector<float> s(hsc.begin()+(size_t)i*Tf,hsc.begin()+(size_t)i*Tf+Tf);
+        for(int k=0;k<topkc;++k){ float best=-1e30f;int bi=-1; for(int t=0;t<thr&&t<Tf;++t) if(s[t]>best){best=s[t];bi=t;} if(bi>=0){s[bi]=-1e30f; htop[(size_t)i*topkc+k]=nwin+bi;} } }
+    CU(cudaMemcpyAsync(dtop,htop.data(),(size_t)K*topkc*4,cudaMemcpyHostToDevice,stream));
+    // kv_all + combined idxs (window ⊕ indexer-selected compressed)
+    int ntot=nwin+Tf; float* kv_all; kv_all=(float*)dmalloc((size_t)ntot*HEAD_DIM*4);
+    CU(cudaMemcpyAsync(kv_all,win_kv,(size_t)nwin*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
+    CU(cudaMemcpyAsync(kv_all+(size_t)nwin*HEAD_DIM,comp_kv,(size_t)Tf*HEAD_DIM*4,cudaMemcpyDeviceToDevice,stream));
+    int wmax=0; for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;if(wid>wmax)wmax=wid;}
+    int topk=wmax+topkc; std::vector<int> comb((size_t)K*topk,-1);
+    for(int i=0;i<K;++i){int ig=pos+i,b=ig-WINDOW+1;if(b<0)b=0;int wid=ig+1-b;
+        for(int k=0;k<wid;++k) comb[(size_t)i*topk+k]=b+k;
+        for(int t=0;t<topkc;++t) comb[(size_t)i*topk+wmax+t]=htop[(size_t)i*topkc+t]; }
+    int* dcomb; dcomb=(int*)dmalloc((size_t)K*topk*4); CU(cudaMemcpyAsync(dcomb,comb.data(),(size_t)K*topk*4,cudaMemcpyHostToDevice,stream));
+    finish_attn(w, q, kv_all, dcomb, K, pos, ntot, topk, out, eps, stream);
+    dsync(stream);
+    dfree(q);dfree(xq2);dfree(xs2);dfree(qr2);dfree(iqrq);dfree(iqrs);dfree(qidx);dfree(qtmp);dfree(iw);dfree(iscore);dfree(dtop);dfree(kv_all);dfree(dcomb);
+}

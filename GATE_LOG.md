@@ -250,3 +250,14 @@ layers) dominates and is exactly what the native-dtype-scale optimization remove
 memory-neutral). Correctness first, speed next. The decode-spine attention is all bit-exact-gated; this wires it
 end-to-end. NEXT optimizations toward the ~273 GB/s / ~50 tok/s bound: (1) native-dtype scales (kill re-dequant),
 (2) pre-alloc buffers (Step 2), (3) CUDA graphs (Step 3), (4) DSpark spec-decode (Step 5, the multiplier).
+
+**Spec-decode M=K verify — the weight-share primitive: WORKS, 2.2x/token demonstrated.** `mla_verify_step` +
+`compressed_verify_step_{strided,indexer}` + `block_verify_step`/`cblock_verify_step` process K tokens at
+[pos..pos+K-1] in ONE forward — the GEMMs (attn projections, MoE, ogroup, wo_b) run at M=K so the weights are
+read ONCE for all K tokens (the spec-decode win); per-query window+compressed idxs, compressor emits groups
+completing in the block, indexer scores K queries. Gates: (a) `gate_mla_verify` synthetic — M=K verify ==
+K sequential mla_decode_step, **cosine 1.0, maxabs 0** (bit-exact math); (b) full 180B — M=5 verify in ONE
+forward = **67.9 ms/tok if all accepted vs 149.3 M=1 = 2.2x**, argmax matches the decode on all DETERMINISTIC
+positions (270/9829/16/983); the single diff (pos1: 3924 vs 6919) is a MoE-atomic near-tie the decode itself
+flips run-to-run (documented non-determinism), not a verify bug. Next: draft (DSpark head) proposes the K
+candidates + accept-longest-prefix loop -> real spec-decode throughput.

@@ -26,3 +26,10 @@ void compressed_attn_cache_r4(float* win_kv, float* comp_kv, float* idx_ckv, int
 void compressed_decode_step_indexer(float* out, const float* x_full, int pos, const CompressedAttnWeights& w,
                                     float* win_kv, float* comp_kv, float* idx_ckv, int* T, int ratio,
                                     float eps, cudaStream_t stream = 0);
+
+// M=K VERIFY (spec-decode): K tokens at [pos..pos+K-1], GEMMs at M=K (weights once). x_full supplies the
+// attention-input history (xin). ≡ K sequential decode steps.
+void compressed_verify_step_strided(float* out, const float* x_full, int pos, int K, const CompressedAttnWeights& w,
+                                    float* win_kv, float* comp_kv, int* T, int ratio, float eps, cudaStream_t stream = 0);
+void compressed_verify_step_indexer(float* out, const float* x_full, int pos, int K, const CompressedAttnWeights& w,
+                                    float* win_kv, float* comp_kv, float* idx_ckv, int* T, int ratio, float eps, cudaStream_t stream = 0);

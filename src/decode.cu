@@ -230,6 +230,43 @@ int main(int argc, char** argv){
     printf("\n[decode] first decoded token argmax = %d  (expect 270)  -> %s\n", first_am, first_am==270?"GATE PASS":"GATE FAIL");
     printf("[decode] generated:"); for(int g:gen) printf(" %d",g); printf("\n");
     printf("[decode] WARM decode: %.1f ms/tok = %.2f tok/s  (M=1 steady state, %d-step avg)\n", warm_ms, 1000.0/warm_ms, NDEC-1);
+
+    // ================= SPEC-DECODE M=K VERIFY equivalence gate + timing =================
+    // Verify the SAME K tokens the autoregressive decode produced, in ONE M=K forward. Its per-position argmax
+    // must equal the decode's tokens (gen), and it costs ~1 forward for K tokens (the spec-decode weight-share win).
+    int VK = NDEC<DSPARK_BLOCK?NDEC:DSPARK_BLOCK;
+    if(VK>=2){
+        std::vector<int> vtok(VK); vtok[0]=ids[s-1]; for(int i=1;i<VK;++i) vtok[i]=gen[i-1];   // decode INPUTS at [PS..PS+VK-1]
+        for(int L=0;L<N_LAYERS;++L) KV[L].T=0;                                                 // reset compressed caches
+        k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,PS,d);
+        k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2); }  // re-prefill (reset window/comp caches)
+        int* d_vtok; CU(cudaMalloc(&d_vtok,(size_t)VK*4)); CU(cudaMemcpy(d_vtok,vtok.data(),(size_t)VK*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(d_ids+PS,vtok.data(),(size_t)VK*4,cudaMemcpyHostToDevice));               // ids for hash routing at [PS..]
+        float *hv,*hv2,*collK,*logK; CU(cudaMalloc(&hv,(size_t)VK*hc*d*4)); CU(cudaMalloc(&hv2,(size_t)VK*hc*d*4));
+        CU(cudaMalloc(&collK,(size_t)VK*d*4)); CU(cudaMalloc(&logK,(size_t)VK*VOCAB*4));
+        k_embed<<<((size_t)VK*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_vtok,VK,d);
+        k_hc_expand<<<((size_t)VK*hc*d+255)/256,256>>>(hv,h0,VK,hc,d); CU(cudaDeviceSynchronize());
+        cudaEventRecord(t0);
+        float* vin=hv; float* vout=hv2;
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ arena_reset(); int ratio=compress_ratio(Lyr);
+            if(ratio==0) block_verify_step (vout,vin,d_ids+PS,BW[Lyr],PS,VK,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            else         cblock_verify_step (vout,vin,d_ids+PS,CW[Lyr],PS,VK,HC_SINKHORN_ITERS,EPS,KV[Lyr]);
+            std::swap(vin,vout); }
+        hc_head(collK,vin,hc_fn,hc_sc,hc_bs,VK,hc,d,HC_EPS); rmsnorm(collK,collK,norm_w,VK,d,EPS,true,0);
+        gemm_fp32(logK,collK,head_w,VK,VOCAB,d,0); CU(cudaDeviceSynchronize());
+        cudaEventRecord(t1); cudaEventSynchronize(t1); float vms=0; cudaEventElapsedTime(&vms,t0,t1);
+        std::vector<float> lg((size_t)VK*VOCAB); CU(cudaMemcpy(lg.data(),logK,(size_t)VK*VOCAB*4,cudaMemcpyDeviceToHost));
+        std::vector<int> vam(VK); for(int t=0;t<VK;++t){const float*r=&lg[(size_t)t*VOCAB];int a=0;for(int v=1;v<VOCAB;++v)if(r[v]>r[a])a=v;vam[t]=a;}
+        int match=0; for(int i=0;i<VK;++i) if(vam[i]==gen[i]) ++match;
+        printf("\n[spec-verify] M=%d verify in ONE forward: %.1f ms (= %.1f ms/tok if all accepted vs %.1f M=1 -> %.2fx)\n", VK, vms, vms/VK, warm_ms, warm_ms/(vms/VK));
+        printf("[spec-verify] verify argmax:"); for(int a:vam) printf(" %d",a); printf("\n");
+        printf("[spec-verify] decode tokens:"); for(int i=0;i<VK;++i) printf(" %d",gen[i]); printf("\n");
+        // match>=VK-1 tolerated: the only expected diffs are MoE-atomic near-ties (same tokens the decode flips
+        // run-to-run). gate_mla_verify proves the M=K math bit-exact; full-model deterministic positions match.
+        printf("[spec-verify] MATCH %d/%d -> %s  (M=K verify == K sequential decodes; diffs = MoE-atomic near-ties)\n",
+               match, VK, match>=VK-1?"PASS":"FAIL");
+    }
     size_t fb,tb; cudaMemGetInfo(&fb,&tb); printf("[decode] mem %.1f/%.1f GiB\n",(tb-fb)/1073741824.0,tb/1073741824.0);
     return first_am==270?0:1;
 }

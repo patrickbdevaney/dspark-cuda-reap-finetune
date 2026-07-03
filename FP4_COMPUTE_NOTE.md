@@ -11,6 +11,14 @@ decode (DSpark / DFlash) — the compute-bound regimes (prefill, batched capture
   .target sm_110". NVIDIA's own CUTLASS SM110 FP4 kernel is reported non-functional (dev-forum). FP8 mma
   (`m16n8k32.e4m3`) and fp16 mma ARE supported for hand-PTX.
 
+## UPDATE (probed CUDA 13.0, July 2026): FP4 compute is BLOCKED on Thor sm_110 via EVERY path
+- hand-PTX `mma.sync.kind::f8f6f4` / `tcgen05` / `mma…kind::mxf4.block_scale` → ptxas 'not supported on sm_110'.
+- **cuBLASLt FP4** (MXFP4 e2m1/ue8m0) → `cublasLtMatmulAlgoGetHeuristic` = status 7 (NOT_SUPPORTED), **0 algos**.
+- CUTLASS SM110 FP4 → reported non-functional (dev-forum).
+So the 2070-TFLOPS FP4 silicon is NOT reachable by any CUDA-13.0 software path on Thor yet. Re-test with the
+probe `experiments/cublas_fp4_probe.cu` (this repo) after each CUDA toolkit/driver update — when algos_found>0
+OR ptxas accepts fp4 for sm_110a, build the FP4 GEMM. Until then, **FP8 mma (m16n8k32, 2× fp16) is the ceiling.**
+
 ## The strategy (ranked)
 1. **Hand-PTX FP4 on `sm_110a` — the moment `ptxas` exposes it** (imminent; the silicon is there). Keeps the
    pure-hand-rolled ethos and hits 2070 TFLOPS. RE-TEST each CUDA toolkit release: compile a block-scaled

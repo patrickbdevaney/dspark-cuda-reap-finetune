@@ -45,8 +45,11 @@ These are the correctness-first shapes — chosen for provable correctness, alwa
 ## LEDGER (variant → measured tok/s → keep/kill → note)
 | # | component | variant | tok/s | vs champ | decision |
 |---|---|---|---|---|---|
-| 0 | ALL | correctness-first (baseline) | ~1 | — | baseline |
-| … | | | | | (append as we grind) |
+| 0 | MoE fp4 GEMM | fp4_gemm (warp-per-output, oracle) | 1.412 ms/call | — | baseline/gate-oracle |
+| 1 | MoE fp4 GEMM | **tc_fp4_gemm** (Marlin TC mma.sync.m16n8k16, W4A8) | **0.462 ms/call** | **3.06× FASTER** | **CHAMPION** (cosine 1.0, rms 0.03% vs fp4_gemm; incl per-call repack — cache it for more) |
+| — | next | cache weight repack at load (kill per-call repack+malloc) | | (expect >3×) | TODO |
+| — | next | native fp8 mma m16n8k32 (skip fp8→fp16) | | (~2× more) | TODO |
+| — | next | batched/grouped MoE dispatch (kill host per-token loop) | | | TODO |
 
 ## Target #1 PORT DESIGN (turnkey — adapt gemma tc_w4a16 → our W4A8 MoE-expert GEMM)
 Champion `tc_verify_gemm.cu` is fp4-weight × **fp16**-act, mma.sync.m16n8k16.f32.f16.f16.f32, 1 warp=8 N-cols,

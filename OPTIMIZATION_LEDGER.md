@@ -69,3 +69,31 @@ A/B in the decode harness → log tok/s here. Then batch the MoE dispatch (devic
 ## STATUS (campaign): baseline+bottleneck+champion+plan committed; scan retry @11:10pm ET (resumeFromRunId
 ## wf_b54e3f4d-169). NEXT EXECUTION = write kernels/tc_moe_gemm.cu per the design above, gate bit-exact vs
 ## fp4_gemm, A/B in the decode harness. This is the single largest expected jump (naive→TC GEMM, ~10-30×).
+
+## LITERATURE SCAN RESULTS (deep-research wf_b54e3f4d-169, 23 sources, 24 confirmed / 1 refuted)
+**REFRAMING INSIGHT (highest value):** *low-batch decode is MEMORY-BANDWIDTH-bound — cost is dominated by
+weight loading, not compute or routing* (confirmed, fused-MoE + FlashMLA sources). This EXPLAINS our own A/B:
+M=1 → 2.71× (bandwidth-capped, weight load dominates) vs M=8 → 19.7× (load amortized, compute-where-TC-wins).
+So the biggest decode levers are **(a) reduce weight TRAFFIC and (b) BATCH to amortize loads** — not just faster MMA.
+
+### Ranked black-swans for next rounds (with source-backed numbers)
+1. **Batch/amortize weight loads** — the TC win scales with M (our data + theory). Batch the decode microstep and
+   the spec-decode block(5) through the MoE so weight loads amortize → toward the 19.7× regime. (Highest ROI, free.)
+2. **Fuse gate+up (w1,w3) projections** — share input tile, keep intermediate in registers → ~35% less global
+   memory traffic, **1.16–1.40×** (source: fused-MoE-dispatch). Directly attacks the bandwidth bound. Clean win.
+3. **No-fp32-dequant / native-dtype** (e8m0 scales in-kernel, fp8 wo_a, bf16 lm_head) — pure traffic reduction,
+   also the MEMORY.md win. Bandwidth-bound decode makes this a SPEED win too, not just memory.
+4. **Grouped GEMM (single-launch, device permute/unpermute + row_id_map)** for MoE dispatch — kills the host
+   per-token loop + per-expert launches; block-scheduled Triton variant (BLOCK_M fixed) cut Mixtral 24→5 launches,
+   beat Megablocks +131% @32 tok (LOW-batch win, falls off @512 — our regime). NOTE: CUTLASS grouped GEMM has
+   **no FP4/W4A8** — we build our own W4A8 grouped GEMM (extend tc_moe_gemm to multi-expert single launch).
+5. **CUDA graphs** to kill 43-layer launch overhead. **Megakernel REFUTED** (0-3 vote: does NOT reliably beat
+   CUDA-graphed cuBLAS at int8 batch-1) → prefer CUDA graphs, do NOT over-invest in a full megakernel.
+6. **MLA sparse decode is DEQUANT-bound** (dequant ~50 cyc vs MMA ~34 cyc/token), not MMA-bound. FlashMLA is
+   SM90/SM100 only (no sm_110a) → adapt, don't port. The CTA-cluster "crossover" exploits MQA (1 KV head, all
+   query heads share it) to cut dequant 50% — applicable to our MLA (1 KV head). FP8 KV = 656 B/token layout.
+Sources: DeepGEMM, FlashMLA hopper-fp8-sparse-deep-dive, fused-moe-dispatch-triton, momoe, NV_grouped_gemm,
+hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x blogs. journal.jsonl has all 111.
+
+## REVISED GRIND ORDER (bandwidth-first): batch loads (1) → fuse gate+up (2) → native-dtype no-dequant (3) →
+## W4A8 grouped GEMM single-launch (4) → CUDA graphs (5) → MLA dequant-cut crossover (6). Each A/B'd + logged.

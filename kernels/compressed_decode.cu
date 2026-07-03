@@ -331,7 +331,8 @@ void compressed_verify_step_indexer(float* out, const float* x_full, int pos, in
 // ================= device-pos compressed decode (CUDA-graph capturable) =================
 // combined cache kvc = [winmax(window) .. winmax+Tmax(compressed)][HEAD_DIM]; d_T = device compressed count.
 #include "mla_forward.h"
-__global__ void k_gather_win_dp(float* scr, const float* xin, const int* d_pos, int ntok, int tok_off, int dim){
+__global__ void k_gather_win_dp(float* scr, const float* xin, const int* d_pos, int ntok, int tok_off, int dim, int ratio){
+    if(((*d_pos)+1)%ratio!=0) return;   // only gather on commit steps (graph launch stays static)
     long i=(long)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(long)ntok*dim) return; int r=i/dim, c=i%dim;
     int t=(*d_pos)+tok_off+r; if(t<0) t=0; scr[i]=xin[(size_t)t*dim+c]; }   // clamp: candidate computed every step (commit self-masked); early neg windows must not OOB
 __global__ void k_dg(int* d_g, const int* d_pos, int ratio){ if(!threadIdx.x&&!blockIdx.x) *d_g=(*d_pos)/ratio; }
@@ -356,8 +357,8 @@ static void emit_group_dp(float* comp_region, const float* xin, const int* d_pos
     float *scr,*kv,*score,*pooled,*cand;
     scr=(float*)dmalloc((size_t)ntok*dim*4); kv=(float*)dmalloc((size_t)ntok*od*4); score=(float*)dmalloc((size_t)ntok*od*4);
     pooled=(float*)dmalloc((size_t)(localg+1)*d*4); cand=(float*)dmalloc((size_t)d*4);
-    k_gather_win_dp<<<((size_t)ntok*dim+255)/256,256,0,stream>>>(scr,xin,d_pos,ntok,tok_off,dim);
-    gemm_fp32(kv,scr,wkv,ntok,od,dim,stream); gemm_fp32(score,scr,wgate,ntok,od,dim,stream);
+    k_gather_win_dp<<<((size_t)ntok*dim+255)/256,256,0,stream>>>(scr,xin,d_pos,ntok,tok_off,dim,ratio);
+    gemm_fp32_cond(kv,scr,wkv,ntok,od,dim,d_pos,ratio,stream); gemm_fp32_cond(score,scr,wgate,ntok,od,dim,d_pos,ratio,stream);
     if(overlap) compressor_pool_overlap(pooled,kv,score,ape,localg+1,ratio,d,stream);
     else        compressor_pool(pooled,kv,score,ape,1,ratio,d,stream);
     rmsnorm(cand,pooled+(size_t)localg*d,norm_w,1,d,eps,true,stream);

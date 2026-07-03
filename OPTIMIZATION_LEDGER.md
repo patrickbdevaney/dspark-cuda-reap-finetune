@@ -205,3 +205,17 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   0.67x -> **0.91x** base. Stable target argmax stops rejecting valid drafts. Still <1x: M=5 verify = 2.8x M=1
   (415 vs 146 ms) -> the remaining gap is CUDA graphs (verify -> weight-bound floor) + head fine-tune (Phase 3).
   Plain decode now bit-reproducible run-to-run (270 3924 16 983 344 260), 147.9 ms/tok (no regression).
+
+## CUDA graphs — full 43-layer step CAPTURED, correct, at PARITY (0.99x)
+- Device-pos rewrite of ALL decode flavors (mla/strided/indexer _dp + block wrappers) over combined caches with
+  a device-conditional compressor emit; captured the WHOLE per-token step as one cudaGraph. argmax=270, generated
+  270 3924 16 983 344 260 4593 396 == deterministic base (bit-exact). Gates: gate_{mla,compressed,indexer}_graph
+  cosine 1.0.
+- **A/B: 148.9 ms/tok (graph) vs 147.9 (non-graph) = 0.99x (parity).** Progression while removing the emit
+  overhead: naive always-run emit 191 ms (0.78x) -> conditional-compute emit 158 (0.94x) -> grid-stride
+  conditional emit 148.9 (0.99x).
+- **HONEST FINDING: graphs give NO speedup here because the M=1 decode is already GPU/bandwidth-bound, not
+  launch-bound** — the earlier opts (structs-once, arena, GEMV, native scales) removed the per-token host
+  overhead, so there's little launch overhead left for a graph to eliminate. The remaining 148 ms/tok is the
+  active-weight bandwidth floor. The lever to beat it is SPEC-DECODE (amortize weights over K tokens), not graphs.
+  Graphs are now available infra (e.g. could wrap the M=K verify) but aren't the bottleneck at M=1.

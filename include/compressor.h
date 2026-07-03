@@ -6,6 +6,7 @@
 
 // C[M,N] = A[M,K] @ B[N,K]^T, all fp32.
 void gemm_fp32(float* C, const float* A, const float* B, int M, int N, int K, cudaStream_t stream = 0);
+void gemm_fp32_cond(float* C, const float* A, const float* B, int M, int N, int K, const int* d_pos, int ratio, cudaStream_t stream = 0);
 
 // Gated pooling: pooled[g,e] = Σ_p softmax_p(score[g*ratio+p,e] + ape[p,e]) * kv[g*ratio+p,e].
 // kv,score:[groups*ratio, d]; ape:[ratio,d]; pooled:[groups,d].

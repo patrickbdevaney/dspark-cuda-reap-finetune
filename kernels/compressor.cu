@@ -16,6 +16,23 @@ __global__ void gemm_fp32_kernel(float* __restrict__ C, const float* __restrict_
 void gemm_fp32(float* C, const float* A, const float* B, int M, int N, int K, cudaStream_t stream) {
     dim3 grid(N, M); gemm_fp32_kernel<<<grid, 32, 0, stream>>>(C, A, B, M, N, K);
 }
+// device-conditional gemm (CUDA-graph emit): launch stays static but the block early-exits when this step is
+// NOT a group-completion (so the expensive K-loop only runs on commit steps ~ every `ratio` tokens).
+// grid-STRIDE (small fixed grid) so non-commit steps schedule few blocks (all early-return), not M*N of them.
+__global__ void gemm_fp32_cond_kernel(float* __restrict__ C, const float* __restrict__ A, const float* __restrict__ B,
+                                      int M, int N, int K, const int* __restrict__ d_pos, int ratio){
+    if(((*d_pos)+1)%ratio != 0) return;
+    int lane=threadIdx.x&31, wpb=blockDim.x>>5, warp=blockIdx.x*wpb + (threadIdx.x>>5), nw=gridDim.x*wpb, tot=M*N;
+    for(int idx=warp; idx<tot; idx+=nw){ int m=idx/N, n=idx%N;
+        const float* a=A+(size_t)m*K; const float* b=B+(size_t)n*K; float acc=0.f;
+        for(int k=lane;k<K;k+=32) acc+=a[k]*b[k];
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+        if(lane==0) C[idx]=acc; }
+}
+void gemm_fp32_cond(float* C, const float* A, const float* B, int M, int N, int K, const int* d_pos, int ratio, cudaStream_t stream){
+    gemm_fp32_cond_kernel<<<256,256,0,stream>>>(C,A,B,M,N,K,d_pos,ratio);   // 256*8=2048 warps grid-stride M*N
+}
 
 // pooled[g,e] = Σ_p softmax_p(score[g*ratio+p,e]+ape[p,e]) * kv[g*ratio+p,e]. One thread per (g,e).
 __global__ void compressor_pool_kernel(float* __restrict__ pooled, const float* __restrict__ kv,

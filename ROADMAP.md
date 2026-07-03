@@ -15,14 +15,21 @@ artifact — nothing disposable.**
 
 ---
 
-## WHERE WE ARE NOW (turn ~34)
-**`forward.cu` WRITTEN and COMPILES** (`src/forward.cu`, `scripts/build_forward.sh`) — full 180B assembled:
-WeightStore load + dequant (e8m0 scales→fp32, wo_a fp8-block→fp32, bf16→fp32) + per-layer struct
-population + YaRN freqs + embed→HC-expand→43-layer loop (block/compressed_block)→hc_head→norm→lm_head.
-**Gate 1 (first full run on Thor) is executing/iterating now.** Expect first-run bugs (name typos, dtype/
-shape mismatches, freq indexing) — iterate: read run output, fix, `bash scripts/build_forward.sh`, re-run
-`./build/forward <dir> <s>`. Loader + both attention variants + Block all validated, so failures are
-integration wiring, not kernel math.
+## WHERE WE ARE NOW (turn ~36) — GATE 1 PASSED ✅
+**The full DeepSeek-V4-180B-REAP forward RUNS on Thor** (`src/forward.cu`, `build/forward`, `scripts/build_forward.sh`).
+s=8 prefill: all 43 layers, memory FLAT 120.5/122.8 GiB, finite sane logits (argmax=1822 logit=16.4),
+5494 ms (687 ms/tok, unoptimized). OOM fixed by per-layer dequant scoping (`Loader::mark/release`).
+NOTE: mem tight partly due to **RustDesk GUI overhead — run headless via SSH+tmux** to reclaim ~15-20 GiB.
+RUN: `./build/forward /home/patrickd/models/DeepSeek-V4-Flash-180B <s>`.
+
+**NEXT (recursion):**
+- **Gate 1.5 — correctness:** per-layer math already gated on real weights (block 0.23%, compressed cosine
+  1.0, same dequant path as goldens). Validate END-TO-END: feed a real tokenized prompt (inherited
+  `include/tokenizer.h`, `server/tok_test.cpp`; check model tokenizer files) → greedy-decode → sensible text?
+  OR compare logits to a reference (full 96 GiB ref forward is infeasible on CPU — prefer tokenizer sanity +
+  spot-checking dequant/freqs/head pieces). Risks are forward.cu-new: freqs indexing, embed/HC-init, head.
+- **Speed:** 687 ms/tok is correctness-first (per-token host loops, warp-per-output GEMMs). Phase E optimizes.
+- **Gate 2 — DSpark MTP head** (pivotal): implement `mtp.0.*` head, measure unfine-tuned τ on REAP.
 
 ### (historical) Weight-to-device loader path: SOLVED & PROVEN (`tools/load_device.cu`)
 - Probed: `integrated=1, hostRegisterSupported=1, canUseHostPtrForRegMem=1, canMapHostMem=1`.

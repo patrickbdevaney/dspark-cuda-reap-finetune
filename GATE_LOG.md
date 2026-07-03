@@ -151,5 +151,16 @@ repacked in place + separate fp16 scale ~7GB), not per-forward. Banked config: *
 (1.23x, no repack, no OOM)**; tc_fp4 MoE deferred to repack-at-load. The MoE is the dominant cost, so
 repack-at-load is the next big lever (unlocks 19.7x on the bulk).
 
+**Repack-at-load pp MoE — correct + zero-mem, but byte-loads negate the win (measured).** Repack-at-load
+solved the OOM (in-place, same byte-size) AND the per-layer churn (no malloc, read original scale). Kernel
+cosine 1.0. BUT the in-place weight sits at arbitrary safetensors offsets, so the 16B uint4 __ldcs faulted →
+switched to byte loads (alignment-safe) → **555.9 ms/tok (~neutral vs 559.8 dense-only)**. Root cause of the
+non-win: decode is BANDWIDTH-bound; tc_fp4's 19.7x came from COALESCED uint4 weight loads, and byte loads are
+uncoalesced (≈ fp4_gemm's load). So the TC compute win is masked by the slow load. FIX (next): aligned loads —
+either (a) funnel-shift (2 aligned uint4 straddling each 16B, combine by the constant per-weight offset; L2
+absorbs the overlap) or (b) loader places routed-expert tensors 16B-aligned so uint4 __ldcs works in place.
+LESSON: a correct kernel isn't a fast kernel — on a bandwidth-bound path, load coalescing IS the win; measure
+end-to-end, don't assume the unit-gate speedup transfers when the memory access pattern changed.
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

@@ -44,7 +44,8 @@ for **black-swan / step-change** techniques so we don't thrash on diminishing re
 | Lever | Status | Measured |
 |---|---|---|
 | tc_fp8 dense (17.9×) + batched | ✅ wired | 559.8 ms/tok (1.23×) |
-| tc_fp4 pp MoE (repack-at-load) | in progress | (pending) |
+| tc_fp4 pp MoE (repack-at-load, byte-load) | ✅ correct, but ~neutral | 555.9 ms/tok (byte-loads negate coalescing) |
+| **tc_fp4 pp ALIGNED load** (funnel-shift OR loader 16B-align) | **NEXT (unlocks MoE 19.7×)** | — |
 | CUDA graphs + device MoE routing + fusion | TODO | — |
 | DSpark spec decode (block verify) | TODO (τ≈0.815 proven) | — |
 | FP4 compute (4×) | BLOCKED (CUDA 13) | re-test probe armed |

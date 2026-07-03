@@ -133,3 +133,14 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   the M=1 launch-bound decode regime is where this compounds hardest.
 - kernel: `kernels/tc_moe_gemm.cu` (`k_grouped_w4a8_kernel`, `k_build_tiles`, `tc_fp4_grouped_gemm`);
   integration `kernels/moe.cu` (`g_moe_grouped` branch); gate `tests/gate_grouped_moe.cu`.
+
+## Decode opt #1 — native-e8m0 expert scales (no per-token dequant) — WIN 3x
+- **A/B (full 43-layer M=1 decode, argmax=270 both, generated seq identical):** per-layer f32 dequant
+  **2019 ms/tok (0.50 tok/s)** -> native e8m0 **678 ms/tok (1.47 tok/s)** = **-66% (3.0x)**. mem 110.7/122.8.
+- **Mechanism:** the grouped MoE GEMM reads the ORIGINAL e8m0 scale BYTES (F8_E8M0) from the WeightStore and
+  computes `exp2f(byte-127)` in-register (bit-identical to the pre-dequanted f32 pow2 -> same argmax/tokens).
+  Removes ~160x3 `cudaMalloc`+dequant-kernel launches PER LAYER PER TOKEN (~20,640/token) AND keeps the scale
+  pointers persistent (no f32 buffer). kernel `k_grouped_w4a8_e8m0_kernel` (tc_moe_gemm.cu); `MoEWeights.e8m0_scales`.
+- Remaining per-token dequant (next levers): wo_a fp8->f32 (134 MB/layer), attn fp8 scales, norms bf16->f32,
+  shared-expert scales; + thousands of scratch mallocs/syncs per token (pre-alloc = Step 2) + launch overhead
+  (CUDA graphs = Step 3). Physics floor ~273 GB/s -> active-weight reads ~20-25 ms/tok base; still overhead-bound.

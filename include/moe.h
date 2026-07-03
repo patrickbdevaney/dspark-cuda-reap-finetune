@@ -36,6 +36,10 @@ struct MoEWeights {
     // If w1p != null, expert e uses w1p[e]/w1sp[e]/... instead of the stacked w1+e*stride. Gates leave null.
     const uint8_t *const *w1p = nullptr, *const *w2p = nullptr, *const *w3p = nullptr;
     const float   *const *w1sp = nullptr, *const *w2sp = nullptr, *const *w3sp = nullptr;
+    // NATIVE-e8m0 decode path: per-expert e8m0 scale-BYTE tables (persistent WeightStore ptrs, no dequant).
+    // When e8m0_scales, the grouped MoE reads these instead of w1sp/... and dequants exp2(byte-127) in-kernel.
+    bool e8m0_scales = false;
+    const uint8_t *const *w1sp8 = nullptr, *const *w2sp8 = nullptr, *const *w3sp8 = nullptr;
 };
 // x:[bs,dim] fp32, input_ids:[bs] i32 (for hash routing) -> out:[bs,dim] fp32.
 void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeights& w,

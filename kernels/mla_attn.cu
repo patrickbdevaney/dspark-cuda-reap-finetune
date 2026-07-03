@@ -247,9 +247,27 @@ __global__ void tc_ogroup_fp8_kernel(float* out, const __half* o16, const uint8_
     if(gid+8<bs && n0+cn+1<R) out[((size_t)(gid+8)*G+gg)*R + n0+cn+1]=c[3];
 }
 bool g_tc_ogroup = false;   // forward.cu sets true; gates use the warp-per-output oracle
+// M=1 ogroup GEMV: one warp per output (g,r), out[g*R+r] = sum_d o[g][d]*fp8(wo[gr][d])*e8m0scale. Coalesced
+// strided reads (lanes read consecutive bytes), NO mma waste (bs=1). Kills the tc_ogroup's scalar-byte m16 mma
+// (~32 ms/tok -> bandwidth). Gated cosine vs ogroup_gemm oracle (tests/gate_ogroup_gemv.cu).
+__global__ void ogroup_gemv_fp8_kernel(float* __restrict__ out, const float* __restrict__ o,
+                                       const uint8_t* __restrict__ wo, const uint8_t* __restrict__ wsc, int G, int R, int Kd){
+    int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5; int total=G*R; if(warp>=total) return;
+    int gr=warp, g=gr/R; int lane=threadIdx.x&31, scw=Kd/128;
+    const uint8_t* wr=wo+(size_t)gr*Kd; const uint8_t* sr=wsc+(size_t)(gr/128)*scw; const float* og=o+(size_t)g*Kd;
+    float acc=0.f;
+    for(int kb=0; kb<Kd/128; ++kb){ float ws=exp2f((float)sr[kb]-127.f);
+        for(int dd=kb*128+lane; dd<(kb+1)*128; dd+=32) acc += og[dd]*ogm_e4m3(wr[dd])*ws; }
+    #pragma unroll
+    for(int o2=16;o2>0;o2>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o2);
+    if(lane==0) out[gr]=acc;
+}
 // fp8-native TC ogroup: o(f32)->f16 + fused fp8 wo_a decode in the mma. No per-token wo16 conversion.
 void ogroup_gemm_fp8(float* out, const float* o, const uint8_t* wo_fp8, const uint8_t* wo_sc,
                      int bs, int G, int R, int Kd, cudaStream_t stream){
+    if(bs==1 && getenv("NO_OGGEMV")==nullptr){          // M=1 decode: bandwidth-bound GEMV (no mma waste)
+        int threads=256; ogroup_gemv_fp8_kernel<<<((size_t)G*R*32+threads-1)/threads,threads,0,stream>>>(out,o,wo_fp8,wo_sc,G,R,Kd);
+        dsync(stream); return; }
     __half* o16; o16=(__half*)dmalloc((size_t)bs*G*Kd*2);
     k_f2h<<<((size_t)bs*G*Kd+255)/256,256,0,stream>>>(o16,o,(size_t)bs*G*Kd);
     dim3 grid((R+7)/8, G); tc_ogroup_fp8_kernel<<<grid,32,0,stream>>>(out,o16,wo_fp8,wo_sc,bs,G,R,Kd);

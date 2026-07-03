@@ -234,3 +234,15 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   KV gather), not launch/compute/bandwidth-LIMIT bound. Levers past this: (1) head fine-tune (Phase 3, raise
   acceptance -- the clearest spec-decode win), (2) deep per-kernel bandwidth profiling + access-pattern fixes on
   the below-bandwidth kernels. Not graphs, not M=K GEMV, not sync removal (all tested).
+
+## Decode opt #9 — M=1 ogroup GEMV (profile-guided) — WIN -15%
+- nsys of the CURRENT decode (after all prior opts) showed the biggest per-token kernels are NOT bandwidth-bound:
+  tc_ogroup_fp8 ~32 ms/tok and k_grouped_w4a8 (MoE) — both ~40 GB/s (1/6 of peak). Root cause for ogroup: it did
+  SCALAR fp8 byte reads inside an m16 mma that wastes 15/16 rows at bs=1.
+- **A/B (warm M=1, argmax=270):** ogroup_gemm_fp8 bs==1 -> `ogroup_gemv_fp8_kernel` (one warp/output, coalesced
+  strided byte reads, e8m0 scale per-128, NO mma waste): **148 -> 126.2 ms/tok (6.76 -> 7.93 tok/s) = -15%.**
+  Unit gate cosine 1.0 vs the f32 ogroup oracle (tests/gate_ogroup_gemv.cu). NO_OGGEMV=1 restores TC.
+- **Cumulative decode: 0.50 -> 7.93 tok/s = 15.9x** (opts #1-9). This is the kernel-efficiency lever the earlier
+  finding pointed to: profile -> find the below-bandwidth kernel -> vectorize its reads / kill the mma waste.
+  (The M=K GEMV was the WRONG target; the M=1 ogroup was the RIGHT one.) Next biggest per-token: the MoE grouped
+  GEMM (fp4 GEMV lost earlier, so it stays TC) + a fresh profile to find the new top kernel.

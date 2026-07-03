@@ -65,7 +65,8 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
 
     // 5. de-rotate o, grouped o-LoRA, wo_b
     rope_interleaved(o + NOPE_DIM, cosP, sinP, N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
-    ogroup_gemm(og, o, w.wo_a, 1, O_GROUPS, O_LORA, GKd, stream);
+    if(w.wo_a_native) ogroup_gemm_fp8(og, o, w.wo_a_fp8, w.wo_a_sc, 1, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, w.wo_a,                1, O_GROUPS, O_LORA, GKd, stream);
     act_quant_fp8(ogq, ogs, og, 1, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, w.wo_b, w.wo_b_s, 1, DIM, OB, stream);
 

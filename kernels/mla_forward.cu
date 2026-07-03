@@ -73,7 +73,8 @@ void mla_forward(float* out, const float* x, const MLAWeights& w, int b, int s, 
 
     // 6. de-rotate o, grouped o-LoRA, wo_b
     rope_interleaved(o + NOPE_DIM, w.cosT, w.sinT, bs * N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
-    ogroup_gemm(og, o, w.wo_a, bs, O_GROUPS, O_LORA, GKd, stream);               // o viewed [bs,G,GKd]
+    if(w.wo_a_native) ogroup_gemm_fp8(og, o, w.wo_a_fp8, w.wo_a_sc, bs, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, w.wo_a,                bs, O_GROUPS, O_LORA, GKd, stream);   // o [bs,G,GKd]
     act_quant_fp8(ogq, ogs, og, bs, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, w.wo_b, w.wo_b_s, bs, DIM, OB, stream);
 

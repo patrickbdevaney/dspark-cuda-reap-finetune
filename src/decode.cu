@@ -134,7 +134,8 @@ int main(int argc, char** argv){
         a.wq_a=L.raw(p+"wq_a.weight");a.wq_a_s=L.scale(p+"wq_a.scale");a.wq_b=L.raw(p+"wq_b.weight");a.wq_b_s=L.scale(p+"wq_b.scale");
         a.wkv=L.raw(p+"wkv.weight");a.wkv_s=L.scale(p+"wkv.scale");a.wo_b=L.raw(p+"wo_b.weight");a.wo_b_s=L.scale(p+"wo_b.scale");
         a.q_norm=L.bf16(p+"q_norm.weight");a.kv_norm=L.bf16(p+"kv_norm.weight");
-        a.wo_a=L.wo_a(p+"wo_a.weight",p+"wo_a.scale");a.attn_sink=L.f32(p+"attn_sink");
+        a.wo_a_native=true; a.wo_a_fp8=L.raw(p+"wo_a.weight"); a.wo_a_sc=L.raw(p+"wo_a.scale");  // native fp8 (no dequant)
+        a.attn_sink=L.f32(p+"attn_sink");
         a.cosT=compressed?cqc:slide_cos;a.sinT=compressed?cqs:slide_sin; };
 
     // build one layer's weights (dequant), run either prefill_cache (bs=PS) or a decode step (pos), then it's the

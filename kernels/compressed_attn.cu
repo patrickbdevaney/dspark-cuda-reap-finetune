@@ -86,7 +86,8 @@ void compressed_attn_forward(float* out, const float* x, const CompressedAttnWei
     // --- sparse attention over combined KV, then de-rotate + grouped o-LoRA + wo_b ---
     sparse_attn(o, q, kv_all, a.attn_sink, combined, 1, s, N_HEADS, HEAD_DIM, s + T, tot, scale, stream);
     rope_interleaved(o + NOPE_DIM, a.cosT, a.sinT, bs * N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
-    ogroup_gemm(og, o, a.wo_a, bs, O_GROUPS, O_LORA, GKd, stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og, o, a.wo_a_fp8, a.wo_a_sc, bs, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, a.wo_a,                bs, O_GROUPS, O_LORA, GKd, stream);
     act_quant_fp8(ogq, ogs, og, bs, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, a.wo_b, a.wo_b_s, bs, DIM, OB, stream);
 

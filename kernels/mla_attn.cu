@@ -198,7 +198,25 @@ __global__ void tc_ogroup_kernel(float* out, const __half* o16, const __half* wo
     if(gid+8<bs && n0+cn  <R) out[((size_t)(gid+8)*G+gg)*R + n0+cn ]=c[2];
     if(gid+8<bs && n0+cn+1<R) out[((size_t)(gid+8)*G+gg)*R + n0+cn+1]=c[3];
 }
+// NATIVE wo_a: fp8 byte * e8m0 block-scale -> f16, in ONE pass (no f32 dequant buffer, no double conversion).
+#include <cuda_fp8.h>
+__global__ void k_wo_fp8_to_f16(__half* wo16, const uint8_t* w, const uint8_t* sc, int GR, int Kd){
+    size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x; if(i>=(size_t)GR*Kd) return; int row=i/Kd, col=i%Kd;
+    __half_raw hr=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)w[i], __NV_E4M3);
+    float wv=__half2float(*reinterpret_cast<__half*>(&hr));
+    int scw=Kd/128; float s=exp2f((float)sc[(size_t)(row/128)*scw + col/128]-127.f);
+    wo16[i]=__float2half(wv*s);
+}
 bool g_tc_ogroup = false;   // forward.cu sets true; gates use the warp-per-output oracle
+// fp8-native TC ogroup: o(f32)->f16 + wo_a(fp8+e8m0)->f16 in-kernel, then m16n8k16. Kills the wo_a f32 dequant.
+void ogroup_gemm_fp8(float* out, const float* o, const uint8_t* wo_fp8, const uint8_t* wo_sc,
+                     int bs, int G, int R, int Kd, cudaStream_t stream){
+    __half *o16,*wo16; o16=(__half*)dmalloc((size_t)bs*G*Kd*2); wo16=(__half*)dmalloc((size_t)G*R*Kd*2);
+    k_f2h<<<((size_t)bs*G*Kd+255)/256,256,0,stream>>>(o16,o,(size_t)bs*G*Kd);
+    k_wo_fp8_to_f16<<<((size_t)G*R*Kd+255)/256,256,0,stream>>>(wo16, wo_fp8, wo_sc, G*R, Kd);
+    dim3 grid((R+7)/8, G); tc_ogroup_kernel<<<grid,32,0,stream>>>(out,o16,wo16,bs,G,R,Kd);
+    dsync(stream); dfree(o16); dfree(wo16);
+}
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream) {
     if (g_tc_ogroup && Kd%16==0) {

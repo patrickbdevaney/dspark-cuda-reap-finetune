@@ -144,3 +144,13 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
 - Remaining per-token dequant (next levers): wo_a fp8->f32 (134 MB/layer), attn fp8 scales, norms bf16->f32,
   shared-expert scales; + thousands of scratch mallocs/syncs per token (pre-alloc = Step 2) + launch overhead
   (CUDA graphs = Step 3). Physics floor ~273 GB/s -> active-weight reads ~20-25 ms/tok base; still overhead-bound.
+
+## Decode opt #4 — native wo_a (fp8+e8m0 -> f16 in one pass, no f32 dequant) — WIN -22%
+- **A/B (warm M=1 decode, argmax=270):** 581 ms/tok (1.72) -> **453 ms/tok (2.21 tok/s)** = -22%. mem 110.6.
+- **Mechanism (nsys-guided):** profile showed `k_deq_fp8_blk` (wo_a fp8->f32, 2.02 ms x43 = 87 ms/tok) +
+  `k_f2h` (f32->f16, ~53 ms/tok) dominating. `ogroup_gemm_fp8`/`k_wo_fp8_to_f16` convert the fp8 wo_a straight
+  to f16 with the e8m0 block-scale in-register (bit-identical: same fp8 decode x exp2(byte-127) x float2half),
+  killing the f32 dequant buffer AND the double conversion. wo_a stays native/persistent (MLAWeights.wo_a_native).
+- **NOTE (non-determinism):** multi-token decode sequences vary run-to-run (MoE scatter_add atomics -> near-tie
+  argmax flips downstream); token-0 argmax is stable (==270) so the gate is deterministic. Benign; a sorted
+  scatter would make it bit-reproducible if ever needed.

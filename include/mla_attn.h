@@ -41,3 +41,6 @@ void act_quant_fp4sim(float* x, int rows, int active_dim, int block, int row_str
 // Grouped o-LoRA GEMM: out[bs,G,R] = sum_d o[bs,G,d] * wo_a[G,R,d]. fp32.
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream = 0);
+// NATIVE wo_a variant: wo_a as fp8 bytes + e8m0 block scale (no per-token f32 dequant). TC path.
+void ogroup_gemm_fp8(float* out, const float* o, const uint8_t* wo_fp8, const uint8_t* wo_sc,
+                     int bs, int G, int R, int Kd, cudaStream_t stream = 0);

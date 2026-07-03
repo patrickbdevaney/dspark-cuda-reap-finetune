@@ -99,7 +99,8 @@ void compressed_decode_step_strided(float* out, const float* x_full, int pos, co
     sparse_attn(o, q, kv_all, a.attn_sink, dcomb, 1, 1, N_HEADS, HEAD_DIM, ntot, tot, scale, stream);
     // de-rotate, grouped o-LoRA, wo_b
     rope_interleaved(o + NOPE_DIM, cosP, sinP, N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
-    ogroup_gemm(og, o, a.wo_a, 1, O_GROUPS, O_LORA, GKd, stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og, o, a.wo_a_fp8, a.wo_a_sc, 1, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, a.wo_a,                1, O_GROUPS, O_LORA, GKd, stream);
     act_quant_fp8(ogq, ogs, og, 1, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, a.wo_b, a.wo_b_s, 1, DIM, OB, stream);
 
@@ -204,7 +205,8 @@ void compressed_decode_step_indexer(float* out, const float* x_full, int pos, co
     CU(cudaMemcpyAsync(comb + wwidth, dtop, (size_t)topk*4, cudaMemcpyDeviceToDevice, stream));
     sparse_attn(o, q, kv_all, a.attn_sink, comb, 1, 1, N_HEADS, HEAD_DIM, ntot, tot, scale, stream);
     rope_interleaved(o + NOPE_DIM, cosP, sinP, N_HEADS, ROPE_DIM, true, HEAD_DIM, N_HEADS, stream);
-    ogroup_gemm(og, o, a.wo_a, 1, O_GROUPS, O_LORA, GKd, stream);
+    if(a.wo_a_native) ogroup_gemm_fp8(og, o, a.wo_a_fp8, a.wo_a_sc, 1, O_GROUPS, O_LORA, GKd, stream);
+    else              ogroup_gemm    (og, o, a.wo_a,                1, O_GROUPS, O_LORA, GKd, stream);
     act_quant_fp8(ogq, ogs, og, 1, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, a.wo_b, a.wo_b_s, 1, DIM, OB, stream);
 

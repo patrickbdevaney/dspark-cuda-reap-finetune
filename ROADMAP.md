@@ -5,6 +5,16 @@
 `reference/DEEPSEEK_V4_MODELING_NOTES.md` (numeric spec), and the memory file
 `~/.claude/projects/-home-patrickd/memory/dspark-v4flash-180b-thor.md`.
 
+## HIGH-LEVEL OVERVIEW (user, turn ~48) — the definitive remaining sequence
+1. **Fastest kernels for base decode** (target model) — TC mma.sync GEMMs + batched MoE + fusion/graphs → 38-50 tok/s.
+2. **Fastest kernels for DSpark** (the UNPRUNED draft head) — the block-diffusion head decode, co-optimized with (1).
+3. **Minimized-wall-time optimal capture + training** — high-τ acceptance + outcome decode for the draft head; the
+   *fastest* kernels from (1,2) make capture feasible; representative on-policy coverage; block-acceptance objective.
+4. **OpenAI-compatible inference server** — take the BASE INFERENCE kernels (separate from the capture/fine-tune
+   TRAINING kernels) and build the server with **feature parity with gemma-cuda-hybrid** (NVFP4 decode, OpenAI API,
+   reasoning/tool parsing, prefix cache, FP8 KV, web+terminal chat). This is the production deliverable.
+Note: base-inference kernels, capture/train kernels, and the server are SEPARATE artifacts (all preserved in-repo).
+
 ## Mission
 Fine-tune the DeepSeek "DSpark" spec-decode **draft head** onto `0xSero/DeepSeek-V4-Flash-180B-REAP`
 (K160, NVFP4/FP8), and serve the pair at max decode — **all pure CUDA on one Jetson Thor** (`sm_110a`,

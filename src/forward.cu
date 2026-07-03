@@ -7,6 +7,7 @@
 #include "deepseek_v4.h"
 #include "block.h"
 #include "compressed_block.h"
+#include "dspark.h"        // DSpark MTP draft head
 #include "hc.h"            // hc_head
 #include "mla_attn.h"      // rmsnorm
 #include "compressor.h"    // gemm_fp32
@@ -95,10 +96,10 @@ int main(int argc, char** argv){
     k_hc_expand<<<((size_t)s*hc*d+255)/256,256>>>(h,h0,s,hc,d);
     CU(cudaDeviceSynchronize());
 
-    auto fill_moe=[&](int Lyr, MoEWeights& m, std::vector<const uint8_t*>& p1,std::vector<const uint8_t*>& p2,std::vector<const uint8_t*>& p3,
+    auto fill_moe=[&](const std::string& pfx, bool is_hash, MoEWeights& m, std::vector<const uint8_t*>& p1,std::vector<const uint8_t*>& p2,std::vector<const uint8_t*>& p3,
                       std::vector<const float*>& s1,std::vector<const float*>& s2,std::vector<const float*>& s3){
-        std::string p="layers."+std::to_string(Lyr)+".ffn.";
-        m.gate_w=L.bf16(p+"gate.weight"); m.is_hash=is_hash_layer(Lyr);
+        std::string p=pfx+"ffn.";
+        m.gate_w=L.bf16(p+"gate.weight"); m.is_hash=is_hash;
         m.gate_bias=m.is_hash?nullptr:(W.has(p+"gate.bias")?L.f32(p+"gate.bias"):nullptr);
         m.tid2eid=m.is_hash?(const long*)W.get(p+"gate.tid2eid").dev:nullptr;
         for(int e=0;e<N_ROUTED;++e){ std::string ep=p+"experts."+std::to_string(e)+".";
@@ -109,8 +110,8 @@ int main(int argc, char** argv){
         m.sw1=L.raw(sp+"w1.weight"); m.sw2=L.raw(sp+"w2.weight"); m.sw3=L.raw(sp+"w3.weight");
         m.sw1s=L.scale(sp+"w1.scale"); m.sw2s=L.scale(sp+"w2.scale"); m.sw3s=L.scale(sp+"w3.scale");
         m.n_routed=N_ROUTED; m.n_act=N_ACT; m.dim=DIM; m.inter=MOE_INTER; m.vocab=VOCAB; m.route_scale=ROUTE_SCALE; m.swiglu_limit=SWIGLU_LIMIT; };
-    auto fill_attn=[&](int Lyr, MLAWeights& a, bool compressed){
-        std::string p="layers."+std::to_string(Lyr)+".attn.";
+    auto fill_attn=[&](const std::string& pfx, MLAWeights& a, bool compressed){
+        std::string p=pfx+"attn.";
         a.wq_a=L.raw(p+"wq_a.weight"); a.wq_a_s=L.scale(p+"wq_a.scale"); a.wq_b=L.raw(p+"wq_b.weight"); a.wq_b_s=L.scale(p+"wq_b.scale");
         a.wkv=L.raw(p+"wkv.weight"); a.wkv_s=L.scale(p+"wkv.scale"); a.wo_b=L.raw(p+"wo_b.weight"); a.wo_b_s=L.scale(p+"wo_b.scale");
         a.q_norm=L.bf16(p+"q_norm.weight"); a.kv_norm=L.bf16(p+"kv_norm.weight");
@@ -126,15 +127,15 @@ int main(int argc, char** argv){
         std::string lp="layers."+std::to_string(Lyr)+".";
         size_t mk=L.mark();                                   // free this layer's dequant buffers after the block
         if(ratio==0){
-            BlockWeights b{}; fill_attn(Lyr,b.attn,false);
-            fill_moe(Lyr,b.ffn,P1[Lyr],P2[Lyr],P3[Lyr],S1[Lyr],S2[Lyr],S3[Lyr]);
+            BlockWeights b{}; fill_attn(lp,b.attn,false);
+            fill_moe(lp,is_hash_layer(Lyr),b.ffn,P1[Lyr],P2[Lyr],P3[Lyr],S1[Lyr],S2[Lyr],S3[Lyr]);
             b.attn_norm=L.bf16(lp+"attn_norm.weight"); b.ffn_norm=L.bf16(lp+"ffn_norm.weight");
             b.hc_attn_fn=L.f32(lp+"hc_attn_fn"); b.hc_attn_scale=L.f32(lp+"hc_attn_scale"); b.hc_attn_base=L.f32(lp+"hc_attn_base");
             b.hc_ffn_fn=L.f32(lp+"hc_ffn_fn"); b.hc_ffn_scale=L.f32(lp+"hc_ffn_scale"); b.hc_ffn_base=L.f32(lp+"hc_ffn_base");
             b.dim=DIM; b.hc=HC_MULT;
             block_forward(h2,h,d_ids,b,s,HC_SINKHORN_ITERS,EPS);
         } else {
-            CompressedBlockWeights b{}; fill_attn(Lyr,b.attn.attn,true);
+            CompressedBlockWeights b{}; fill_attn(lp,b.attn.attn,true);
             std::string p=lp+"attn.";
             b.attn.mc_wkv=L.bf16(p+"compressor.wkv.weight"); b.attn.mc_wgate=L.bf16(p+"compressor.wgate.weight");
             b.attn.mc_ape=L.f32(p+"compressor.ape"); b.attn.mc_norm=L.bf16(p+"compressor.norm.weight");
@@ -146,7 +147,7 @@ int main(int argc, char** argv){
                 b.attn.idx_c_ape=L.f32(p+"indexer.compressor.ape"); b.attn.idx_c_norm=L.bf16(p+"indexer.compressor.norm.weight");
             }
             b.attn.index_n_heads=INDEX_N_HEADS; b.attn.index_head_dim=INDEX_HEAD_DIM; b.attn.index_topk=INDEX_TOPK;
-            fill_moe(Lyr,b.ffn,P1[Lyr],P2[Lyr],P3[Lyr],S1[Lyr],S2[Lyr],S3[Lyr]);
+            fill_moe(lp,is_hash_layer(Lyr),b.ffn,P1[Lyr],P2[Lyr],P3[Lyr],S1[Lyr],S2[Lyr],S3[Lyr]);
             b.attn_norm=L.bf16(lp+"attn_norm.weight"); b.ffn_norm=L.bf16(lp+"ffn_norm.weight");
             b.hc_attn_fn=L.f32(lp+"hc_attn_fn"); b.hc_attn_scale=L.f32(lp+"hc_attn_scale"); b.hc_attn_base=L.f32(lp+"hc_attn_base");
             b.hc_ffn_fn=L.f32(lp+"hc_ffn_fn"); b.hc_ffn_scale=L.f32(lp+"hc_ffn_scale"); b.hc_ffn_base=L.f32(lp+"hc_ffn_base");
@@ -174,5 +175,38 @@ int main(int argc, char** argv){
     printf("\n[Gate 1] prefill s=%d: %.1f ms (%.1f ms/tok). last-token argmax=%d logit=%.3f\n", s, ms, ms/s, am, lg[am]);
     printf("[Gate 1] GPU mem: %.1f/%.1f GiB used\n", (totb-freeb)/1073741824.0, totb/1073741824.0);
     printf("[Gate 1] FULL 180B FORWARD RAN ON THOR.\n");
+
+    // ================= GATE 2: DSpark draft head + single-token acceptance tau =================
+    std::vector<float> ml((size_t)s*VOCAB); CU(cudaMemcpy(ml.data(),logits,(size_t)s*VOCAB*4,cudaMemcpyDeviceToHost));
+    std::vector<int> main_am(s);
+    for(int t=0;t<s;++t){ const float* r=&ml[(size_t)t*VOCAB]; int a=0; for(int v=1;v<VOCAB;++v) if(r[v]>r[a])a=v; main_am[t]=a; }
+
+    DSparkWeights dw{}; BlockWeights& mb=dw.block;
+    std::vector<const uint8_t*> mp1,mp2,mp3; std::vector<const float*> ms1,ms2,ms3;
+    fill_attn("mtp.0.", mb.attn, false);                                     // pure-sliding block
+    fill_moe("mtp.0.", false, mb.ffn, mp1,mp2,mp3,ms1,ms2,ms3);
+    mb.attn_norm=L.bf16("mtp.0.attn_norm.weight"); mb.ffn_norm=L.bf16("mtp.0.ffn_norm.weight");
+    mb.hc_attn_fn=L.f32("mtp.0.hc_attn_fn"); mb.hc_attn_scale=L.f32("mtp.0.hc_attn_scale"); mb.hc_attn_base=L.f32("mtp.0.hc_attn_base");
+    mb.hc_ffn_fn=L.f32("mtp.0.hc_ffn_fn"); mb.hc_ffn_scale=L.f32("mtp.0.hc_ffn_scale"); mb.hc_ffn_base=L.f32("mtp.0.hc_ffn_base");
+    mb.dim=DIM; mb.hc=HC_MULT;
+    dw.e_proj=L.raw("mtp.0.e_proj.weight"); dw.e_proj_s=L.scale("mtp.0.e_proj.scale");
+    dw.h_proj=L.raw("mtp.0.h_proj.weight"); dw.h_proj_s=L.scale("mtp.0.h_proj.scale");
+    dw.enorm=L.bf16("mtp.0.enorm.weight"); dw.hnorm=L.bf16("mtp.0.hnorm.weight"); dw.norm=L.bf16("mtp.0.norm.weight");
+    dw.hc_head_fn=L.f32("mtp.0.hc_head_fn"); dw.hc_head_scale=L.f32("mtp.0.hc_head_scale"); dw.hc_head_base=L.f32("mtp.0.hc_head_base");
+    dw.lm_head=L.bf16("head.weight"); dw.embed=(const __nv_bfloat16*)W.get("embed.weight").dev;
+    dw.dim=DIM; dw.hc=HC_MULT; dw.vocab=VOCAB;
+
+    float* draft; CU(cudaMalloc(&draft,(size_t)s*VOCAB*4));
+    dspark_head_forward(draft, h, d_ids, dw, s, EPS);                        // tapped [s,hc,d] state
+    std::vector<float> dl((size_t)s*VOCAB); CU(cudaMemcpy(dl.data(),draft,(size_t)s*VOCAB*4,cudaMemcpyDeviceToHost));
+    std::vector<int> draft_am(s);
+    for(int t=0;t<s;++t){ const float* r=&dl[(size_t)t*VOCAB]; int a=0; for(int v=1;v<VOCAB;++v) if(r[v]>r[a])a=v; draft_am[t]=a; }
+    int m0=0,m1=0; for(int t=0;t<s;++t) if(draft_am[t]==main_am[t]) m0++;
+    for(int t=0;t<s-1;++t) if(draft_am[t]==main_am[t+1]) m1++;
+    printf("\n[Gate 2] DSpark draft head single-token acceptance (unfine-tuned on REAP):\n");
+    printf("   tau@0  (draft[t]==main[t])   = %.3f  (%d/%d)\n", (double)m0/s, m0, s);
+    printf("   tau@+1 (draft[t]==main[t+1]) = %.3f  (%d/%d)\n", (double)m1/(s-1), m1, s-1);
+    printf("[Gate 2] main  argmax:"); for(int t=0;t<s;++t) printf(" %d",main_am[t]); printf("\n");
+    printf("[Gate 2] draft argmax:"); for(int t=0;t<s;++t) printf(" %d",draft_am[t]); printf("\n");
     return 0;
 }

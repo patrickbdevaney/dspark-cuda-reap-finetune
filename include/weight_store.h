@@ -30,6 +30,9 @@ public:
             size_t got = 0; off_t off = (off_t)sh->dataFileOffset();
             while (got < nb) { ssize_t r = pread(sh->fd(), (char*)buf + got, nb - got, off + got);
                 if (r <= 0) throw std::runtime_error("pread shard failed: " + sh->path()); got += (size_t)r; }
+            // drop the file pages from the page cache — we've copied them to `buf`. Reclaims ~96 GiB of
+            // otherwise-"used" reclaimable cache that Tegra cudaMalloc won't auto-evict (memory headroom).
+            posix_fadvise(sh->fd(), off, nb, POSIX_FADV_DONTNEED);
             void* dev; if (cudaHostGetDevicePointer(&dev, buf, 0) != cudaSuccess) throw std::runtime_error("getDevicePointer failed");
             pinned_.push_back(buf); base[sh] = dev; host_base_[sh] = sh->dataStart(); dev_base_[sh] = dev;
             loaded_ += nb;

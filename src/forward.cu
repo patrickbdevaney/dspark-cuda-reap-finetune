@@ -16,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 using namespace dsv4;
 #define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
@@ -69,8 +70,11 @@ static std::vector<float> stride_rows(const std::vector<float>& in, int s, int h
 int main(int argc, char** argv){
     setvbuf(stdout, nullptr, _IONBF, 0);          // unbuffered: see progress live (esp. if killed)
     const char* dir = argc>1?argv[1]:"/home/patrickd/models/DeepSeek-V4-Flash-180B";
-    int s = argc>2?atoi(argv[2]):8;
-    printf("[forward] loading %s (single-tenant, ~96 GiB)...\n", dir);
+    std::vector<int> ids; int s;
+    if(argc>2 && strchr(argv[2],',')){                       // explicit comma-separated token ids
+        char* tok=strtok(argv[2],","); while(tok){ ids.push_back(atoi(tok)); tok=strtok(nullptr,","); } s=ids.size();
+    } else { s = argc>2?atoi(argv[2]):8; ids.resize(s); for(int i=0;i<s;++i) ids[i]=(i*131+7)%VOCAB; }
+    printf("[forward] loading %s (single-tenant, ~96 GiB)...  s=%d ids:", dir, s); for(int v:ids) printf(" %d",v); printf("\n");
     st::WeightStore W(dir, key_map);
     printf("[forward] loaded %.2f GiB, %zu tensors. prefill s=%d\n", W.loadedGiB(), W.count(), s);
     Loader L(W);
@@ -84,8 +88,7 @@ int main(int argc, char** argv){
     const float *cc4c=up_f(stride_rows(cqc_h,s,half,4),keep), *cc4s=up_f(stride_rows(cqs_h,s,half,4),keep);
     const float *cc128c=(s>=128)?up_f(stride_rows(cqc_h,s,half,128),keep):cqc, *cc128s=(s>=128)?up_f(stride_rows(cqs_h,s,half,128),keep):cqs;
 
-    int* d_ids; std::vector<int> ids(s); for(int i=0;i<s;++i) ids[i]=(i*131+7)%VOCAB;
-    CU(cudaMalloc(&d_ids,s*4)); CU(cudaMemcpy(d_ids,ids.data(),s*4,cudaMemcpyHostToDevice));
+    int* d_ids; CU(cudaMalloc(&d_ids,s*4)); CU(cudaMemcpy(d_ids,ids.data(),s*4,cudaMemcpyHostToDevice));
     float *h0, *h, *h2;
     CU(cudaMalloc(&h0,(size_t)s*d*4)); CU(cudaMalloc(&h,(size_t)s*hc*d*4)); CU(cudaMalloc(&h2,(size_t)s*hc*d*4));
     k_embed<<<((size_t)s*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,s,d);

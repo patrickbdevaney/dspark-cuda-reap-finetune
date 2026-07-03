@@ -25,3 +25,10 @@ void compressor_forward(float* out, const float* x, const float* wkv, const floa
                         const float* ape, const float* norm_w, const float* cosT, const float* sinT,
                         int s, int dim, int d, int ratio, bool overlap, int rope_dim, float eps,
                         bool rotate, cudaStream_t stream = 0);
+
+// Incremental: emit ONE compressed row (= compressor_forward's out[g]) from just group g's tokens (decode
+// append-only KV). Non-overlap pools x[g*ratio..]; overlap (ratio==4) pools [(g-1)*ratio .. g*ratio+ratio-1].
+void compressor_emit_group(float* out_row, const float* x, int g, int ratio, const float* wkv,
+                           const float* wgate, const float* ape, const float* norm_w,
+                           const float* cc_cos, const float* cc_sin, int dim, int d, bool overlap,
+                           int rope_dim, float eps, bool rotate, cudaStream_t stream = 0);

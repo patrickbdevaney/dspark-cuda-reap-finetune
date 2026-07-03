@@ -210,3 +210,13 @@ sparse_attn m=1, ogroup_gemm) — every op is per-row, so decode(pos) == prefill
   the compressed flavors (milestone 2) and the full 43-layer decode loop (milestone 3) build on.
 - key RoPE detail: at decode the single token's N_HEADS query rows all share position `pos`'s cos/sin row —
   pass `cosT + pos*half` with `cos_stride_rows=N_HEADS`; the KV row uses the same offset with stride 1.
+
+**Step 4 milestone 2 (crux) — incremental compressor emit: BIT-EXACT (all 3 variants).** The append-only
+compressed KV cache rests on `compressor_emit_group(g)` reproducing `compressor_forward`'s out[g] from ONLY that
+group's tokens (a compressed row finalizes once its `ratio` tokens exist; overlap ratio-4 also needs the prior
+group's ratio tokens). Gate (`tests/gate_compressor_emit.cu`, synthetic, path-vs-path): **cosine 1.0, rms 0,
+maxabs 0** for (a) ratio-128 non-overlap main compressor, (b) ratio-4 overlap main compressor, (c) ratio-4
+indexer's own compressor (rotate = hadamard+fp4sim, d=128). Per-(m,n) gemm dots + per-group pool are
+batch-independent, so incremental == prefill exactly. This derisks the whole compressed-decode path: what
+remains is wiring (window+compressed KV caches, strided idxs / DSA-indexer M=1 top-512, sparse_attn over the
+union), analogous to the bit-exact milestone-1 sliding step.

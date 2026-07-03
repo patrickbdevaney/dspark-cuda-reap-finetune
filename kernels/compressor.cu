@@ -91,3 +91,34 @@ void compressor_forward(float* out, const float* x, const float* wkv, const floa
     CU2(cudaStreamSynchronize(stream));
     cudaFree(kv); cudaFree(score);
 }
+
+// ---- incremental single-group emit (STRUCTURAL_PLAN Step 4 decode) ----
+// Emit ONE compressed row = compressor_forward's out[g], from just this group's tokens (append-only KV: a
+// compressed row finalizes once its `ratio` tokens exist and never changes). Non-overlap (ratio!=4): pools
+// x[g*ratio .. g*ratio+ratio-1]. Overlap (ratio==4): pools the 2 local groups [(g-1)*ratio .. g*ratio+ratio-1]
+// (prev half masked for g==0) and takes the current one. Bit-exact vs compressor_forward (same per-group math).
+void compressor_emit_group(float* out_row, const float* x, int g, int ratio, const float* wkv,
+                           const float* wgate, const float* ape, const float* norm_w,
+                           const float* cc_cos, const float* cc_sin, int dim, int d, bool overlap,
+                           int rope_dim, float eps, bool rotate, cudaStream_t stream){
+    int coff = overlap ? 2 : 1, od = coff * d;
+    int ntok, tok0, localg;
+    if(overlap){ tok0 = (g>=1) ? (g-1)*ratio : 0; ntok = (g>=1) ? 2*ratio : ratio; localg = (g>=1) ? 1 : 0; }
+    else       { tok0 = g*ratio; ntok = ratio; localg = 0; }
+    const float* xg = x + (size_t)tok0*dim;
+    float *kv,*score,*pooled;
+    CU2(cudaMalloc(&kv,(size_t)ntok*od*4)); CU2(cudaMalloc(&score,(size_t)ntok*od*4));
+    CU2(cudaMalloc(&pooled,(size_t)(localg+1)*d*4));
+    gemm_fp32(kv, xg, wkv, ntok, od, dim, stream);
+    gemm_fp32(score, xg, wgate, ntok, od, dim, stream);
+    if(overlap) compressor_pool_overlap(pooled, kv, score, ape, localg+1, ratio, d, stream);
+    else        compressor_pool(pooled, kv, score, ape, 1, ratio, d, stream);
+    float* prow = pooled + (size_t)localg*d;                 // the target group's pooled row
+    rmsnorm(out_row, prow, norm_w, 1, d, eps, true, stream);
+    rope_interleaved(out_row + (d - rope_dim), cc_cos + (size_t)g*(rope_dim/2), cc_sin + (size_t)g*(rope_dim/2),
+                     1, rope_dim, false, d, 1, stream);
+    if(rotate){ hadamard(out_row, out_row, 1, d, stream); act_quant_fp4sim(out_row, 1, d, 32, d, stream); }
+    else      { act_quant_fp8sim(out_row, 1, d - rope_dim, 64, d, stream); }
+    CU2(cudaStreamSynchronize(stream));
+    cudaFree(kv); cudaFree(score); cudaFree(pooled);
+}

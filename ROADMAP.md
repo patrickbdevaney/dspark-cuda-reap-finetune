@@ -195,6 +195,9 @@ block-diffusion MTP, shares main embed+head, `compress_ratio=0` (pure sliding).
 - **Weights:** `mtp.0.{main_proj(+scale),main_norm}`+full block; `markov_head.markov_w1/w2` (on mtp.2 — CONFIRM
   3-block wiring). **Verify/accept loop NOT in reference** — build in harness (draft output_ids vs target,
   accept longest matching prefix, confidence early-exit). Loader: WeightStore reads raw shards; mp=1.
+- **LOGISTICS (verified):** DSpark-head repo = ~11 GB (shards 46-48 = the mtp.* head: 3 MTP blocks,
+  256-expert MoE, markov_head, main_proj, confidence). Extract ONLY mtp.* and run on REAP taps 40/41/42 →
+  fits (96 REAP + ~3 GB head). Head keeps 256 experts (its own capacity); fine-tune adapts to REAP distribution.
 
 ### Phase B(proxy, DONE) — REAP built-in MTPBlock → measured τ@0=0.815
 **Architecture (model.py MTPBlock:756-783), fully mapped:** the head is a `Block` subclass, layer_id=43 →

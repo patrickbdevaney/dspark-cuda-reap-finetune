@@ -28,6 +28,7 @@ struct MoEWeights {
     const uint8_t *sw1, *sw2, *sw3; const float *sw1s, *sw2s, *sw3s; // shared expert (fp8)
     int n_routed, n_act, dim, inter, vocab;
     float route_scale, swiglu_limit;
+    bool use_tc = false;   // route routed-expert GEMMs through tc_fp4_gemm (Marlin TC, ~3x). false = fp4_gemm oracle (bit-exact gate).
     // Real-checkpoint path: per-expert device-pointer tables (HOST arrays of device ptrs, len n_routed).
     // If w1p != null, expert e uses w1p[e]/w1sp[e]/... instead of the stacked w1+e*stride. Gates leave null.
     const uint8_t *const *w1p = nullptr, *const *w2p = nullptr, *const *w3p = nullptr;

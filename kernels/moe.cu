@@ -91,6 +91,7 @@ void moe_router_score(float* weights, int* indices, const float* x, const float*
 #include "mla_attn.h"
 #include <vector>
 #include <cstdio>
+void tc_fp4_gemm(float*, const uint8_t*, const float*, const uint8_t*, const float*, int, int, int, cudaStream_t); // Marlin TC W4A8 (tc_moe_gemm.cu)
 #define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 
 __global__ void compute_scores_kernel(float* sc, const float* x, const float* gw, int bs, int dim, int nr){
@@ -166,11 +167,12 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
             const float *W1s = w.w1sp? w.w1sp[e] : w.w1s+(size_t)e*w13s, *W3s = w.w3sp? w.w3sp[e] : w.w3s+(size_t)e*w13s,
                         *W2s = w.w2sp? w.w2sp[e] : w.w2s+(size_t)e*w2s;
             act_quant_fp8(xq,xs,xr,1,dim,128,stream);
-            fp4_gemm(g,xq,xs, W1, W1s, 1,inter,dim,stream);
-            fp4_gemm(u,xq,xs, W3, W3s, 1,inter,dim,stream);
+            auto GEMM = w.use_tc ? tc_fp4_gemm : fp4_gemm;   // TC Marlin (~3x, cosine 1.0) or bit-exact oracle
+            GEMM(g,xq,xs, W1, W1s, 1,inter,dim,stream);
+            GEMM(u,xq,xs, W3, W3s, 1,inter,dim,stream);
             swiglu_kernel<<<(inter+63)/64,64,0,stream>>>(h,g,u,inter,w.swiglu_limit,wgt);
             act_quant_fp8(hq,hs,h,1,inter,128,stream);
-            fp4_gemm(oe,hq,hs, W2, W2s, 1,dim,inter,stream);
+            GEMM(oe,hq,hs, W2, W2s, 1,dim,inter,stream);
             accum_kernel<<<(dim+63)/64,64,0,stream>>>(out+(size_t)t*dim,oe,dim);
         }
         // shared expert (fp8), no routing weight

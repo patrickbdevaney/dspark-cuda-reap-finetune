@@ -79,16 +79,27 @@ __global__ void tc_w4a8_kernel(float* out, const uint8_t* wpr, const __half* wsr
 }
 
 #define CT(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
-// Same signature as fp4_gemm (drop-in). Repacks weight+scale per call (caller can cache later). M<=16 fast path.
+#include <unordered_map>
+// weight-repack cache: keyed by (B_fp4 ptr, b_s ptr). Repacked ONCE (lazy warm-up), reused across all decode
+// forwards — this is the decode win. NOTE: repacked ≈ same bytes as the original fp4 layout, so caching every
+// routed expert doubles expert-weight memory (~82 GB -> OOM on the full model). For the full model, repack at
+// LOAD storing repacked in place of the original (loader change), or scope per-layer. Fine for gates/tests here.
+struct TcW { uint8_t* wpr; __half* wsr; };
+static std::unordered_map<const void*, TcW> g_tc_cache;
+static TcW tc_get_weight(const uint8_t* B_fp4, const float* b_s, int N, int K, cudaStream_t s){
+    auto it=g_tc_cache.find(B_fp4); if(it!=g_tc_cache.end()) return it->second;
+    TcW w; CT(cudaMalloc(&w.wpr,(size_t)(N/8)*(K/128)*512)); CT(cudaMalloc(&w.wsr,(size_t)(N/8)*(K/16)*8*2));
+    long tw=(long)(N/8)*(K/128)*32*8, ts=(long)(N/8)*(K/16)*8;
+    k_repack_w<<<(tw+255)/256,256,0,s>>>(w.wpr, B_fp4, N, K);
+    k_repack_s<<<(ts+255)/256,256,0,s>>>(w.wsr, b_s, N, K);
+    g_tc_cache.emplace(B_fp4, w); return w;
+}
+// Same signature as fp4_gemm (drop-in). Weight repack cached by ptr; only the fp8->fp16 act convert is per-call.
 void tc_fp4_gemm(float* C, const uint8_t* A_fp8, const float* a_s, const uint8_t* B_fp4, const float* b_s,
                  int M, int N, int K, cudaStream_t s){
     __half* x16; CT(cudaMalloc(&x16,(size_t)M*K*2));
     k_a_to_fp16<<<((long)M*K+255)/256,256,0,s>>>(x16, A_fp8, a_s, M, K);
-    uint8_t* wpr; CT(cudaMalloc(&wpr,(size_t)(N/8)*(K/128)*512));
-    __half* wsr;  CT(cudaMalloc(&wsr,(size_t)(N/8)*(K/16)*8*2));
-    long tw=(long)(N/8)*(K/128)*32*8, ts=(long)(N/8)*(K/16)*8;
-    k_repack_w<<<(tw+255)/256,256,0,s>>>(wpr, B_fp4, N, K);
-    k_repack_s<<<(ts+255)/256,256,0,s>>>(wsr, b_s, N, K);
-    dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, wpr, wsr, x16, M, N, K);
-    CT(cudaStreamSynchronize(s)); cudaFree(x16); cudaFree(wpr); cudaFree(wsr);
+    TcW w = tc_get_weight(B_fp4, b_s, N, K, s);
+    dim3 grid((N/8 + TCM_WARPS-1)/TCM_WARPS); tc_w4a8_kernel<<<grid, TCM_WARPS*32, 0, s>>>(C, w.wpr, w.wsr, x16, M, N, K);
+    CT(cudaStreamSynchronize(s)); cudaFree(x16);
 }

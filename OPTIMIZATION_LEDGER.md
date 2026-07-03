@@ -46,8 +46,9 @@ These are the correctness-first shapes — chosen for provable correctness, alwa
 | # | component | variant | tok/s | vs champ | decision |
 |---|---|---|---|---|---|
 | 0 | MoE fp4 GEMM | fp4_gemm (warp-per-output, oracle) | 1.412 ms/call | — | baseline/gate-oracle |
-| 1 | MoE fp4 GEMM | **tc_fp4_gemm** (Marlin TC mma.sync.m16n8k16, W4A8) | **0.462 ms/call** | **3.06× FASTER** | **CHAMPION** (cosine 1.0, rms 0.03% vs fp4_gemm; incl per-call repack — cache it for more) |
-| — | next | cache weight repack at load (kill per-call repack+malloc) | | (expect >3×) | TODO |
+| 1 | MoE fp4 GEMM | **tc_fp4_gemm** (Marlin TC W4A8) — per-call repack | 0.462 ms | 3.06× | superseded |
+| 2 | MoE fp4 GEMM | **tc_fp4_gemm + CACHED repack** (ptr-keyed) | **M=8: 0.080 ms / M=1: 0.065 ms** | **M=8: 19.7× / M=1: 2.71×** | **CHAMPION** (cosine 1.0). Swapped into moe.cu behind MoEWeights.use_tc. TC win GROWS with M -> BATCH tokens. |
+| — | note | full-model enable: caching every expert repack DOUBLES expert mem (~82GB) -> OOM. Repack at LOAD (store repacked in place of original) or per-layer scope. | | | TODO (blocks full-model use_tc) |
 | — | next | native fp8 mma m16n8k32 (skip fp8→fp16) | | (~2× more) | TODO |
 | — | next | batched/grouped MoE dispatch (kill host per-token loop) | | | TODO |
 

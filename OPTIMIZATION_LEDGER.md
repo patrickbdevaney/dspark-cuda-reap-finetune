@@ -182,3 +182,11 @@ hazyresearch no-bubbles, AutoMegaKernel(refuted), NVIDIA DFlash + Jetson-Thor-7x
   bandwidth. Routed for M==1 in fp8_block_gemm (NO_GEMV=1 falls back to TC for A/B). **Cumulative 0.50 -> 6.71
   tok/s = 13.4x.** (Earlier the byte-load warp-per-output oracle was SLOWER than TC — the uint vectorization
   is what makes the GEMV win.) Next biggest: MoE grouped fp4 GEMM at M=1 (analogous fp4 GEMV).
+
+## Decode try — M=1 fp4 MoE GEMV — REVERTED (survivor, not champion)
+- fp4 GEMV on ORIGINAL fp4 (funnel-aligned uint4 weight load, e8m0 in-register), unit-gated cosine 1.0 vs
+  fp4_gemm (tests/gate_fp4_gemv). But full-decode A/B: **148.9 -> 230 ms/tok (SLOWER)**. Root cause: fp4's
+  packed-nibble scalar decode (32 fp8+fp4 decodes/lane/32-block) costs more than the m16-mma waste it removes;
+  the TC mma decodes fp4x2->half2 in hardware far cheaper. UNLIKE fp8 (opt #8) where simple uint decode won.
+  LESSON: M=1 GEMV wins only when the per-element decode is cheap (fp8), not for packed fp4. Kept default-OFF
+  (`g_moe_gemv`, env MOE_GEMV=1) as a gated reference; MoE stays on the TC grouped path. Champion 148.5 ms/tok.

@@ -95,6 +95,7 @@ void moe_router_score(float* weights, int* indices, const float* x, const float*
 #include <cstdio>
 void tc_fp4_gemm(float*, const uint8_t*, const float*, const uint8_t*, const float*, int, int, int, cudaStream_t); // Marlin TC W4A8 (tc_moe_gemm.cu)
 bool g_moe_grouped=false;   // STRUCTURAL_PLAN Step 1b: zero-sync grouped-GEMM MoE (removes off[] D2H, graph-capturable)
+bool g_moe_gemv=false;      // decode: M=1 fp4 GEMV on ORIGINAL fp4 (no repack, act stays fp8) — bandwidth-bound at small M
 #define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
 
 __global__ void compute_scores_kernel(float* sc, const float* x, const float* gw, int bs, int dim, int nr){
@@ -201,6 +202,9 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
                                  const int*, const int*, const int*, const int*, int, int, int, cudaStream_t);
         void tc_fp4_grouped_gemm_e8m0(float*, const __half*, const uint8_t* const*, const uint8_t* const*,
                                  const int*, const int*, const int*, const int*, int, int, int, cudaStream_t);
+        void tc_fp4_grouped_gemv_e8m0(float*, const uint8_t*, const float*, const uint8_t* const*, const uint8_t* const*,
+                                 const int*, const int*, const int*, const int*, int, int, int, cudaStream_t);
+        extern bool g_moe_gemv;
         const int maxm = bs*na;
         // -- device counting-sort grouping (off_d KEPT on device; NO D2H) --
         int *counts,*off_d,*cursor,*alltok_d; float* allwt_d;
@@ -214,7 +218,8 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         int *tile_e,*tile_row0,*ntiles_d; tile_e=(decltype(tile_e))dmalloc(maxm*4); tile_row0=(decltype(tile_row0))dmalloc(maxm*4); ntiles_d=(decltype(ntiles_d))dmalloc(4);
         tc_build_tiles(tile_e,tile_row0,ntiles_d,off_d,nr,stream);
         // -- repack every expert weight in place once (idempotent) + upload per-expert ptr tables to device --
-        for(int e=0;e<nr;++e){ tc_ensure_repacked((uint8_t*)w.w1p[e],inter,dim,stream);
+        // GEMV path reads ORIGINAL fp4 (no repack).
+        if(!g_moe_gemv) for(int e=0;e<nr;++e){ tc_ensure_repacked((uint8_t*)w.w1p[e],inter,dim,stream);
             tc_ensure_repacked((uint8_t*)w.w3p[e],inter,dim,stream); tc_ensure_repacked((uint8_t*)w.w2p[e],dim,inter,stream); }
         const uint8_t **w1d,**w3d,**w2d; void **s1d,**s3d,**s2d;   // s*d hold float* (dequant) OR uint8_t* (e8m0)
         w1d=(decltype(w1d))dmalloc(nr*sizeof(void*)); w3d=(decltype(w3d))dmalloc(nr*sizeof(void*)); w2d=(decltype(w2d))dmalloc(nr*sizeof(void*));
@@ -236,19 +241,23 @@ void moe_forward(float* out, const float* x, const int* input_ids, const MoEWeig
         // -- routed experts: gather -> quant -> fp16 -> grouped gate/up -> swiglu -> quant -> fp16 -> grouped down -> scatter --
         k_gather_x<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(Xe,x,alltok_d,maxm,dim);
         act_quant_fp8(Xeq,Xes,Xe,maxm,dim,128,stream);
-        tc_a_to_fp16(x16,Xeq,Xes,maxm,dim,stream);
-        if(w.e8m0_scales){
+        if(g_moe_gemv){                                         // fp4 GEMV on ORIGINAL fp4 (no x16, act stays fp8)
+            tc_fp4_grouped_gemv_e8m0(Gb,Xeq,Xes,w1d,(const uint8_t* const*)s1d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
+            tc_fp4_grouped_gemv_e8m0(Ub,Xeq,Xes,w3d,(const uint8_t* const*)s3d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
+        } else if(w.e8m0_scales){
+            tc_a_to_fp16(x16,Xeq,Xes,maxm,dim,stream);
             tc_fp4_grouped_gemm_e8m0(Gb,x16,w1d,(const uint8_t* const*)s1d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
             tc_fp4_grouped_gemm_e8m0(Ub,x16,w3d,(const uint8_t* const*)s3d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
         } else {
+            tc_a_to_fp16(x16,Xeq,Xes,maxm,dim,stream);
             tc_fp4_grouped_gemm(Gb,x16,w1d,(const float* const*)s1d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
             tc_fp4_grouped_gemm(Ub,x16,w3d,(const float* const*)s3d,off_d,tile_e,tile_row0,ntiles_d,maxm,inter,dim,stream);
         }
         swiglu_wrow<<<((size_t)maxm*inter+255)/256,256,0,stream>>>(Hb,Gb,Ub,allwt_d,maxm,inter,w.swiglu_limit);
         act_quant_fp8(Hqb,Hsb,Hb,maxm,inter,128,stream);
-        tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream);
-        if(w.e8m0_scales) tc_fp4_grouped_gemm_e8m0(OEb,h16,w2d,(const uint8_t* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);
-        else              tc_fp4_grouped_gemm(OEb,h16,w2d,(const float* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);
+        if(g_moe_gemv)         tc_fp4_grouped_gemv_e8m0(OEb,Hqb,Hsb,w2d,(const uint8_t* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);
+        else if(w.e8m0_scales){tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream); tc_fp4_grouped_gemm_e8m0(OEb,h16,w2d,(const uint8_t* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);}
+        else                  {tc_a_to_fp16(h16,Hqb,Hsb,maxm,inter,stream); tc_fp4_grouped_gemm(OEb,h16,w2d,(const float* const*)s2d,off_d,tile_e,tile_row0,ntiles_d,maxm,dim,inter,stream);}
         k_scatter_add<<<((size_t)maxm*dim+255)/256,256,0,stream>>>(out,OEb,alltok_d,maxm,dim);
         // -- shared expert (fp8, all bs tokens, weight 1) --
         if(!getenv("NOSHARED")){

@@ -263,6 +263,55 @@ void tc_build_tiles(int* tile_e, int* tile_row0, int* ntiles_d, const int* off_d
     k_build_tiles<<<1,1,0,s>>>(tile_e, tile_row0, ntiles_d, off_d, nr);
 }
 
+// ===================== M=1 fp4 GEMV (small-M decode, ORIGINAL fp4 layout, no repack) =====================
+// One warp per (output n, tile); loops the tile's <=16 rows. Reads the ORIGINAL packed fp4 weight row
+// (uint4-vectorized, coalesced) + fp8 act (uint4) + e8m0 per-32 scale in-register. Bandwidth-bound — beats the
+// m16-tile mma at small M (which is mma-latency bound). Gated cosine vs fp4_gemm (tests/gate_fp4_gemv).
+__constant__ float GEMV_E2M1[8] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f};
+__device__ __forceinline__ float gv_fp4(uint8_t nib){ float m=GEMV_E2M1[nib&7]; return (nib&8)?-m:m; }
+__device__ __forceinline__ float gv_e4m3(uint8_t b){ __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b,__NV_E4M3); return __half2float(*reinterpret_cast<__half*>(&r)); }
+__global__ void k_grouped_fp4_gemv_e8m0(float* out, const uint8_t* const* wptr, const uint8_t* const* sptr,
+        const int* __restrict__ tile_e, const int* __restrict__ tile_row0, const int* __restrict__ ntiles,
+        const int* __restrict__ off, const uint8_t* Xq, const float* Xs, int N, int K){
+    int tile=blockIdx.y; if(tile>=*ntiles) return;
+    int e=tile_e[tile], row0=tile_row0[tile]; int me=off[e+1]-row0; if(me>16)me=16;
+    int warp=(blockIdx.x*blockDim.x+threadIdx.x)>>5; int n=warp; if(n>=N) return; int lane=threadIdx.x&31;
+    const uint8_t* Wn = wptr[e] + (size_t)n*(K/2);       // packed fp4 row (2 nibbles/byte) — arbitrary alignment
+    const uint8_t* Sn = sptr[e] + (size_t)n*(K/32);      // e8m0 per-32 scale row
+    int nb32 = K/32;                                     // 32-weight blocks = 16 bytes each
+    int off_b=(int)((uintptr_t)Wn & 15); int k0f=off_b>>2; unsigned shf=(off_b&3)*8;   // funnel-align the weight loads
+    for(int r=0;r<me;++r){
+        const uint8_t* Aq = Xq + (size_t)(row0+r)*K;
+        const float*  As = Xs + (size_t)(row0+r)*(K/128);
+        float acc=0.f;
+        for(int kb=lane; kb<nb32; kb+=32){              // lane -> whole 32-weight block (16B), coalesced across warp
+            float ws=exp2f((float)Sn[kb]-127.f); float asc=As[kb/4];   // act scale per-128 = per 4 of the 32-blocks
+            const uint8_t* wa=Wn+(size_t)kb*16-off_b;
+            uint4 WA=__ldcs((const uint4*)wa), WB=__ldcs((const uint4*)(wa+16));
+            uint4 w16=tcm_funnel16(WA,WB,k0f,shf);
+            uint4 a0 =*(const uint4*)(Aq+(size_t)kb*32);
+            uint4 a1 =*(const uint4*)(Aq+(size_t)kb*32+16);
+            const uint8_t* wb=(const uint8_t*)&w16; const uint8_t* ab0=(const uint8_t*)&a0; const uint8_t* ab1=(const uint8_t*)&a1;
+            float sub=0.f;
+            #pragma unroll
+            for(int j=0;j<16;++j){ uint8_t byte=wb[j]; uint8_t a2j=(j<8)?ab0[2*j]:ab1[2*(j-8)]; uint8_t a2j1=(j<8)?ab0[2*j+1]:ab1[2*(j-8)+1];
+                sub += gv_e4m3(a2j)  * gv_fp4(byte&0xF);
+                sub += gv_e4m3(a2j1) * gv_fp4((byte>>4)&0xF);
+            }
+            acc += sub * asc * ws;
+        }
+        #pragma unroll
+        for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+        if(lane==0) out[(size_t)(row0+r)*N + n]=acc;
+    }
+}
+void tc_fp4_grouped_gemv_e8m0(float* out, const uint8_t* Xq, const float* Xs, const uint8_t* const* wptr_d,
+        const uint8_t* const* sptr_d, const int* off_d, const int* tile_e, const int* tile_row0, const int* ntiles_d,
+        int maxtiles, int N, int K, cudaStream_t s){
+    int threads=128; dim3 grid((N*32+threads-1)/threads, maxtiles);
+    k_grouped_fp4_gemv_e8m0<<<grid, threads, 0, s>>>(out, wptr_d, sptr_d, tile_e, tile_row0, ntiles_d, off_d, Xq, Xs, N, K);
+}
+
 // NATIVE-e8m0 grouped GEMM: scale ptrs point to the ORIGINAL e8m0 scale BYTES (F8_E8M0) in the WeightStore —
 // exp2f(byte-127) is computed in-register (bit-identical to the pre-dequanted f32 pow2). This removes the
 // per-layer-per-token scale dequant (160x3 mallocs+kernels/layer) AND keeps the scale pointers persistent

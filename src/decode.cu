@@ -84,6 +84,7 @@ int main(int argc, char** argv){
     const int half=ROPE_DIM/2, hc=HC_MULT, d=DIM;
     extern bool g_tc_fp8; g_tc_fp8=true; extern bool g_tc_ogroup; g_tc_ogroup=true;
     extern bool g_moe_grouped; g_moe_grouped=true; extern void tc_moe_clear_cache();
+    extern bool g_moe_gemv; g_moe_gemv=(getenv("MOE_GEMV")!=nullptr);   // fp4 GEMV: A/B'd SLOWER than TC mma (scalar nibble decode > mma-waste). default OFF.
 
     // freqs over seqmax
     std::vector<void*> keep;

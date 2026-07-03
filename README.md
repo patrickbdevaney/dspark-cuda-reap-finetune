@@ -90,6 +90,48 @@ to 0.0 error; the deepest real-weights compositions to ≤1.6%.
 
 ---
 
+## Unpruned (256 experts) vs REAP (160 experts): what stays, what changes
+
+REAP pruning removes 96 of the 256 routed experts (the *pool*) but leaves **`num_experts_per_tok = 6`
+routing and the 1 always-on shared expert unchanged** — so the **per-token active compute path is
+byte-for-byte identical**. That single fact is why almost none of the CUDA cares whether you run the
+unpruned `DeepSeek-V4-Flash` or the REAP `-180B`.
+
+**Stays the same — the core CUDA principles and components (essentially everything):**
+- **All 20 kernel primitives.** The FP8/FP4 GEMMs, MLA attention (q/kv-LoRA, per-head RMS, interleaved
+  RoPE, `attn_sink`, `sparse_attn`), the KV Compressor, the DSA Indexer (Hadamard + top-512), Hyper-
+  Connections/Sinkhorn, RMSNorm, the `act_quant` family, `ogroup_gemm` — none reference expert count.
+- **The entire attention + Hyper-Connections subsystem** — pruning never touches attention.
+- **The MoE *machinery*.** `sqrtsoftplus` scoring, `noaux_tc` bias-for-selection, hash routing (first 3
+  layers), top-6 renorm × `route_scale`, the SwiGLU FP4 expert FFN, the FP8 shared expert, the per-token
+  dispatch — the *algorithm* is identical; only the number of experts it chooses among differs.
+- **Quant formats** (FP8 linear / FP4 experts / e8m0 scales), the **sharded loader** (it reads shapes
+  from the checkpoint index, so it adapts automatically), the block structure, the 43-layer forward loop,
+  and the DSpark draft-head architecture + training objective.
+- **Decode performance.** Because active params/token are identical, the roofline, the per-token
+  memory-bandwidth profile, and therefore the decode tok/s are unchanged — the kernels are equally fast
+  on both. Pruning buys memory, not per-token speed.
+
+**Changes — only the expert-count-dependent factors:**
+- **One constant:** `N_ROUTED` in `include/deepseek_v4.h` (`160` ↔ `256`). Point the loader at the other
+  checkpoint and you're done — everything downstream is shape-derived from the index.
+- **Total weight footprint.** The expert pool is the bulk of the 96 GiB; 256 experts ≈ 1.6× the routed-
+  expert memory of 160. On the same 122.8 GiB Thor, the unpruned model leaves **less headroom → smaller
+  max KV / context** (this is exactly the tradeoff REAP exists to buy back at the edge).
+- **Shape-derived quantities** (all auto-sized by the loader, no code change beyond the constant):
+  `ffn.gate.weight [n_routed, dim]`, `ffn.gate.bias [n_routed]`, the routed-expert weight arrays + their
+  strides, the `moe_forward` expert-loop bound, and the router's top-k scan width.
+- **The trained values, not the kernels:** hash `tid2eid` tables and the learned router steer over a
+  differently-sized pool — but that lives in the *checkpoint*, not the code.
+- **The fine-tune target distribution:** the draft head is adapted to the REAP hidden-state distribution
+  rather than the unpruned one — a *data/training* difference (the whole point of this repo), not a
+  CUDA-kernel difference.
+
+**Takeaway:** swapping unpruned ↔ REAP is a **one-constant + different-checkpoint** change; the CUDA is
+invariant to expert count because the *active compute path* is. This is a concrete instance of the
+model-oriented transferability principle above — the same hand-tuned instruction stream serves both K=256
+and K=160, and by extension other REAP depths / K-values, with only memory and a handful of shapes moving.
+
 ## Governing docs
 - **`CONSTITUTION.md`** — the charter: two artifacts (portable weights + *preserved* Thor CUDA), the gate
   ladder, front-loaded correctness, no silent failures. The CUDA here is a first-class, version-controlled

@@ -1,5 +1,6 @@
 // hc.cu — Hyper-Connections compose, correctness-first (Gate K oracle: ref/gen_units.py gen_hc).
 #include "hc.h"
+#include "dscratch.h"
 #include "hc_sinkhorn.h"
 #include <cstdio>
 #define CU(x) do{cudaError_t e=(x); if(e){fprintf(stderr,"cuda %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }while(0)
@@ -56,13 +57,12 @@ void hc_pre(float* y, float* post, float* comb, const float* x, const float* hc_
             int sinkhorn_iters, float eps, cudaStream_t stream) {
     int mix_hc = (2 + hc) * hc, hcd = hc * d;
     float *rsq, *mixes, *pre;
-    CU(cudaMalloc(&rsq, (size_t)bs * 4)); CU(cudaMalloc(&mixes, (size_t)bs * mix_hc * 4)); CU(cudaMalloc(&pre, (size_t)bs * hc * 4));
+    rsq=(float*)dmalloc((size_t)bs*4); mixes=(float*)dmalloc((size_t)bs*mix_hc*4); pre=(float*)dmalloc((size_t)bs*hc*4);
     k_rsqrt<<<bs, 256, 0, stream>>>(rsq, x, bs, hcd, eps);
     k_mixes<<<bs * mix_hc, 32, 0, stream>>>(mixes, x, hc_fn, rsq, bs, mix_hc, hcd);
     hc_sinkhorn(pre, post, comb, mixes, hc_scale, hc_base, bs, hc, sinkhorn_iters, eps, stream);
     k_combine<<<(bs * d + 255) / 256, 256, 0, stream>>>(y, pre, x, bs, hc, d);
-    CU(cudaStreamSynchronize(stream));
-    cudaFree(rsq); cudaFree(mixes); cudaFree(pre);
+    dsync(stream); dfree(rsq); dfree(mixes); dfree(pre);
 }
 
 void hc_post(float* y, const float* x_new, const float* residual, const float* post,
@@ -74,11 +74,10 @@ void hc_head(float* y, const float* x, const float* hc_fn, const float* hc_scale
              const float* hc_base, int bs, int hc, int d, float eps, cudaStream_t stream) {
     int hcd = hc * d;
     float *rsq, *mixes, *pre;
-    CU(cudaMalloc(&rsq, (size_t)bs * 4)); CU(cudaMalloc(&mixes, (size_t)bs * hc * 4)); CU(cudaMalloc(&pre, (size_t)bs * hc * 4));
+    rsq=(float*)dmalloc((size_t)bs*4); mixes=(float*)dmalloc((size_t)bs*hc*4); pre=(float*)dmalloc((size_t)bs*hc*4);
     k_rsqrt<<<bs, 256, 0, stream>>>(rsq, x, bs, hcd, eps);
     k_mixes<<<bs * hc, 32, 0, stream>>>(mixes, x, hc_fn, rsq, bs, hc, hcd);          // mix_hc = hc for head
     k_sigmoid_pre<<<(bs * hc + 255) / 256, 256, 0, stream>>>(pre, mixes, hc_scale, hc_base, bs, hc, eps);
     k_combine<<<(bs * d + 255) / 256, 256, 0, stream>>>(y, pre, x, bs, hc, d);
-    CU(cudaStreamSynchronize(stream));
-    cudaFree(rsq); cudaFree(mixes); cudaFree(pre);
+    dsync(stream); dfree(rsq); dfree(mixes); dfree(pre);
 }

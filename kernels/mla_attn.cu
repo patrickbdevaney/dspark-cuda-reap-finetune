@@ -1,6 +1,7 @@
 // mla_attn.cu — MLA attention primitives, correctness-first (Gate K oracle: ref/gen_units.py).
 // Optimization (mma, smem KV staging, bf16) comes AFTER these pass their gate (CONSTITUTION Art. I).
 #include <cuda_fp16.h>
+#include "dscratch.h"
 #include "mla_attn.h"
 
 // ---------------- sparse_attn ----------------
@@ -201,11 +202,11 @@ bool g_tc_ogroup = false;   // forward.cu sets true; gates use the warp-per-outp
 void ogroup_gemm(float* out, const float* o, const float* wo_a,
                  int bs, int G, int R, int Kd, cudaStream_t stream) {
     if (g_tc_ogroup && Kd%16==0) {
-        __half *o16,*wo16; cudaMalloc(&o16,(size_t)bs*G*Kd*2); cudaMalloc(&wo16,(size_t)G*R*Kd*2);
+        __half *o16,*wo16; o16=(__half*)dmalloc((size_t)bs*G*Kd*2); wo16=(__half*)dmalloc((size_t)G*R*Kd*2);
         k_f2h<<<((size_t)bs*G*Kd+255)/256,256,0,stream>>>(o16,o,(size_t)bs*G*Kd);
         k_f2h<<<((size_t)G*R*Kd+255)/256,256,0,stream>>>(wo16,wo_a,(size_t)G*R*Kd);
         dim3 grid((R+7)/8, G); tc_ogroup_kernel<<<grid,32,0,stream>>>(out,o16,wo16,bs,G,R,Kd);
-        cudaStreamSynchronize(stream); cudaFree(o16); cudaFree(wo16); return;
+        dsync(stream); dfree(o16); dfree(wo16); return;
     }
     ogroup_gemm_kernel<<<bs * G * R, 32, 0, stream>>>(out, o, wo_a, bs, G, R, Kd);
 }

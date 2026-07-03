@@ -162,5 +162,16 @@ absorbs the overlap) or (b) loader places routed-expert tensors 16B-aligned so u
 LESSON: a correct kernel isn't a fast kernel — on a bandwidth-bound path, load coalescing IS the win; measure
 end-to-end, don't assume the unit-gate speedup transfers when the memory access pattern changed.
 
+**PROFILE-FIRST redirect (nsys kernel summary) — the grind was aimed wrong.** Measured GPU-time breakdown of
+the s=8 forward: k_repack_w 27% (ONE-TIME repack, amortizes over decode — single-forward double-counts it),
+WEIGHT DEQUANT 27% (k_deq_e8m0 17% + k_deq_fp8_blk 5% + k_deq_bf16 5% — re-dequanted EVERY layer EVERY forward,
+redundant for decode), tc_w4a8_pp MoE GEMM only 14%, ogroup_gemm (fp32 attn-out) 13% (not TC), gemm_fp32
+(compressor/indexer/head) 10%, tc_fp8 dense only 4.6%. LESSON: I'd been chasing the MoE GEMM (14%) and the
+aligned-load refinement; the REAL levers are (1) don't pay the one-time repack in the timed forward (warmup),
+(2) DEQUANT-AT-LOAD — cache dequanted scales/weights once instead of re-dequanting every forward (~27%), (3)
+TC-ify ogroup_gemm + gemm_fp32 (23% combined, still warp/fp32). Profile-first caught a mis-aimed grind before
+more effort was wasted — exactly the discipline. Next: dequant-at-load (start with e8m0 scales — biggest single
+at 17%, smallest memory since scales are ~weight/128).
+
 ---
 *Update this log whenever a gate catches something or an iteration lands a measured change. The "why" is the asset.*

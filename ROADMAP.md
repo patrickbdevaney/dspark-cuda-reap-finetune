@@ -95,12 +95,16 @@ container `vllm-dflash-thor:sglang`. Never `--runtime nvidia` (wedges containers
 1. **Weight loader** — DONE: `include/weight_store.h` `WeightStore` loads all shards (pread→cudaHostAlloc-
    mapped, single-copy) and exposes `dev<T>(name)` device pointers for all 43843 tensors. `tools/load_device.cu`
    is the load+verify test.
-   - **INTEGRATION SUBTLETY for MoE (surfaces here):** `MoEWeights` wants routed experts as a single stacked
-     `[E, ...]` array + per-expert stride, but the checkpoint stores them as per-expert tensors
-     (`layers.L.ffn.experts.{e}.{w1,w2,w3}.weight`). CHECK whether the 160 experts are byte-contiguous within
-     a shard (consecutive `data_offsets`) → if so, pass `experts.0.w1` device ptr as the base with computed
-     stride (zero-copy). If NOT contiguous, either change `moe_forward` to take a per-expert pointer table, or
-     gather. The block gate used a pre-stacked golden, so this is the first place it matters. Same for scales.
+   - **MoE INTEGRATION — RESOLVED (finding):** checked shard-4 header. Experts are **NOT byte-contiguous and
+     NOT expert-ordered** (e0's w1/w2/w3 grouped consecutively, but e2 jumps to a different 1.2 GB region).
+     So `MoEWeights`'s stacked-`[E,...]`+stride assumption (used by the pre-stacked block golden) **fails on
+     the real checkpoint.** Per-expert layout: `layers.L.ffn.experts.{e}.w1.weight` = `[inter=2048, dim/2=2048]`
+     dtype **I8** (FP4 packed, 4.19 MB each); `.w2.weight`=[dim, inter/2]; `.w3` like w1; scales `.scale`
+     (F32). shared_experts `.{w1,w2,w3}.{weight,scale}`. gate `.weight` + `.tid2eid` (layers 0,1,2 are hash).
+     **FIX (next task):** add a `moe_forward` variant taking **per-expert device-pointer tables**
+     (`const uint8_t* w1[E], w2[E], w3[E]` + `const float* w1s[E]...`) instead of base+stride — moe.cu already
+     loops per selected expert, so swap `w1 + e*stride` → `w1_ptrs[e]` (localized; keep the stacked version so
+     gate_block/gate_units still pass). Model loader builds the 160-ptr tables per layer via WeightStore.
    - embed = `embed_tokens.weight` (bf16 lookup). `lm_head.weight` (bf16/fp8) + final `norm.weight`.
 2. **Model assembly** — build `BlockWeights` (layers 0-1) and a new `CompressedBlockWeights`
    (=`CompressedAttnWeights`+`MoEWeights`+hc+norms) for layers 2-42 by name lookup. Need

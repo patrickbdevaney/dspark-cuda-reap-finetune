@@ -227,7 +227,7 @@ def cmla(ckpt, config, layer, seq, out_dir):
     torch.set_default_dtype(torch.float32); torch.set_default_device(dev)
     args = build_args(json.load(open(config)))
     args.max_batch_size = 1; args.max_seq_len = max(256, seq * 2)
-    assert args.compress_ratios[layer] == 4, f"cmla needs a ratio-4 indexer layer (got {args.compress_ratios[layer]})"
+    assert args.compress_ratios[layer] in (4, 128), f"cmla needs a compressed layer (got {args.compress_ratios[layer]})"
     M.world_size = 1; M.rank = 0
     M.default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
     M.scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
@@ -240,12 +240,13 @@ def cmla(ckpt, config, layer, seq, out_dir):
     holder = torch.nn.Module(); holder.attn = a; w.layers.append(holder)
     raw_loader.load_state_into(w, ckpt, only_prefixes=[f"layers.{layer}.attn."])
     a.wo_a.weight.data = a.wo_a.weight.data.float()
-    a.indexer.weights_proj.weight.data = a.indexer.weights_proj.weight.data.float()   # bf16 -> fp32 for fp32 path
+    if a.indexer is not None:
+        a.indexer.weights_proj.weight.data = a.indexer.weights_proj.weight.data.float()   # bf16 -> fp32
 
     torch.manual_seed(1234)
     x = torch.randn(1, seq, args.dim)
     o = a(x, 0)                                          # full compressed-path forward
-    mc, idx = a.compressor, a.indexer; ic = idx.compressor
+    mc, idx = a.compressor, a.indexer; ic = idx.compressor if idx is not None else None
     def u8(p): return p.detach().view(torch.uint8).contiguous().cpu()
     def ff(p): return p.detach().float().contiguous().cpu()
     fq = a.freqs_cis[:seq]; fc = a.freqs_cis[:seq:args.compress_ratios[layer]]
@@ -258,11 +259,12 @@ def cmla(ckpt, config, layer, seq, out_dir):
         "cos": torch.view_as_real(fq)[..., 0].contiguous().cpu(), "sin": torch.view_as_real(fq)[..., 1].contiguous().cpu(),
         "cc_cos": torch.view_as_real(fc)[..., 0].contiguous().cpu(), "cc_sin": torch.view_as_real(fc)[..., 1].contiguous().cpu(),
         "mc_wkv": ff(mc.wkv.weight), "mc_wgate": ff(mc.wgate.weight), "mc_ape": ff(mc.ape), "mc_norm": ff(mc.norm.weight),
-        "idx_wq_b": u8(idx.wq_b.weight), "idx_wq_b_s": ff(idx.wq_b.scale), "idx_weights_proj": ff(idx.weights_proj.weight),
-        "idx_c_wkv": ff(ic.wkv.weight), "idx_c_wgate": ff(ic.wgate.weight), "idx_c_ape": ff(ic.ape), "idx_c_norm": ff(ic.norm.weight),
         "dims": torch.tensor([seq, args.dim, args.q_lora_rank, args.window_size, args.compress_ratios[layer],
                               args.index_n_heads, args.index_head_dim, args.index_topk], dtype=torch.int32),
     }
+    if idx is not None:
+        g.update({"idx_wq_b": u8(idx.wq_b.weight), "idx_wq_b_s": ff(idx.wq_b.scale), "idx_weights_proj": ff(idx.weights_proj.weight),
+                  "idx_c_wkv": ff(ic.wkv.weight), "idx_c_wgate": ff(ic.wgate.weight), "idx_c_ape": ff(ic.ape), "idx_c_norm": ff(ic.norm.weight)})
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"cmla_layer{layer}_seq{seq}.safetensors")
     save_file({k: v.contiguous() for k, v in g.items()}, path)

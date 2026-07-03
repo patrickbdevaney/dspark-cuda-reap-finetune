@@ -24,8 +24,10 @@ int main(int argc, char** argv){
     a.cosT=up<float>(S.get("cos")); a.sinT=up<float>(S.get("sin"));
     w.mc_wkv=up<float>(S.get("mc_wkv")); w.mc_wgate=up<float>(S.get("mc_wgate")); w.mc_ape=up<float>(S.get("mc_ape")); w.mc_norm=up<float>(S.get("mc_norm"));
     w.cc_cos=up<float>(S.get("cc_cos")); w.cc_sin=up<float>(S.get("cc_sin"));
-    w.idx_wq_b=up<unsigned char>(S.get("idx_wq_b")); w.idx_wq_b_s=up<float>(S.get("idx_wq_b_s")); w.idx_weights_proj=up<float>(S.get("idx_weights_proj"));
-    w.idx_c_wkv=up<float>(S.get("idx_c_wkv")); w.idx_c_wgate=up<float>(S.get("idx_c_wgate")); w.idx_c_ape=up<float>(S.get("idx_c_ape")); w.idx_c_norm=up<float>(S.get("idx_c_norm"));
+    if (ratio == 4) {   // indexer only on ratio-4 layers
+        w.idx_wq_b=up<unsigned char>(S.get("idx_wq_b")); w.idx_wq_b_s=up<float>(S.get("idx_wq_b_s")); w.idx_weights_proj=up<float>(S.get("idx_weights_proj"));
+        w.idx_c_wkv=up<float>(S.get("idx_c_wkv")); w.idx_c_wgate=up<float>(S.get("idx_c_wgate")); w.idx_c_ape=up<float>(S.get("idx_c_ape")); w.idx_c_norm=up<float>(S.get("idx_c_norm"));
+    }
     w.index_n_heads=inh; w.index_head_dim=ihd; w.index_topk=itk;
 
     const float* x=up<float>(S.get("x"));

@@ -48,18 +48,30 @@ void compressed_attn_forward(float* out, const float* x, const CompressedAttnWei
     act_quant_fp8sim(kv_win, bs, NOPE_DIM, 64, HEAD_DIM, stream);
 
     // --- main compressor -> compressed kv, then combined kv = [window ⊕ compressed] ---
+    // ratio==4: overlapping compressor + DSA indexer. ratio==128: non-overlap compressor + strided idxs.
+    const bool overlap = (ratio == 4), has_indexer = (ratio == 4);
     compressor_forward(kv_comp, x, w.mc_wkv, w.mc_wgate, w.mc_ape, w.mc_norm, w.cc_cos, w.cc_sin,
-                       s, DIM, HEAD_DIM, ratio, true, ROPE_DIM, eps, false, stream);
+                       s, DIM, HEAD_DIM, ratio, overlap, ROPE_DIM, eps, false, stream);
     CU(cudaMemcpyAsync(kv_all, kv_win, (size_t)bs*HEAD_DIM*4, cudaMemcpyDeviceToDevice, stream));
     CU(cudaMemcpyAsync(kv_all + (size_t)bs*HEAD_DIM, kv_comp, (size_t)T*HEAD_DIM*4, cudaMemcpyDeviceToDevice, stream));
 
-    // --- indexer -> compressed top-k idxs (offset = s, into the compressed region) ---
-    int itopk = w.index_topk < T ? w.index_topk : T;
-    float* idx_score; int* compress_topk;
-    CU(cudaMalloc(&idx_score,(size_t)s*T*4)); CU(cudaMalloc(&compress_topk,(size_t)s*itopk*4));
-    indexer_forward(idx_score, compress_topk, x, qr, w.idx_wq_b, w.idx_wq_b_s, w.idx_weights_proj,
-                    w.idx_c_wkv, w.idx_c_wgate, w.idx_c_ape, w.idx_c_norm, a.cosT, a.sinT, w.cc_cos, w.cc_sin,
-                    s, DIM, Q_LORA, w.index_n_heads, w.index_head_dim, ROPE_DIM, ratio, w.index_topk, s, eps, stream);
+    // --- compressed idxs (offset = s, into the compressed region) ---
+    int itopk; int* compress_topk;
+    if (has_indexer) {
+        itopk = w.index_topk < T ? w.index_topk : T;
+        float* idx_score; CU(cudaMalloc(&idx_score,(size_t)s*T*4)); CU(cudaMalloc(&compress_topk,(size_t)s*itopk*4));
+        indexer_forward(idx_score, compress_topk, x, qr, w.idx_wq_b, w.idx_wq_b_s, w.idx_weights_proj,
+                        w.idx_c_wkv, w.idx_c_wgate, w.idx_c_ape, w.idx_c_norm, a.cosT, a.sinT, w.cc_cos, w.cc_sin,
+                        s, DIM, Q_LORA, w.index_n_heads, w.index_head_dim, ROPE_DIM, ratio, w.index_topk, s, eps, stream);
+        cudaFree(idx_score);
+    } else {
+        // strided (get_compress_topk_idxs, prefill): compress[i,t] = (t >= (i+1)/ratio) ? -1 : t + s
+        itopk = T; std::vector<int> hc((size_t)s * T);
+        for (int i = 0; i < s; ++i) { int thr = (i + 1) / ratio;
+            for (int t = 0; t < T; ++t) hc[(size_t)i * T + t] = (t >= thr) ? -1 : t + s; }
+        CU(cudaMalloc(&compress_topk,(size_t)s*T*4));
+        CU(cudaMemcpyAsync(compress_topk, hc.data(), (size_t)s*T*4, cudaMemcpyHostToDevice, stream));
+    }
 
     // --- window idxs (host) ⊕ compressed idxs -> combined ---
     int wwidth = s < win ? s : win;
@@ -81,5 +93,5 @@ void compressed_attn_forward(float* out, const float* x, const CompressedAttnWei
     CU(cudaStreamSynchronize(stream));
     cudaFree(xq);cudaFree(xs);cudaFree(qr);cudaFree(qrq);cudaFree(qrs);cudaFree(q);cudaFree(kv_win);
     cudaFree(kv_comp);cudaFree(kv_all);cudaFree(o);cudaFree(og);cudaFree(ogq);cudaFree(ogs);
-    cudaFree(idx_score);cudaFree(compress_topk);cudaFree(window_dev);cudaFree(combined);
+    cudaFree(compress_topk);cudaFree(window_dev);cudaFree(combined);
 }

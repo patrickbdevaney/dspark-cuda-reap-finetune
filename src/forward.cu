@@ -108,6 +108,7 @@ int main(int argc, char** argv){
 
     auto fill_moe=[&](const std::string& pfx, bool is_hash, MoEWeights& m, std::vector<const uint8_t*>& p1,std::vector<const uint8_t*>& p2,std::vector<const uint8_t*>& p3,
                       std::vector<const float*>& s1,std::vector<const float*>& s2,std::vector<const float*>& s3){
+        p1.clear();p2.clear();p3.clear();s1.clear();s2.clear();s3.clear();   // idempotent: safe to re-run (2x warmup)
         std::string p=pfx+"ffn.";
         m.gate_w=L.bf16(p+"gate.weight"); m.is_hash=is_hash;
         m.gate_bias=m.is_hash?nullptr:(W.has(p+"gate.bias")?L.f32(p+"gate.bias"):nullptr);
@@ -132,7 +133,16 @@ int main(int argc, char** argv){
     std::vector<std::vector<const uint8_t*>> P1(N_LAYERS),P2(N_LAYERS),P3(N_LAYERS);
     std::vector<std::vector<const float*>> S1(N_LAYERS),S2(N_LAYERS),S3(N_LAYERS);
 
-    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1); cudaEventRecord(t0);
+    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1); float ms=0;
+    // Head weights + head buffers dequanted/allocated ONCE (reused both passes; head.weight fp32 ~2.7GB — must
+    // NOT re-alloc per pass or memory blows up). MEMORY-NEUTRAL 2x warmup: no per-pass persistent allocations.
+    const float *head_w=L.bf16("head.weight"), *norm_w=L.bf16("norm.weight");
+    const float *hc_fn=L.f32("hc_head_fn"), *hc_sc=L.f32("hc_head_scale"), *hc_bs=L.f32("hc_head_base");
+    float* collapsed; CU(cudaMalloc(&collapsed,(size_t)s*d*4)); float* logits; CU(cudaMalloc(&logits,(size_t)s*VOCAB*4));
+    // pass 0 = warmup (in-place repack via g_pp_done); pass 1 = steady-state decode (repack cached, no one-time cost).
+    for(int pass=0; pass<2; ++pass){
+    k_hc_expand<<<((size_t)s*hc*d+255)/256,256>>>(h,h0,s,hc,d); CU(cudaDeviceSynchronize());  // reset hidden from embedding
+    cudaEventRecord(t0);
     for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){
         int ratio=compress_ratio(Lyr);
         std::string lp="layers."+std::to_string(Lyr)+".";
@@ -175,14 +185,14 @@ int main(int argc, char** argv){
             printf("  layer %d/%d done (ratio %d)  mem %.1f/%.1f GiB\n",Lyr,N_LAYERS,ratio,(tb-fb)/1073741824.0,tb/1073741824.0); }
     }
 
-    // --- head: hc_head (4->1) -> final norm -> lm_head -> logits[s,vocab] ---
-    float* collapsed; CU(cudaMalloc(&collapsed,(size_t)s*d*4));
-    hc_head(collapsed, h, L.f32("hc_head_fn"), L.f32("hc_head_scale"), L.f32("hc_head_base"), s, hc, d, HC_EPS);
-    rmsnorm(collapsed, collapsed, L.bf16("norm.weight"), s, d, EPS, true, 0);
-    float* logits; CU(cudaMalloc(&logits,(size_t)s*VOCAB*4));
-    gemm_fp32(logits, collapsed, L.bf16("head.weight"), s, VOCAB, d, 0);   // [s,vocab]
+    // --- head: hc_head (4->1) -> final norm -> lm_head -> logits[s,vocab] --- (weights hoisted, reused both passes)
+    hc_head(collapsed, h, hc_fn, hc_sc, hc_bs, s, hc, d, HC_EPS);
+    rmsnorm(collapsed, collapsed, norm_w, s, d, EPS, true, 0);
+    gemm_fp32(logits, collapsed, head_w, s, VOCAB, d, 0);   // [s,vocab]
     CU(cudaDeviceSynchronize()); cudaEventRecord(t1); cudaEventSynchronize(t1);
-    float ms=0; cudaEventElapsedTime(&ms,t0,t1);
+    cudaEventElapsedTime(&ms,t0,t1);
+    printf("[pass %d] %.1f ms (%.1f ms/tok)%s\n", pass, ms, ms/s, pass==0?"  [warmup: one-time repack]":"  [WARM steady-state]");
+    }  // end 2x warmup loop; ms = pass-1 (warm) time
 
     std::vector<float> lg((size_t)VOCAB); CU(cudaMemcpy(lg.data(),logits+(size_t)(s-1)*VOCAB,VOCAB*4,cudaMemcpyDeviceToHost));
     int am=0; for(int v=1;v<VOCAB;++v) if(lg[v]>lg[am]) am=v;

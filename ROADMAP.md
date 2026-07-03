@@ -92,8 +92,19 @@ container `vllm-dflash-thor:sglang`. Never `--runtime nvidia` (wedges containers
 ## REMAINING PATH
 
 ### Phase A — `forward.cu` → GATE 1  (current)
-1. **Weight loader** (blocker above): single-copy into GPU-accessible memory, build name→device-ptr map,
-   populate per-layer weight structs.
+1. **Weight loader** — DONE: `include/weight_store.h` `WeightStore` loads all shards (pread→cudaHostAlloc-
+   mapped, single-copy) and exposes `dev<T>(name)` device pointers for all 43843 tensors. `tools/load_device.cu`
+   is the load+verify test.
+   - **INTEGRATION SUBTLETY for MoE (surfaces here):** `MoEWeights` wants routed experts as a single stacked
+     `[E, ...]` array + per-expert stride, but the checkpoint stores them as per-expert tensors
+     (`layers.L.ffn.experts.{e}.{w1,w2,w3}.weight`). CHECK whether the 160 experts are byte-contiguous within
+     a shard (consecutive `data_offsets`) → if so, pass `experts.0.w1` device ptr as the base with computed
+     stride (zero-copy). If NOT contiguous, either change `moe_forward` to take a per-expert pointer table, or
+     gather. The block gate used a pre-stacked golden, so this is the first place it matters. Same for scales.
+   - embed = `embed_tokens.weight` (bf16 lookup). `lm_head.weight` (bf16/fp8) + final `norm.weight`.
+2. **Model assembly** — build `BlockWeights` (layers 0-1) and a new `CompressedBlockWeights`
+   (=`CompressedAttnWeights`+`MoEWeights`+hc+norms) for layers 2-42 by name lookup. Need
+   `compressed_block_forward` = mirror `block_forward` but call `compressed_attn_forward` for attention.
 2. **Model assembly:** `embed(input_ids)` → HC-expand → 43 layers → final `rmsnorm` → `lm_head` → logits.
    - Layers 0–1: pure-sliding block (`block_forward` uses `mla_forward`).
    - Layers 2–42: compressed block — need a `compressed_block_forward` = block wrapping

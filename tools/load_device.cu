@@ -3,6 +3,7 @@
 //   build: nvcc -O2 -arch=sm_110a -I include tools/load_device.cu -o build/load_device
 //   run:   ./build/load_device /home/patrickd/models/DeepSeek-V4-Flash-180B
 #include "safetensors.h"
+#include "weight_store.h"
 #include "deepseek_v4.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -25,28 +26,20 @@ int main(int argc, char** argv) {
     printf("integrated=%d hostRegisterSupported=%d canUseHostPtrForRegMem=%d canMapHostMem=%d\n",
            integrated, hostReg, canUseHostPtr, mapHost);
 
-    st::ShardedSafeTensors S(argv[1], key_map);
-    printf("shards=%zu tensors=%zu\n", S.shardCount(), S.count());
+    // --- full-model load into GPU-accessible memory (single-copy pread; see weight_store.h) ---
+    st::WeightStore W(argv[1], key_map);
+    printf("loaded %.3f GiB, %zu tensors -> device pointers\n", W.loadedGiB(), W.count());
 
-    // --- weight->device path for integrated Tegra (cudaHostRegister of file mmap is unsupported):
-    //     single-copy shard-0 into cudaHostAlloc(Mapped) GPU-accessible memory, then GPU reads it.
-    //     (forward.cu scales this to all 46 shards; peak ~96 GiB single copy, no mmap+device doubling.) ---
-    auto regs = S.shardRegions();
-    const void* h0 = regs[0].first; size_t bytes0 = regs[0].second;
-    void* pinned = nullptr;
-    cudaError_t e = cudaHostAlloc(&pinned, bytes0, cudaHostAllocMapped);
-    if (e != cudaSuccess) { fprintf(stderr, "cudaHostAlloc %.2f GB failed: %s\n", bytes0/1e9, cudaGetErrorString(e)); return 1; }
-    memcpy(pinned, h0, bytes0);                                    // faults mmap + single copy into GPU-accessible buf
-    void* dptr; if (cudaHostGetDevicePointer(&dptr, pinned, 0) != cudaSuccess) { fprintf(stderr,"getDevicePtr failed\n"); return 1; }
-    printf("shard-0: cudaHostAlloc(Mapped) %.3f GiB + copied; device pointer resolved\n", bytes0/1073741824.0);
-
-    // verify GPU reads the FIRST 32 bytes of the pinned buffer correctly
-    unsigned char hbuf[32], dbuf[32];
-    memcpy(hbuf, pinned, 32);
-    if (cudaMemcpy(dbuf, dptr, 32, cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr,"D2H via dev-ptr failed\n"); return 1; }
-    bool match = memcmp(hbuf, dbuf, 32) == 0;
-    printf("GPU read of shard-0[:32] via device pointer: %s\n", match ? "MATCH host copy" : "MISMATCH");
-    cudaFreeHost(pinned);
-    printf("\nWeight->device path (cudaHostAlloc-mapped single-copy): %s\n", match ? "PASS" : "FAIL");
+    // verify the GPU reads a real weight via its device pointer, matching the file bytes
+    const char* probe = "layers.1.attn.wq_a.weight";
+    if (!W.has(probe)) { fprintf(stderr, "probe tensor missing: %s\n", probe); return 1; }
+    const st::DevTensor& dt = W.get(probe);
+    unsigned char dbuf[32]; if (cudaMemcpy(dbuf, dt.dev, 32, cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr,"D2H failed\n"); return 1; }
+    // ground truth: re-read the same tensor's first 32 bytes straight from its shard mmap
+    bool match = true;   // if the probe shard differs, this compares against W's own resolved pointer consistency
+    { st::ShardedSafeTensors S2(argv[1], key_map); const st::Tensor& t = S2.get(probe);
+      match = (memcmp(dbuf, t.data, 32) == 0); }
+    printf("GPU read of %s[:32]: %s\n", probe, match ? "MATCH file bytes" : "MISMATCH");
+    printf("\nFull-model weight->device load (single-copy pread, %.1f GiB): %s\n", W.loadedGiB(), match ? "PASS" : "FAIL");
     return match ? 0 : 1;
 }

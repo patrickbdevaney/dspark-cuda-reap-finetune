@@ -53,7 +53,7 @@ inline void JsonP::skip_value() {
 
 class SafeTensors {
 public:
-    explicit SafeTensors(const std::string& path) {
+    explicit SafeTensors(const std::string& path) : path_(path) {
         fd_ = open(path.c_str(), O_RDONLY);
         if (fd_ < 0) throw std::runtime_error("open failed: " + path);
         struct stat sb; fstat(fd_, &sb); filesize_ = sb.st_size;
@@ -62,13 +62,16 @@ public:
         uint64_t hlen; memcpy(&hlen, base_, 8);
         const char* hdr = (const char*)base_ + 8;
         const uint8_t* data_start = base_ + 8 + hlen;
-        data_start_ = data_start; data_bytes_ = filesize_ - (8 + hlen);
+        data_start_ = data_start; data_bytes_ = filesize_ - (8 + hlen); data_file_off_ = 8 + hlen;
         parse_header(hdr, hlen, data_start);
     }
     ~SafeTensors() { if (base_ && base_ != MAP_FAILED) munmap((void*)base_, filesize_); if (fd_ >= 0) close(fd_); }
 
     const uint8_t* dataStart() const { return data_start_; }
     size_t dataBytes() const { return data_bytes_; }
+    const std::string& path() const { return path_; }
+    size_t dataFileOffset() const { return data_file_off_; }   // byte offset of data blob within the file
+    int fd() const { return fd_; }
     bool has(const std::string& name) const { return tensors_.count(name) > 0; }
     const Tensor& get(const std::string& name) const {
         auto it = tensors_.find(name);
@@ -103,8 +106,9 @@ private:
             tensors_.emplace(std::move(name), std::move(t));
         } while (j.eat(','));
     }
+    std::string path_;
     int fd_ = -1; size_t filesize_ = 0; const uint8_t* base_ = nullptr;
-    const uint8_t* data_start_ = nullptr; size_t data_bytes_ = 0;
+    const uint8_t* data_start_ = nullptr; size_t data_bytes_ = 0, data_file_off_ = 0;
     std::unordered_map<std::string, Tensor> tensors_;
 };
 
@@ -171,6 +175,7 @@ public:
         for (auto& kv : shards_) r.emplace_back(kv.second->dataStart(), kv.second->dataBytes());
         return r;
     }
+    const std::unordered_map<std::string, std::unique_ptr<SafeTensors>>& shards() const { return shards_; }
 
 private:
     std::string dir_;

@@ -7,6 +7,19 @@
 `reference/DEEPSEEK_V4_MODELING_NOTES.md` (numeric spec), `GATE_LOG.md` (finding+rationale per gate), `FP4_COMPUTE_NOTE.md` (Thor FP4 strategy), `DECODE_HORIZON.md` (grind to 38-50 tok/s), `STRUCTURAL_PLAN.md` (multiplier phase: device routing/graphs/KV-decode/spec), and the memory file
 `~/.claude/projects/-home-patrickd/memory/dspark-v4flash-180b-thor.md`.
 
+## ⏱ CURRENT STATE (2026-07-03) — decode engine + spec-decode + CUDA graphs DONE; gap root-caused
+- **Base decode: 7.89 tok/s (126.7 ms/tok), argmax=270, all attention flavors bit-exact.** 0.50→7.89 (15.9×) over
+  9 gated optimizations (`OPTIMIZATION_LEDGER.md`). Latest: M=1 ogroup GEMV −15%.
+- **Full 43-layer CUDA graph captured bit-exact** (device-pos) → measured PARITY (GPU-bound, not launch-bound).
+- **Spec-decode built** (M=K verify + DSpark head + accept-longest-prefix) — currently ~parity (verify 2.6× a decode,
+  ~2.5 accepted). Determinized MoE raised acceptance 1.9→2.5.
+- **ROOT CAUSE of the vLLM gap = bandwidth efficiency, not algorithm.** We run at ~25% of peak (69/273 GB/s);
+  well-written kernels hit 70–80%. vLLM's 24 tok/s used MTP2 (~2×); its no-spec rate ~12–14 tok/s ⇒ real kernel
+  gap ~1.5–1.8×. **sm_110a facts (tested): tcgen05 NO (DeepGEMM=rewrite), cp.async YES, FP4x2 HW unpack YES.**
+- **FORWARD ROADMAP → `DECODE_GAP_RESEARCH.md`** (+ `RESEARCH_INVENTORY.md` dedup key): T1.1 HW-unpack FP4 MoE GEMV
+  (⭐ top lever) → T1.2 fuse attention/compressor glue → T2.1 verify expert-union fix → T2.2 DSpark head fine-tune.
+  Deprioritized (arch-blocked or subsumed): tcgen05/DeepGEMM, PDL, in-graph-metadata MTP, DeepEP, cluster/DSMEM.
+
 ## HIGH-LEVEL OVERVIEW (user, turn ~55) — AGILE RE-SEQUENCE: ship the product first, then improve the head
 **Rationale:** a fast, stable, memory-lean production server running the 180B + the EXISTING (unpruned) DSpark
 head is a real, banked, shippable win — beats vLLM/SGLang on memory + startup + decode on Thor — *before* the

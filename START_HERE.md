@@ -14,13 +14,16 @@ Every kernel is gated **bit-exact / cosine-1.0 vs a PyTorch oracle** before it i
 preserved first-class repo artifact.
 
 ## 2. The arc (the bigger picture — hold this)
-1. **Peak base + DSpark decode** — fastest kernels + the structural multipliers. **← WE ARE HERE.** Kernel phase
-   DONE (1.81× banked). Next: the **decode engine** (see §6).
-   **DECODE ENGINE BUILT + OPTIMIZING** (see `DECODE_STEP4_DESIGN.md`): full 43-layer M=1 KV-cache decode runs
-   correct on the real 180B (argmax=270), attention all bit-exact-gated. Decode optimized **0.50 → 4.67 tok/s
-   (9.3×)** across 7 gated wins (native e8m0/wo_a scales, arena, structs-once, fused fp8 ogroup, warp router).
-   Remaining to ~50 tok/s: M=1 GEMV + CUDA graphs (base → bandwidth floor) then **DSpark spec-decode** (block
-   verify, the multiplier — where the draft head integrates).
+1. **Peak base + DSpark decode** — fastest kernels + the structural multipliers. **← WE ARE HERE.**
+   **DECODE ENGINE BUILT + OPTIMIZED + spec-decode + CUDA graphs ALL DONE.** Full 43-layer M=1 KV-cache decode
+   runs correct on the real 180B (argmax=270), every attention flavor bit-exact-gated. Decode optimized
+   **0.50 → 7.89 tok/s (15.9×)** across 9 gated wins (structs-once, native e8m0/wo_a, arena, tc_fp8, M=1 fp8 GEMV,
+   fp4 grouped MoE, fused ogroup, **M=1 ogroup GEMV −15%**, determinized MoE). Full **43-layer CUDA graph captured
+   bit-exact** (device-pos) — measured PARITY (not launch-bound). **Spec-decode built**: M=K verify + DSpark head +
+   accept-longest-prefix (currently ~parity — verify is 2.6× a decode; see below).
+   **RESEARCH VERDICT (`DECODE_GAP_RESEARCH.md`): the gap to vLLM is BANDWIDTH EFFICIENCY, not algorithm.** We run
+   at **~25% of peak (69 of 273 GB/s)**; well-written kernels hit 70–80%. vLLM's 24 tok/s used MTP2 (~2×); its
+   no-spec rate is ~12–14 tok/s, so the real kernel gap is ~1.5–1.8×. **Next = §6.**
 2. **OpenAI-compatible, feature-rich inference server** — vLLM/SGLang parity (streaming, tool-calling schema,
    think-block/reasoning delineation, terminal + WebUI clients, configurable KV, prefix cache), adapted for
    DeepSeek-V4-Flash. Memory-lean, quick-start, faster decode than vLLM/SGLang on Thor. **The banked product win.**
@@ -32,17 +35,19 @@ KEY INSIGHT (why 1→2 merge): the **decode engine** (static M=1 KV-cache step +
 spec-decode) IS the core of the server. Build it once; it delivers the multipliers AND backs the API.
 
 ## 3. Where we are RIGHT NOW (measured, gated, correct)
-- **Gates 0/K/1/1.5/2 all PASSED.** Full 180B runs on Thor, numerically correct ("Paris"), and the **unfine-tuned
-  DSpark draft head transfers to REAP at τ@0 = 0.815** (Gate 2 GO — light fine-tune should suffice).
-- **Warm (2× warmup, steady-state, s=8 prefill): 319.8 ms/tok (3.13 tok/s) = 2.15× over the 687 baseline.**
-  (was 378.8; STRUCTURAL_PLAN **Step 1b zero-sync grouped-GEMM MoE** landed −12.5% same-session A/B: 365.7→319.8,
-  argmax=270, memory-neutral — and it removed the last per-layer host sync so the MoE is now graph-capturable.)
-- **Banked champions (all gated cosine 1.0, memory-safe):** `tc_fp8_gemm` (dense/attn W8A8, 17.9×) · `tc_fp4_gemm`
-  (MoE W4A8, 19.7×) + **repack-at-load** (in-place, zero extra memory) + **funnel-shift** aligned coalesced load ·
-  **batched** MoE dispatch · **TC attention-output** (fp16 mma per group) · **device-side MoE routing** (GPU
-  counting-sort, Step 1). Flags in `forward.cu`: `g_tc_fp8`, `g_tc_ogroup`, `m.use_tc_pp/batched/device_route`.
-- **Kernel-compute is TAPPED**: the last kernel lever (funnel-shift) gave only −1.3%; profile shows compute is a
-  small slice now. Remaining ~14× to the 38–50 tok/s target is **structural + the M=1 decode regime**, not more GEMM.
+- **Full 43-layer M=1 KV-cache decode: 7.89 tok/s (126.7 ms/tok), argmax=270, all attention flavors bit-exact.**
+  9 gated optimizations, 0.50 → 7.89 tok/s (15.9×) — see `OPTIMIZATION_LEDGER.md`. Latest win: **M=1 ogroup GEMV
+  −15%** (the ogroup was scalar-byte reads in an m16 mma at ~40 GB/s; a warp-per-output GEMV fixed it).
+- **CUDA graphs: full 43-layer step captured bit-exact** (device-pos, all 3 attention flavors + device-conditional
+  compressor emit; gates `gate_{mla,compressed,indexer}_graph` cosine 1.0). Measured **PARITY (0.99×) → GPU-bound,
+  NOT launch-bound.**
+- **Spec-decode built**: M=K verify (weights read once for K) + DSpark draft head + accept-longest-prefix.
+  Currently **~parity**: M=5 verify = 334 ms = 2.6× the M=1 decode, ~2.5 tokens accepted ⇒ S≈0.95. Determinized
+  MoE raised acceptance 1.9→2.5.
+- **ROOT CAUSE of the vLLM gap (measured, `DECODE_GAP_RESEARCH.md`):** active weights = 8.77 GB/tok → 32 ms floor
+  at 273 GB/s; we run 126.7 ms = **~25% of peak bandwidth**. The gap is kernel bandwidth efficiency, not algorithm.
+- **sm_110a hardware facts (empirically tested, CUDA 13.0):** `tcgen05` (SM100/DeepGEMM path) **NOT supported** →
+  DeepGEMM = rewrite not port; `cp.async` **OK**; `__nv_cvt_fp4x2_to_halfraw2` (HW FP4×2 unpack) **OK**.
 
 ## 4. HARD CONSTRAINTS (violating these has already cost a power-cycle — do not repeat)
 - **MEMORY: the forward uses ~90% of the 122.8 GiB unified RAM, which is SHARED with the host/OS/Claude Code.**
@@ -68,21 +73,23 @@ spec-decode) IS the core of the server. Build it once; it delivers the multiplie
   head + `model.py`: `/home/patrickd/models/DeepSeek-V4-Flash-DSpark-head/`.
 - A single forward run monopolizes the device for ~10–90 s at ~108 GiB — batch measurements; warn before running.
 
-## 6. THE NEXT BUILD — execute STRUCTURAL_PLAN.md (the decode engine = the multiplier phase = the server core)
-Do this as ONE focused build, gated + detached, memory-neutral. Order (details + rationale in `STRUCTURAL_PLAN.md`):
-1. **Static M=1 KV-cache decode step** (Step 4 there) — the real decode regime (we've only measured 8-tok prefill).
-   MLA/attention over cached latent KV (append new token's KV, attend over history). KV is tiny (MLA+SWA+DSA).
-   **Execution-ready design in `DECODE_STEP4_DESIGN.md`** (append-only KV proven tractable incl. the compressor;
-   equivalence gate = decode logits == prefill logits[s-1]). This is the NEXT build to execute.
-2. **Zero-sync grouped-GEMM MoE** (Step 1b) — **DONE + gated + WIN (−12.5%, 365.7→319.8 ms/tok, argmax=270).**
-   One grouped W4A8 launch per stage over all experts; tile→expert map built on-device from `off[]` → the last
-   per-layer host sync is gone → MoE is graph-capturable. `g_moe_grouped` default-on. Next levers are 3/4/5 below.
-3. **Pre-allocate every buffer + static launch sequence** (Step 2) — remove all mid-forward `cudaMalloc/Free`
-   (Loader per-layer dequant, pp `x16`, funnel temps). Memory-neutral (same peak, allocated once).
-4. **CUDA-graph capture** of the M=1 step (Step 3) — `cudaStreamBeginCapture`/`EndCapture`, instantiate,
-   `cudaGraphLaunch` per token. Kills the hundreds of launch overheads that dominate at M=1. Gate: identical logits.
-5. **DSpark spec decode** (Step 5) — draft head proposes block_size=5, target verifies in one graph-launched
-   forward, accept longest matching prefix (τ≈0.75–0.8), overlap draft∥target. ~2.5–4× throughput multiplier.
+## 6. THE NEXT BUILD — execute `DECODE_GAP_RESEARCH.md` (close the bandwidth gap, then the spec win)
+**STRUCTURAL_PLAN.md is fully DONE** (M=1 decode, zero-sync grouped MoE, arena, CUDA graphs, spec-decode — all
+built, gated, committed). The forward plan is now the deep-research roadmap in `DECODE_GAP_RESEARCH.md`
+(+ `RESEARCH_INVENTORY.md` = dedup key). Do these gated + detached + memory-neutral, in order:
+0. **Unblock ncu** (`sudo ncu --set full -k regex:'fp8_gemv_m1|ogroup_gemv|k_grouped' --launch-count 20 ./build/decode …`)
+   — confirm Memory% vs Compute% per kernel (proves the software-dequant compute-bound hypothesis). 30-min de-risk.
+1. **T1.1 (⭐ top lever): rebuild the FP4 MoE GEMV with HARDWARE x2 unpack.** Our *rejected* fp4 GEMV used SCALAR
+   nibble decode — the state-of-the-art path uses `cvt.f16x2.e2m1x2` HW unpack (confirmed on sm_110a) + `cp.async`
+   streaming + L1 cache hints (no_allocate weights / evict_last activation) → ~50% BW. MoE is the largest kernel.
+2. **T1.2: fuse the attention/indexer/compressor glue** (RoPE+norm+quant+KV-write) — vLLM reports 2–20× on these;
+   we run each as a separate kernel with an arena DRAM round-trip.
+3. **T2.1: fix the M=K verify expert-union dilation** — read each activated expert ONCE (group verify tokens by
+   expert). 2.6× → ~1.3× flips spec-decode parity → ~1.9× at unchanged acceptance. FIRST audit whether
+   `k_grouped_w4a8` verify already dedups by expert.
+4. **T2.2: DSpark draft-head fine-tune** (accept 2.5→~4, compounds T2.1 to ~3×). Training-gated (`CAPTURE_TRAIN_PLAN.md`).
+**Deprioritized (evidence in the research doc):** tcgen05/DeepGEMM (arch-blocked on sm_110), PDL + in-graph-metadata
+MTP (subsumed by our CUDA-graph parity), DeepEP (N/A single-node), cluster/DSMEM kernels (porting risk).
 Then this same engine becomes the server's core (arc step 2).
 
 ## 7. Discipline (Constitution — non-negotiable)

@@ -14,6 +14,7 @@
 #include "hc.h"
 #include "mla_attn.h"
 #include "compressor.h"
+#include "dscratch.h"
 #include "yarn.h"
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
@@ -181,8 +182,9 @@ int main(int argc, char** argv){
     CU(cudaMemcpy(d_ids,ids.data(),s*4,cudaMemcpyHostToDevice));
     k_embed<<<((size_t)PS*d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,d_ids,PS,d);
     k_hc_expand<<<((size_t)PS*hc*d+255)/256,256>>>(h,h0,PS,hc,d); CU(cudaDeviceSynchronize());
+    arena_init((size_t)512<<20);                            // 512 MB decode scratch arena (bump, reset per layer)
     printf("[decode] prefill %d positions...\n", PS);
-    for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark();
+    for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark(); arena_reset();
         run_layer(Lyr,true,0,h,h2,d_ids); std::swap(h,h2);
         L.release(mk); tc_moe_clear_cache();
     }
@@ -200,7 +202,7 @@ int main(int argc, char** argv){
         k_embed<<<((size_t)d+255)/256,256>>>(h0,(const __nv_bfloat16*)W.get("embed.weight").dev,cur_dev,1,d);
         k_hc_expand<<<((size_t)hc*d+255)/256,256>>>(hd,h0,1,hc,d);
         float* xin=hd; float* xout=hd2;
-        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark();
+        for(int Lyr=0; Lyr<N_LAYERS; ++Lyr){ size_t mk=L.mark(); arena_reset();
             run_layer(Lyr,false,pos,xin,xout,cur_dev); std::swap(xin,xout);
             L.release(mk); tc_moe_clear_cache();
         }

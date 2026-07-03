@@ -1,5 +1,6 @@
 // compressor.cu — KV Compressor gated-pooling core, correctness-first (Gate K: ref/gen_units gen_compressor).
 #include "compressor.h"
+#include "dscratch.h"
 
 // C[M,N] = A[M,K] @ B[N,K]^T. One warp per (m,n).
 __global__ void gemm_fp32_kernel(float* __restrict__ C, const float* __restrict__ A,
@@ -79,7 +80,7 @@ void compressor_forward(float* out, const float* x, const float* wkv, const floa
                         bool rotate, cudaStream_t stream) {
     int coff = overlap ? 2 : 1, groups = s / ratio, od = coff * d;
     float *kv, *score;
-    CU2(cudaMalloc(&kv, (size_t)s * od * 4)); CU2(cudaMalloc(&score, (size_t)s * od * 4));
+    kv=(decltype(kv))dmalloc( (size_t)s * od * 4); score=(decltype(score))dmalloc( (size_t)s * od * 4);
     gemm_fp32(kv, x, wkv, s, od, dim, stream);
     gemm_fp32(score, x, wgate, s, od, dim, stream);
     if (overlap) compressor_pool_overlap(out, kv, score, ape, groups, ratio, d, stream);
@@ -88,8 +89,8 @@ void compressor_forward(float* out, const float* x, const float* wkv, const floa
     rope_interleaved(out + (d - rope_dim), cosT, sinT, groups, rope_dim, false, d, 1, stream);
     if (rotate) { hadamard(out, out, groups, d, stream); act_quant_fp4sim(out, groups, d, 32, d, stream); }  // indexer compressor
     else        { act_quant_fp8sim(out, groups, d - rope_dim, 64, d, stream); }                             // main compressor NoPE
-    CU2(cudaStreamSynchronize(stream));
-    cudaFree(kv); cudaFree(score);
+    dsync(stream);
+    dfree(kv); dfree(score);
 }
 
 // ---- incremental single-group emit (STRUCTURAL_PLAN Step 4 decode) ----
@@ -107,8 +108,8 @@ void compressor_emit_group(float* out_row, const float* x, int g, int ratio, con
     else       { tok0 = g*ratio; ntok = ratio; localg = 0; }
     const float* xg = x + (size_t)tok0*dim;
     float *kv,*score,*pooled;
-    CU2(cudaMalloc(&kv,(size_t)ntok*od*4)); CU2(cudaMalloc(&score,(size_t)ntok*od*4));
-    CU2(cudaMalloc(&pooled,(size_t)(localg+1)*d*4));
+    kv=(decltype(kv))dmalloc((size_t)ntok*od*4); score=(decltype(score))dmalloc((size_t)ntok*od*4);
+    pooled=(decltype(pooled))dmalloc((size_t)(localg+1)*d*4);
     gemm_fp32(kv, xg, wkv, ntok, od, dim, stream);
     gemm_fp32(score, xg, wgate, ntok, od, dim, stream);
     if(overlap) compressor_pool_overlap(pooled, kv, score, ape, localg+1, ratio, d, stream);
@@ -119,6 +120,6 @@ void compressor_emit_group(float* out_row, const float* x, int g, int ratio, con
                      1, rope_dim, false, d, 1, stream);
     if(rotate){ hadamard(out_row, out_row, 1, d, stream); act_quant_fp4sim(out_row, 1, d, 32, d, stream); }
     else      { act_quant_fp8sim(out_row, 1, d - rope_dim, 64, d, stream); }
-    CU2(cudaStreamSynchronize(stream));
-    cudaFree(kv); cudaFree(score); cudaFree(pooled);
+    dsync(stream);
+    dfree(kv); dfree(score); dfree(pooled);
 }

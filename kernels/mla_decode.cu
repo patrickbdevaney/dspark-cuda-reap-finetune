@@ -3,6 +3,7 @@
 #include "fp8_block_gemm.h"
 #include "mla_attn.h"
 #include "deepseek_v4.h"
+#include "dscratch.h"
 #include <vector>
 #include <cmath>
 #include <cstdio>
@@ -17,13 +18,13 @@ __global__ void k_win_idx(int* idx, int base, int width){
 // ---- prefill: fill window-KV cache for x[0..s-1] (identical to mla_forward's internal kv) ----
 void mla_cache_kv(float* kvcache, const float* x, const MLAWeights& w, int s, cudaStream_t stream){
     uint8_t* xq; float* xs;
-    CU(cudaMalloc(&xq,(size_t)s*DIM)); CU(cudaMalloc(&xs,(size_t)s*(DIM/128)*4));
+    xq=(decltype(xq))dmalloc((size_t)s*DIM); xs=(decltype(xs))dmalloc((size_t)s*(DIM/128)*4);
     act_quant_fp8(xq, xs, x, s, DIM, 128, stream);
     fp8_block_gemm(kvcache, xq, xs, w.wkv, w.wkv_s, s, HEAD_DIM, DIM, stream);
     rmsnorm(kvcache, kvcache, w.kv_norm, s, HEAD_DIM, EPS, true, stream);
     rope_interleaved(kvcache + NOPE_DIM, w.cosT, w.sinT, s, ROPE_DIM, false, HEAD_DIM, 1, stream);   // 1 cos row per token
     act_quant_fp8sim(kvcache, s, NOPE_DIM, 64, HEAD_DIM, stream);
-    CU(cudaStreamSynchronize(stream)); cudaFree(xq); cudaFree(xs);
+    dsync(stream); dfree(xq); dfree(xs);
 }
 
 // ---- decode step: one token at position `pos` ----
@@ -33,10 +34,10 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
     const float *cosP = w.cosT + (size_t)pos*half, *sinP = w.sinT + (size_t)pos*half;   // this position's RoPE row
 
     uint8_t *xq,*qrq,*ogq; float *xs,*qrs,*ogs,*qr,*q,*o,*og;
-    CU(cudaMalloc(&xq,DIM)); CU(cudaMalloc(&xs,(DIM/128)*4));
-    CU(cudaMalloc(&qr,Q_LORA*4)); CU(cudaMalloc(&qrq,Q_LORA)); CU(cudaMalloc(&qrs,(Q_LORA/128)*4));
-    CU(cudaMalloc(&q,Kd*4)); CU(cudaMalloc(&o,Kd*4)); CU(cudaMalloc(&og,OB*4));
-    CU(cudaMalloc(&ogq,OB)); CU(cudaMalloc(&ogs,(OB/128)*4));
+    xq=(decltype(xq))dmalloc(DIM); xs=(decltype(xs))dmalloc((DIM/128)*4);
+    qr=(decltype(qr))dmalloc(Q_LORA*4); qrq=(decltype(qrq))dmalloc(Q_LORA); qrs=(decltype(qrs))dmalloc((Q_LORA/128)*4);
+    q=(decltype(q))dmalloc(Kd*4); o=(decltype(o))dmalloc(Kd*4); og=(decltype(og))dmalloc(OB*4);
+    ogq=(decltype(ogq))dmalloc(OB); ogs=(decltype(ogs))dmalloc((OB/128)*4);
 
     // 1. quantize x once (shared by wq_a and wkv)
     act_quant_fp8(xq, xs, x, 1, DIM, 128, stream);
@@ -58,7 +59,7 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
 
     // 4. sparse attention over the sliding window [base..pos]
     int base = pos - WINDOW + 1; if(base < 0) base = 0; int width = pos + 1 - base;
-    int* didx; CU(cudaMalloc(&didx, width*4));
+    int* didx; didx=(decltype(didx))dmalloc( width*4);
     k_win_idx<<<(width+63)/64,64,0,stream>>>(didx, base, width);
     sparse_attn(o, q, kvcache, w.attn_sink, didx, 1, 1, N_HEADS, HEAD_DIM, pos+1, width, scale, stream);
 
@@ -68,7 +69,7 @@ void mla_decode_step(float* out, const float* x, const MLAWeights& w, float* kvc
     act_quant_fp8(ogq, ogs, og, 1, OB, 128, stream);
     fp8_block_gemm(out, ogq, ogs, w.wo_b, w.wo_b_s, 1, DIM, OB, stream);
 
-    CU(cudaStreamSynchronize(stream));
-    cudaFree(xq);cudaFree(xs);cudaFree(qr);cudaFree(qrq);cudaFree(qrs);cudaFree(q);
-    cudaFree(o);cudaFree(og);cudaFree(ogq);cudaFree(ogs);cudaFree(didx);
+    dsync(stream);
+    dfree(xq);dfree(xs);dfree(qr);dfree(qrq);dfree(qrs);dfree(q);
+    dfree(o);dfree(og);dfree(ogq);dfree(ogs);dfree(didx);
 }

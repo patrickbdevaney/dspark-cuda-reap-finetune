@@ -164,6 +164,14 @@ public:
     size_t count() const { return tensors_.size(); }
     size_t shardCount() const { return shards_.size(); }
 
+    // Mmap regions of each shard's tensor-data blob — for cudaHostRegister (zero-copy device access on
+    // unified memory). Returns [(host_ptr, byte_len)] per shard.
+    std::vector<std::pair<const void*, size_t>> shardRegions() const {
+        std::vector<std::pair<const void*, size_t>> r;
+        for (auto& kv : shards_) r.emplace_back(kv.second->dataStart(), kv.second->dataBytes());
+        return r;
+    }
+
 private:
     std::string dir_;
     std::unordered_map<std::string, std::string> weight_map_;            // name -> shard file
